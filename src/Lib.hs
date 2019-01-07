@@ -2,6 +2,7 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE BangPatterns #-}
 
 module Lib where
 
@@ -17,7 +18,7 @@ import Data.Binary.Get ( runGet
 import qualified Data.ByteString as BS
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (fromStrict)
-import Data.Foldable (toList)
+import Data.Foldable (toList, foldlM)
 import Data.Maybe (fromJust)
 import Data.Sequence (Seq)
 import Data.Word (Word16, Word64)
@@ -48,13 +49,6 @@ topicCountKey TopicConfig{..} tn =
                    , BytesElem "count"
                    ]
 
-topicLastWriteKey :: TopicConfig -> TopicName -> ByteString
-topicLastWriteKey TopicConfig{..} tn =
-  FDB.pack topicSS [ BytesElem tn
-                   , BytesElem "meta"
-                   , BytesElem "lastWrite"
-                   ]
-
 incrTopicCount :: TopicConfig
                -> TopicName
                -> Transaction ()
@@ -76,35 +70,8 @@ getTopicCount conf tn = do
                 <|> fromIntegral <$> getWord16le
                 <|> fromIntegral <$> getWord8
 
-setLastWrite :: TopicConfig -> TopicName -> Transaction ()
-setLastWrite conf tn = do
-  let k = topicLastWriteKey conf tn
-  let v = BS.pack $ take 10 $ cycle [0]
-  FDB.atomicOp FDB.SetVersionstampedValue k v
-
-runGetMay :: Get a -> ByteString -> Maybe a
-runGetMay g b = case runGetOrFail g (fromStrict b) of
-  Left _ -> Nothing
-  Right (_,_,x) -> Just x
-
---TODO: tests in foundationdb-haskell show that
--- decodeTransactionVersionstamp should work. Delete this.
-decodeVersionstampLE :: ByteString -> Maybe TransactionVersionstamp
-decodeVersionstampLE =
-  runGetMay (TransactionVersionstamp <$> getWord64le <*> getWord16le)
-
-getLastWrite :: TopicConfig
-             -> TopicName
-             -> Transaction (Maybe TransactionVersionstamp)
-getLastWrite conf tn = do
-  let k = topicLastWriteKey conf tn
-  vsBytes <- FDB.get k >>= await
-  case fmap decodeTransactionVersionstamp vsBytes of
-    Nothing -> return Nothing
-    Just Nothing -> error $ "malformed versionstamp: "
-                            ++ show vsBytes
-    Just vs -> return vs
-
+-- | Transactionally write a batch of messages to the given topic. The
+-- batch must be small enough to fit into a single FoundationDB transaction.
 writeTopic :: Traversable t
            => TopicConfig
            -> TopicName
@@ -113,15 +80,17 @@ writeTopic :: Traversable t
 writeTopic tc@TopicConfig{..} tname bss = do
   -- TODO: proper error handling
   guard (fromIntegral (length bss) < (maxBound :: Word16))
-  forM_ (zip [0..] (toList bss)) $ \(i,bs) ->
-    FDB.runTransaction topicConfigDB $ do
-      let vs = IncompleteVersionstamp i
-      let k = FDB.pack topicSS [ FDB.BytesElem tname
-                               , FDB.BytesElem "contents"
-                               , FDB.IncompleteVSElem vs]
-      FDB.atomicOp FDB.SetVersionstampedKey k bs
-      setLastWrite tc tname
-      incrTopicCount tc tname
+  FDB.runTransaction topicConfigDB $ do
+    n <- foldlM go 1 bss
+    incrTopicCount tc tname
+    where
+      go !i bs = do
+        let vs = IncompleteVersionstamp i
+        let k = FDB.pack topicSS [ FDB.BytesElem tname
+                                 , FDB.BytesElem "contents"
+                                 , FDB.IncompleteVSElem vs]
+        FDB.atomicOp FDB.SetVersionstampedKey k bs
+        return (i+1)
 
 trOutput :: TopicConfig
          -> (ByteString, ByteString)
@@ -163,7 +132,7 @@ getNAfter tc@TopicConfig{..} tn n vs =
 
 blockUntilNew :: TopicConfig -> TopicName -> IO ()
 blockUntilNew conf@TopicConfig{..} tn = do
-  let k = topicLastWriteKey conf tn
+  let k = topicCountKey conf tn
   f <- FDB.runTransaction topicConfigDB (FDB.watch k)
   FDB.awaitIO f >>= \case
     Right () -> return ()
