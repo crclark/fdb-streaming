@@ -37,7 +37,7 @@ packages:
 - .
 - location:
     git: https://github.com/crclark/foundationdb-haskell.git
-    commit: adb299fcfcf3fe30b6dda2fc152ee72accf18992
+    commit: 4a2de8f0b71df8e5b87164a133641c581925d7ba
   extra-dep: true
 # Dependency packages to be pulled from upstream that are not in the resolver
 # using the same syntax as the packages field.

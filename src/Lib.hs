@@ -21,7 +21,7 @@ import Data.ByteString.Lazy (fromStrict)
 import Data.Foldable (toList, foldlM)
 import Data.Maybe (fromJust)
 import qualified Data.Sequence as Seq
-import Data.Sequence (Seq, ViewL(..))
+import Data.Sequence (Seq(..), ViewL(..), ViewR(..))
 import Data.Word (Word8, Word16, Word64)
 import FoundationDB as FDB
 import FoundationDB.Layer.Subspace as FDB
@@ -50,6 +50,7 @@ data TopicConfig = TopicConfig { topicConfigDB :: FDB.Database
                                , topicName :: TopicName
                                , topicCountKey :: ByteString
                                , topicMsgsSS :: FDB.Subspace
+                               , topicWriteOneKey :: ByteString
                                }
                                deriving Show
 
@@ -60,7 +61,7 @@ makeTopicConfig topicConfigDB topicSS topicName = TopicConfig{..} where
                                    , BytesElem "count"
                                    ]
   topicMsgsSS = FDB.extend topicSS [BytesElem topicName, BytesElem "msgs"]
-
+  topicWriteOneKey = FDB.pack topicMsgsSS [FDB.IncompleteVSElem (IncompleteVersionstamp 0)]
 
 incrTopicCount :: TopicConfig
                -> Transaction ()
@@ -100,14 +101,26 @@ writeTopic tc@TopicConfig{..} bss = do
   -- TODO: proper error handling
   guard (fromIntegral (length bss) < (maxBound :: Word16))
   FDB.runTransaction topicConfigDB $ do
-    n <- foldlM go 1 bss
-    incrTopicCount tc
+    _ <- foldlM go 1 bss
+    return ()
     where
       go !i bs = do
         let vs = IncompleteVersionstamp i
         let k = FDB.pack topicMsgsSS [FDB.IncompleteVSElem vs]
         FDB.atomicOp FDB.SetVersionstampedKey k bs
+        incrTopicCount tc
         return (i+1)
+
+-- | Optimized function for writing a single message to a topic. The key is
+-- precomputed once, so no time needs to be spent computing it. This may be
+-- faster than writing batches of keys. Profile the code to find out!
+writeOneMsgTopic :: TopicConfig
+                 -> ByteString
+                 -> IO ()
+writeOneMsgTopic tc@TopicConfig{..} bs = do
+  FDB.runTransaction topicConfigDB $ do
+    FDB.atomicOp FDB.SetVersionstampedKey topicWriteOneKey bs
+    incrTopicCount tc
 
 trOutput :: TopicConfig
          -> (ByteString, ByteString)
@@ -195,11 +208,40 @@ readNPastCheckpoint tc rn n = do
                 }
   fmap (trOutput tc) <$> FDB.getEntireRange r
 
+readNAndCheckpoint :: TopicConfig
+                   -> ReaderName
+                   -> Word8
+                   -> IO (Seq (Versionstamp 'Complete, ByteString))
+readNAndCheckpoint tc@TopicConfig{..} rn n = do
+  FDB.runTransactionWithConfig conf topicConfigDB $
+    readNPastCheckpoint tc rn n >>= \case
+      (x@(_ :|> (vs,_))) -> do
+        checkpoint' tc rn vs
+        return x
+      _ -> return mempty
+  where conf = FDB.defaultConfig {maxRetries = maxBound}
+
+-- | Exactly once delivery. Contention on a single key -- could be slow!
 readAndCheckpoint :: TopicConfig
                   -> ReaderName
                   -> IO (Maybe (Versionstamp 'Complete, ByteString))
 readAndCheckpoint tc@TopicConfig{..} rn =
-  FDB.runTransaction topicConfigDB $
+  FDB.runTransactionWithConfig conf topicConfigDB $
     (Seq.viewl <$> readNPastCheckpoint tc rn 1) >>= \case
       EmptyL -> return Nothing
-      (x :< _) -> return (Just x)
+      (x@(vs,_) :< _) -> do
+        checkpoint' tc rn vs
+        return (Just x)
+  where conf = FDB.defaultConfig {maxRetries = maxBound}
+
+-- | At least once delivery. No contention.
+nonAtomicReadThenCheckpoint :: TopicConfig
+                            -> ReaderName
+                            -> IO (Maybe (Versionstamp 'Complete, ByteString))
+nonAtomicReadThenCheckpoint tc@TopicConfig{..} rn = do
+  res <- FDB.runTransaction topicConfigDB (readNPastCheckpoint tc rn 1)
+  case Seq.viewl res of
+    EmptyL -> return Nothing
+    (x@(vs,_) :< _) -> do
+      FDB.runTransaction topicConfigDB (checkpoint' tc rn vs)
+      return (Just x)
