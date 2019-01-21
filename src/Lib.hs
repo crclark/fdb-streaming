@@ -3,26 +3,28 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE RankNTypes #-}
 
 module Lib where
 
 import Control.Applicative
+import Control.Concurrent
 import Control.Monad
+import Control.Monad.IO.Class
 import Data.Binary.Get ( runGet
-                       , runGetOrFail
                        , getWord64le
                        , getWord32le
                        , getWord16le
-                       , getWord8
-                       , Get)
-import qualified Data.ByteString as BS
+                       , getWord8)
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (fromStrict)
-import Data.Foldable (toList, foldlM)
-import Data.Maybe (fromJust)
+import Data.Foldable (foldlM, toList)
+import Data.Maybe (fromJust, catMaybes)
 import qualified Data.Sequence as Seq
-import Data.Sequence (Seq(..), ViewL(..), ViewR(..))
+import Data.Sequence (Seq(..), ViewL(..))
 import Data.Word (Word8, Word16, Word64)
+import Data.Void
 import FoundationDB as FDB
 import FoundationDB.Layer.Subspace as FDB
 import FoundationDB.Layer.Tuple as FDB
@@ -31,7 +33,6 @@ import FoundationDB.Transaction (prefixRangeEnd)
 import FoundationDB.Versionstamp (Versionstamp
                                   (CompleteVersionstamp,
                                    IncompleteVersionstamp),
-                                  decodeTransactionVersionstamp,
                                   encodeVersionstamp,
                                   TransactionVersionstamp(..),
                                   VersionstampCompleteness(..),
@@ -91,6 +92,22 @@ readerCheckpointKey TopicConfig{..} rn =
                    , BytesElem rn
                    , BytesElem "ckpt"]
 
+writeTopic' :: Traversable t
+            => TopicConfig
+            -> t ByteString
+            -> Transaction ()
+writeTopic' tc@TopicConfig{..} bss = do
+  _ <- foldlM go 1 bss
+  return ()
+    where
+      go !i bs = do
+        let vs = IncompleteVersionstamp i
+        let k = FDB.pack topicMsgsSS [FDB.IncompleteVSElem vs]
+        FDB.atomicOp FDB.SetVersionstampedKey k bs
+        incrTopicCount tc
+        return (i+1)
+
+-- TODO: support messages larger than FDB size limit, via chunking.
 -- | Transactionally write a batch of messages to the given topic. The
 -- batch must be small enough to fit into a single FoundationDB transaction.
 writeTopic :: Traversable t
@@ -100,16 +117,7 @@ writeTopic :: Traversable t
 writeTopic tc@TopicConfig{..} bss = do
   -- TODO: proper error handling
   guard (fromIntegral (length bss) < (maxBound :: Word16))
-  FDB.runTransaction topicConfigDB $ do
-    _ <- foldlM go 1 bss
-    return ()
-    where
-      go !i bs = do
-        let vs = IncompleteVersionstamp i
-        let k = FDB.pack topicMsgsSS [FDB.IncompleteVSElem vs]
-        FDB.atomicOp FDB.SetVersionstampedKey k bs
-        incrTopicCount tc
-        return (i+1)
+  FDB.runTransaction topicConfigDB $ writeTopic' tc bss
 
 -- | Optimized function for writing a single message to a topic. The key is
 -- precomputed once, so no time needs to be spent computing it. This may be
@@ -153,7 +161,7 @@ getNAfter tc@TopicConfig{..} n vs =
   FDB.runTransaction topicConfigDB $ do
     let range = fromJust $
                 FDB.prefixRange $
-                FDB.subspaceKey topicMsgsSS
+                FDB.pack topicMsgsSS [FDB.CompleteVSElem vs]
     let rangeN = range {rangeLimit = Just n}
     fmap (trOutput tc) <$> FDB.getEntireRange rangeN
 
@@ -245,3 +253,91 @@ nonAtomicReadThenCheckpoint tc@TopicConfig{..} rn = do
     (x@(vs,_) :< _) -> do
       FDB.runTransaction topicConfigDB (checkpoint' tc rn vs)
       return (Just x)
+
+{-
+
+High-level streaming combinators -- an experiment.
+
+The streams need to be easy to maintain. How to change a topology over time is
+an important consideration. What happens if I put a new step in the middle of
+a pipeline? What happens if I remove a step? What happens if I change the logic
+of a step?
+
+After all of these modifications, what happens when I start my program again
+with the existing DB? What happens if I do a rolling deployment, so some are
+still running the old version of the code?
+
+-}
+
+-- TODO: error handling for bad parses
+class Messageable a where
+  toMessage :: a -> ByteString
+  fromMessage :: ByteString -> a
+
+-- TODO: make FDB optional -- want STM version, etc.
+data Topic a where
+  Topic :: Messageable a => TopicConfig -> Topic a
+
+type StreamName = ByteString
+
+-- TODO: consider generalizing IO to m in future
+-- TODO: what about state and folds?
+-- TODO: what about truncating old data by timestamp?
+-- TODO: probably shouldn't contain Topic info -- pass in DB connection and
+-- build it based on StreamName, perhaps.
+data Stream a b where
+  StreamProducer :: StreamName
+                 -> Topic b
+                 -- Maybe allows for filtering
+                 -> IO (Maybe b)
+                 -> Stream Void b
+  StreamConsumer :: StreamName
+                 -> Topic a
+                 -> (a -> IO ())
+                 -> Stream a Void
+  StreamPipe :: StreamName
+             -> Topic a
+             -> Topic b
+             -> (a -> IO (Maybe b))
+             -> Stream a b
+  StreamComp :: Stream a b
+             -> Stream b c
+             -> Stream a c
+
+-- | Runs a stream. For each StreamPipe in the tree, reads from its input topic
+-- in chunks, runs the monadic action on each input, and writes the result to
+-- its output topic.
+-- TODO: handle cyclical inputs
+runStream :: Stream a b -> IO ()
+runStream (StreamProducer _rn (Topic outCfg) step) =
+  -- TODO: what if this thread dies?
+  -- TODO: this keeps spinning even if the producer is done and will never
+  -- produce again.
+  void $ forkIO $ forever $ do
+    xs <- catMaybes <$> replicateM 10 step -- TODO: batch size config
+    writeTopic outCfg (fmap toMessage xs)
+
+runStream (StreamConsumer rn (Topic inCfg) step) =
+  void $ forkIO $ forever $ do
+  -- TODO: if parsing the message fails, should we still checkpoint?
+  xs <- readNAndCheckpoint inCfg rn 10
+  mapM_ step (fmap (fromMessage . snd) xs)
+
+runStream (StreamPipe rn (Topic inCfg) (Topic outCfg) step) =
+  -- TODO: blockUntilNew
+  void $ forkIO $ forever $ FDB.runTransactionWithConfig cnf (topicConfigDB inCfg) $ do
+    xs <- readNPastCheckpoint inCfg rn 10 --TODO: auto-adjust batch size
+    case xs of
+      Empty -> return ()
+      (_ :|> (vs,_)) -> do
+        let inMsgs = fmap (fromMessage . snd) xs
+        ys <- catMaybes . toList <$> liftIO (mapM step inMsgs)
+        let outMsgs = fmap toMessage ys
+        writeTopic' outCfg outMsgs
+        checkpoint' inCfg rn vs
+  -- TODO: auto-adjust retries?
+  where cnf = FDB.defaultConfig {maxRetries = maxBound}
+runStream (StreamComp l r) = do
+  runStream l
+  runStream r
+
