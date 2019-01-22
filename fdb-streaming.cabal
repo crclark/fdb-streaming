@@ -88,7 +88,7 @@ executable fdb-streaming-highlevel
       Paths_fdb_streaming
   hs-source-dirs:
       highlevel
-  ghc-options: -threaded -rtsopts -with-rtsopts=-N -O2
+  ghc-options: -threaded -rtsopts -with-rtsopts=-N -O2 -Wall
   build-depends:
       base >=4.7 && <5
     , async

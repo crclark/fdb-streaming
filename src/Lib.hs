@@ -165,6 +165,8 @@ getNAfter tc@TopicConfig{..} n vs =
     let rangeN = range {rangeLimit = Just n}
     fmap (trOutput tc) <$> FDB.getEntireRange rangeN
 
+-- TODO: should actually set the watch from the same transaction that did the
+-- last read, so that we are guaranteed to be woken by the next write.
 blockUntilNew :: TopicConfig -> IO ()
 blockUntilNew conf@TopicConfig{..} = do
   let k = topicCountKey
@@ -274,9 +276,10 @@ class Messageable a where
   toMessage :: a -> ByteString
   fromMessage :: ByteString -> a
 
--- TODO: make FDB optional -- want STM version, etc.
-data Topic a where
-  Topic :: Messageable a => TopicConfig -> Topic a
+-- TODO: argh, find a way to avoid this.
+instance Messageable Void where
+  toMessage = undefined
+  fromMessage = undefined
 
 type StreamName = ByteString
 
@@ -286,44 +289,75 @@ type StreamName = ByteString
 -- TODO: probably shouldn't contain Topic info -- pass in DB connection and
 -- build it based on StreamName, perhaps.
 data Stream a b where
-  StreamProducer :: StreamName
-                 -> Topic b
+  StreamProducer :: Messageable b
+                 => StreamName
                  -- Maybe allows for filtering
                  -> IO (Maybe b)
                  -> Stream Void b
-  StreamConsumer :: StreamName
-                 -> Topic a
-                 -> (a -> IO ())
+  StreamConsumer :: (Messageable a, Messageable b)
+                 => StreamName
+                 -> Stream a b
+                 -> (b -> IO ())
                  -> Stream a Void
-  StreamPipe :: StreamName
-             -> Topic a
-             -> Topic b
-             -> (a -> IO (Maybe b))
+  -- TODO: looks suspiciously similar to monadic bind
+  StreamPipe :: (Messageable a, Messageable b, Messageable c)
+             => StreamName
              -> Stream a b
-  StreamComp :: Stream a b
-             -> Stream b c
+             -> (b -> IO (Maybe c))
              -> Stream a c
+
+streamName :: Stream a b -> StreamName
+streamName (StreamProducer sn _) = sn
+streamName (StreamConsumer sn _ _) = sn
+streamName (StreamPipe sn _ _) = sn
+
+-- TODO: other persistence backends
+data FDBStreamConfig = FDBStreamConfig {
+  streamConfigDB :: FDB.Database,
+  streamConfigSS :: FDB.Subspace
+}
+
+inputTopic :: FDBStreamConfig -> Stream a b -> TopicConfig
+-- TODO: actually StreamProducer has no input topic.
+inputTopic sc (StreamProducer sn _) =
+  makeTopicConfig (streamConfigDB sc) (streamConfigSS sc) sn
+inputTopic sc (StreamConsumer _ inp _) = outputTopic sc inp
+inputTopic sc (StreamPipe _ inp _) = outputTopic sc inp
+
+outputTopic :: FDBStreamConfig -> Stream a b -> TopicConfig
+-- TODO: StreamConsumer has no output
+outputTopic sc s =
+  makeTopicConfig (streamConfigDB sc)
+                  (streamConfigSS sc)
+                  (streamName s <> "_out")
 
 -- | Runs a stream. For each StreamPipe in the tree, reads from its input topic
 -- in chunks, runs the monadic action on each input, and writes the result to
 -- its output topic.
 -- TODO: handle cyclical inputs
-runStream :: Stream a b -> IO ()
-runStream (StreamProducer _rn (Topic outCfg) step) =
+runStream :: FDBStreamConfig -> Stream a b -> IO ()
+runStream c@FDBStreamConfig{..} s@(StreamProducer _rn step) = do
   -- TODO: what if this thread dies?
   -- TODO: this keeps spinning even if the producer is done and will never
   -- produce again.
+  let outCfg = outputTopic c s
   void $ forkIO $ forever $ do
     xs <- catMaybes <$> replicateM 10 step -- TODO: batch size config
     writeTopic outCfg (fmap toMessage xs)
 
-runStream (StreamConsumer rn (Topic inCfg) step) =
+runStream c@FDBStreamConfig{..} s@(StreamConsumer rn inp step) = do
+  runStream c inp
+  let inCfg = inputTopic c s
   void $ forkIO $ forever $ do
-  -- TODO: if parsing the message fails, should we still checkpoint?
-  xs <- readNAndCheckpoint inCfg rn 10
-  mapM_ step (fmap (fromMessage . snd) xs)
+    -- TODO: if parsing the message fails, should we still checkpoint?
+    -- TODO: blockUntilNew
+    xs <- readNAndCheckpoint inCfg rn 10
+    mapM_ step (fmap (fromMessage . snd) xs)
 
-runStream (StreamPipe rn (Topic inCfg) (Topic outCfg) step) =
+runStream c@FDBStreamConfig{..} s@(StreamPipe rn inp step) = do
+  runStream c inp
+  let inCfg = inputTopic c s
+  let outCfg = outputTopic c s
   -- TODO: blockUntilNew
   void $ forkIO $ forever $ FDB.runTransactionWithConfig cnf (topicConfigDB inCfg) $ do
     xs <- readNPastCheckpoint inCfg rn 10 --TODO: auto-adjust batch size
@@ -337,7 +371,4 @@ runStream (StreamPipe rn (Topic inCfg) (Topic outCfg) step) =
         checkpoint' inCfg rn vs
   -- TODO: auto-adjust retries?
   where cnf = FDB.defaultConfig {maxRetries = maxBound}
-runStream (StreamComp l r) = do
-  runStream l
-  runStream r
 
