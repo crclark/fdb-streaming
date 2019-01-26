@@ -278,16 +278,86 @@ class Messageable a where
 
 -- TODO: argh, find a way to avoid this.
 instance Messageable Void where
-  toMessage = undefined
-  fromMessage = undefined
+  toMessage = error "impossible happened: called toMessage on Void"
+  fromMessage = error "impossible happened: called fromMessage on Void"
 
 type StreamName = ByteString
+
+-- TODO: need to think about grouping and windowing. Windowing appears to be a
+-- special case of grouping, where the groupBy function is a function of time.
+-- But is a sliding window a special case of groupBy? Seems like it might not be
+-- since consecutive messages can be assigned to multiple groups.
+-- Come to think of it, does groupBy need to assign each item to only one group?
+-- Could it ever make sense to assign a single object to a set of groups?
+-- What if the set of groups is rather large (such as all sliding windows the
+-- object falls within)?
+
+-- It looks like kafka streams only allows sliding windows for joins, which
+-- would certainly simplify matters.
+
+-- For groupBy, I think we could introduce a type GroupedBy a b, representing
+-- things of type b grouped by type a. Introduction would be by
+-- groupBy :: (b -> a) -> Stream c b -> Stream c (GroupedBy a b)
+-- elimination would be by
+-- aggregateBy :: Monoid m => (b -> m) -> Stream c (GroupedBy a b) -> Stream c (a, m)
+-- or something similar. Problem being that we can't produce an (a,m) until we
+-- know we have seen everything with a particular a key. So perhaps it should be
+-- persisted to a state m associated with each Stream -- Stream m a b?
+-- Or perhaps don't parametrize, and instead require that the Stream state be a
+-- k/v store (i.e. table), and give the user an interface into that?
+
+-- Note: we don't need a separate type for nested groupby -- we can simply group
+-- by a tuple. No need to support GroupedBy a (GroupedBy b c).
+
+-- TODO: think about joins.
+-- I believe we can build joins out of FDB by listening to both upstream topics,
+-- writing a k/v when we receive one half of the join tuple, check if the tuple
+-- has been completed (i.e., the half we just received is the last of the two
+-- halves), and then emit a downstream message of the tuple.
+-- tentative type:
+-- joinOn :: (a -> e) -> (b -> e) -> Stream c a -> Stream d b -> Stream d (a,b)
+-- possible user errors/gotchas:
+-- 1. non-unique join values
+-- 2. must be the case for all x,y :: JoinValue that
+--    (toMessage x == toMessage y) iff x == y. That is, they will be joined by
+--    the equality of the serializations of the values, not the Haskell values
+--    themselves.
+-- stuff to deal with on our side:
+-- 1. How do we garbage collect halves that never get paired up?
+--    The intermediate data must necessarily be keyed by
+
+-- joinOn type above is wrong. The output is a stream that claims to take one
+-- input and produce two, but really it takes two inputs. Is it sane to give the
+-- result the type Stream (c,d) (a,b)? Is composition still associative?
+
+{-
+Let's try to find a counterexample to associativity.
+Assume we have g :: Stream (User,User) (User, User) which is a join where
+the join function is ((==) `on` age). Can we find an f and h where (f.g).h /=
+f.(g.h)?
+
+even though h is supposed to map over the tuples before they get joined, in
+practice it must necessarily be mapped over the tuples after they have been
+joined, because of parametricity -- we can't do different things depending on
+other parts of the stream tree.
+
+So h needs to be something that emits a (User,User). But how would that work?
+And h gets to choose its input type, so it must be reading from a single topic
+that we don't control. This means we can't somehow patch it to read from two
+topics.
+
+This seems to show that we need to change our Stream type to be parametrized
+only by its output.
+
+
+-}
 
 -- TODO: consider generalizing IO to m in future
 -- TODO: what about state and folds?
 -- TODO: what about truncating old data by timestamp?
 -- TODO: probably shouldn't contain Topic info -- pass in DB connection and
 -- build it based on StreamName, perhaps.
+-- TODO: don't recurse infinitely on cyclical topologies.
 data Stream a b where
   StreamProducer :: Messageable b
                  => StreamName
@@ -297,14 +367,20 @@ data Stream a b where
   StreamConsumer :: (Messageable a, Messageable b)
                  => StreamName
                  -> Stream a b
+                 -- TODO: if this handler type took a batch at a time,
+                 -- it would be easier to optimize -- imagine if it were to
+                 -- to do a get from FDB for each item -- it could do them all
+                 -- in parallel.
                  -> (b -> IO ())
                  -> Stream a Void
   -- TODO: looks suspiciously similar to monadic bind
-  StreamPipe :: (Messageable a, Messageable b, Messageable c)
+  StreamPipe :: (Messageable b, Messageable c)
              => StreamName
              -> Stream a b
              -> (b -> IO (Maybe c))
              -> Stream a c
+
+
 
 streamName :: Stream a b -> StreamName
 streamName (StreamProducer sn _) = sn
