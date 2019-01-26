@@ -347,7 +347,9 @@ that we don't control. This means we can't somehow patch it to read from two
 topics.
 
 This seems to show that we need to change our Stream type to be parametrized
-only by its output.
+only by its output. I can't think of anything we lose by doing so, except
+perhaps an Arrow interface in the future, but we seem to at least gain sane
+joins.
 
 
 -}
@@ -358,31 +360,31 @@ only by its output.
 -- TODO: probably shouldn't contain Topic info -- pass in DB connection and
 -- build it based on StreamName, perhaps.
 -- TODO: don't recurse infinitely on cyclical topologies.
-data Stream a b where
-  StreamProducer :: Messageable b
+data Stream b where
+  StreamProducer :: Messageable a
                  => StreamName
                  -- Maybe allows for filtering
-                 -> IO (Maybe b)
-                 -> Stream Void b
-  StreamConsumer :: (Messageable a, Messageable b)
+                 -> IO (Maybe a)
+                 -> Stream a
+  StreamConsumer :: (Messageable a)
                  => StreamName
-                 -> Stream a b
+                 -> Stream a
                  -- TODO: if this handler type took a batch at a time,
                  -- it would be easier to optimize -- imagine if it were to
                  -- to do a get from FDB for each item -- it could do them all
                  -- in parallel.
-                 -> (b -> IO ())
-                 -> Stream a Void
+                 -> (a -> IO ())
+                 -> Stream Void
   -- TODO: looks suspiciously similar to monadic bind
-  StreamPipe :: (Messageable b, Messageable c)
+  StreamPipe :: (Messageable a, Messageable b)
              => StreamName
-             -> Stream a b
-             -> (b -> IO (Maybe c))
-             -> Stream a c
+             -> Stream a
+             -> (a -> IO (Maybe b))
+             -> Stream b
 
 
 
-streamName :: Stream a b -> StreamName
+streamName :: Stream a -> StreamName
 streamName (StreamProducer sn _) = sn
 streamName (StreamConsumer sn _ _) = sn
 streamName (StreamPipe sn _ _) = sn
@@ -393,14 +395,14 @@ data FDBStreamConfig = FDBStreamConfig {
   streamConfigSS :: FDB.Subspace
 }
 
-inputTopic :: FDBStreamConfig -> Stream a b -> TopicConfig
+inputTopic :: FDBStreamConfig -> Stream a -> TopicConfig
 -- TODO: actually StreamProducer has no input topic.
 inputTopic sc (StreamProducer sn _) =
   makeTopicConfig (streamConfigDB sc) (streamConfigSS sc) sn
 inputTopic sc (StreamConsumer _ inp _) = outputTopic sc inp
 inputTopic sc (StreamPipe _ inp _) = outputTopic sc inp
 
-outputTopic :: FDBStreamConfig -> Stream a b -> TopicConfig
+outputTopic :: FDBStreamConfig -> Stream a -> TopicConfig
 -- TODO: StreamConsumer has no output
 outputTopic sc s =
   makeTopicConfig (streamConfigDB sc)
@@ -411,7 +413,7 @@ outputTopic sc s =
 -- in chunks, runs the monadic action on each input, and writes the result to
 -- its output topic.
 -- TODO: handle cyclical inputs
-runStream :: FDBStreamConfig -> Stream a b -> IO ()
+runStream :: FDBStreamConfig -> Stream a -> IO ()
 runStream c@FDBStreamConfig{..} s@(StreamProducer _rn step) = do
   -- TODO: what if this thread dies?
   -- TODO: this keeps spinning even if the producer is done and will never

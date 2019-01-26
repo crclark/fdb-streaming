@@ -21,7 +21,7 @@ instance Messageable Int where
   toMessage = toStrict . runPut . putWord64le . fromIntegral
   fromMessage = fromIntegral . runGet getWord64le . fromStrict
 
-writeInts :: TVar Int -> Int -> Stream Void Int
+writeInts :: TVar Int -> Int -> Stream Int
 writeInts state n = StreamProducer "writeInts" $ do
   curr <- readTVarIO state
   if curr < n
@@ -29,7 +29,7 @@ writeInts state n = StreamProducer "writeInts" $ do
             return $ Just curr
     else return Nothing
 
-keepOdds :: Messageable a => Stream a Int -> Stream a Int
+keepOdds :: Stream Int -> Stream Int
 keepOdds input = StreamPipe "keepOdds" input $ \x ->
   if odd x
     then return (Just x)
@@ -37,13 +37,13 @@ keepOdds input = StreamPipe "keepOdds" input $ \x ->
 
 -- TODO: obviously with state as a tvar this can't actually be split into
 -- multiple processes yet.
-sumInts :: Messageable a => TVar Int -> Stream a Int -> Stream a Void
+sumInts :: TVar Int -> Stream Int -> Stream Void
 sumInts state input = StreamConsumer "sumInts" input $ \x -> do
   curr <- readTVarIO state
   putStrLn $ "### current value = " ++ show curr
   atomically $ modifyTVar' state (+x)
 
-topo :: IO (Stream Void Void)
+topo :: IO (Stream Void)
 topo = do
   writeState <- newTVarIO 0
   sumState <- newTVarIO 0
