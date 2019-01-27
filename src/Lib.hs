@@ -5,11 +5,13 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Lib where
 
 import Control.Applicative
 import Control.Concurrent
+import Control.Exception
 import Control.Monad
 import Control.Monad.IO.Class
 import Data.Binary.Get ( runGet
@@ -39,8 +41,11 @@ import FoundationDB.Versionstamp (Versionstamp
                                   decodeVersionstamp)
 import System.IO (stderr, hPutStrLn)
 
-someFunc :: IO ()
-someFunc = putStrLn "someFunc"
+import Unsafe.Coerce
+
+-- TODO: something less insane
+infRetry :: TransactionConfig
+infRetry = FDB.defaultConfig {maxRetries = maxBound}
 
 type TopicName = ByteString
 
@@ -83,15 +88,18 @@ getTopicCount conf = do
                 <|> fromIntegral <$> getWord16le
                 <|> fromIntegral <$> getWord8
 
+readerSS :: TopicConfig -> ReaderName -> Subspace
+readerSS TopicConfig{..} rn =
+  extend topicSS [BytesElem "rdrs", BytesElem rn]
+
 readerCheckpointKey :: TopicConfig
                     -> ReaderName
                     -> ByteString
-readerCheckpointKey TopicConfig{..} rn =
-  FDB.pack topicSS [ BytesElem topicName
-                   , BytesElem "readers"
-                   , BytesElem rn
-                   , BytesElem "ckpt"]
+readerCheckpointKey tc rn =
+  FDB.pack (readerSS tc rn) [BytesElem "ckpt"]
 
+-- | Danger!! It's possible to write multiple messages with the same key
+-- if this is called more than once in a single transaction.
 writeTopic' :: Traversable t
             => TopicConfig
             -> t ByteString
@@ -218,31 +226,42 @@ readNPastCheckpoint tc rn n = do
                 }
   fmap (trOutput tc) <$> FDB.getEntireRange r
 
+-- TODO: would be useful to have a version of this that returns a watch if
+-- there are no new messages.
+readNAndCheckpoint' :: TopicConfig
+                    -> ReaderName
+                    -> Word8
+                    -> Transaction (Seq (Versionstamp 'Complete, ByteString))
+readNAndCheckpoint' tc@TopicConfig{..} rn n =
+  readNPastCheckpoint tc rn n >>= \case
+    (x@(_ :|> (vs,_))) -> do
+      checkpoint' tc rn vs
+      return x
+    _ -> return mempty
+
 readNAndCheckpoint :: TopicConfig
                    -> ReaderName
                    -> Word8
                    -> IO (Seq (Versionstamp 'Complete, ByteString))
-readNAndCheckpoint tc@TopicConfig{..} rn n = do
-  FDB.runTransactionWithConfig conf topicConfigDB $
-    readNPastCheckpoint tc rn n >>= \case
-      (x@(_ :|> (vs,_))) -> do
-        checkpoint' tc rn vs
-        return x
-      _ -> return mempty
-  where conf = FDB.defaultConfig {maxRetries = maxBound}
+readNAndCheckpoint tc@TopicConfig{..} rn n =
+  FDB.runTransactionWithConfig infRetry topicConfigDB (readNAndCheckpoint' tc rn n)
 
--- | Exactly once delivery. Contention on a single key -- could be slow!
+readAndCheckpoint' :: TopicConfig
+                   -> ReaderName
+                   -> Transaction (Maybe (Versionstamp 'Complete, ByteString))
+readAndCheckpoint' tc@TopicConfig{..} rn =
+  (Seq.viewl <$> readNPastCheckpoint tc rn 1) >>= \case
+    EmptyL -> return Nothing
+    (x@(vs,_) :< _) -> do
+      checkpoint' tc rn vs
+      return (Just x)
+
+-- | Exactly once delivery. Contention on a single key -- could scale poorly!
 readAndCheckpoint :: TopicConfig
                   -> ReaderName
                   -> IO (Maybe (Versionstamp 'Complete, ByteString))
 readAndCheckpoint tc@TopicConfig{..} rn =
-  FDB.runTransactionWithConfig conf topicConfigDB $
-    (Seq.viewl <$> readNPastCheckpoint tc rn 1) >>= \case
-      EmptyL -> return Nothing
-      (x@(vs,_) :< _) -> do
-        checkpoint' tc rn vs
-        return (Just x)
-  where conf = FDB.defaultConfig {maxRetries = maxBound}
+  FDB.runTransactionWithConfig infRetry topicConfigDB (readAndCheckpoint' tc rn)
 
 -- | At least once delivery. No contention.
 nonAtomicReadThenCheckpoint :: TopicConfig
@@ -281,6 +300,14 @@ instance Messageable Void where
   toMessage = error "impossible happened: called toMessage on Void"
   fromMessage = error "impossible happened: called fromMessage on Void"
 
+instance (Messageable a, Messageable b) => Messageable (a,b) where
+  toMessage (x,y) = encodeTupleElems [BytesElem (toMessage x), BytesElem (toMessage y)]
+  fromMessage bs =
+    case decodeTupleElems bs of
+      Left err -> error $ "bad tuple decode " ++ show err
+      Right [BytesElem x, BytesElem y] -> (fromMessage x, fromMessage y)
+      Right xs -> error $ "unexpected decode " ++ show xs
+
 type StreamName = ByteString
 
 -- TODO: need to think about grouping and windowing. Windowing appears to be a
@@ -297,9 +324,9 @@ type StreamName = ByteString
 
 -- For groupBy, I think we could introduce a type GroupedBy a b, representing
 -- things of type b grouped by type a. Introduction would be by
--- groupBy :: (b -> a) -> Stream c b -> Stream c (GroupedBy a b)
+-- groupBy :: (b -> a) -> Stream b -> Stream (GroupedBy a b)
 -- elimination would be by
--- aggregateBy :: Monoid m => (b -> m) -> Stream c (GroupedBy a b) -> Stream c (a, m)
+-- aggregateBy :: Monoid m => (b -> m) -> Stream (GroupedBy a b) -> Stream (a, m)
 -- or something similar. Problem being that we can't produce an (a,m) until we
 -- know we have seen everything with a particular a key. So perhaps it should be
 -- persisted to a state m associated with each Stream -- Stream m a b?
@@ -315,7 +342,7 @@ type StreamName = ByteString
 -- has been completed (i.e., the half we just received is the last of the two
 -- halves), and then emit a downstream message of the tuple.
 -- tentative type:
--- joinOn :: (a -> e) -> (b -> e) -> Stream c a -> Stream d b -> Stream d (a,b)
+-- joinOn :: (a -> e) -> (b -> e) -> Stream a -> Stream b -> Stream (a,b)
 -- possible user errors/gotchas:
 -- 1. non-unique join values
 -- 2. must be the case for all x,y :: JoinValue that
@@ -324,35 +351,8 @@ type StreamName = ByteString
 --    themselves.
 -- stuff to deal with on our side:
 -- 1. How do we garbage collect halves that never get paired up?
---    The intermediate data must necessarily be keyed by
-
--- joinOn type above is wrong. The output is a stream that claims to take one
--- input and produce two, but really it takes two inputs. Is it sane to give the
--- result the type Stream (c,d) (a,b)? Is composition still associative?
-
-{-
-Let's try to find a counterexample to associativity.
-Assume we have g :: Stream (User,User) (User, User) which is a join where
-the join function is ((==) `on` age). Can we find an f and h where (f.g).h /=
-f.(g.h)?
-
-even though h is supposed to map over the tuples before they get joined, in
-practice it must necessarily be mapped over the tuples after they have been
-joined, because of parametricity -- we can't do different things depending on
-other parts of the stream tree.
-
-So h needs to be something that emits a (User,User). But how would that work?
-And h gets to choose its input type, so it must be reading from a single topic
-that we don't control. This means we can't somehow patch it to read from two
-topics.
-
-This seems to show that we need to change our Stream type to be parametrized
-only by its output. I can't think of anything we lose by doing so, except
-perhaps an Arrow interface in the future, but we seem to at least gain sane
-joins.
-
-
--}
+--    The intermediate data must necessarily be keyed by the projected value,
+--    which is itself not ordered by anything useful.
 
 -- TODO: consider generalizing IO to m in future
 -- TODO: what about state and folds?
@@ -381,26 +381,83 @@ data Stream b where
              -> Stream a
              -> (a -> IO (Maybe b))
              -> Stream b
+  -- | Streaming one-to-one join. If the relationship is not actually one-to-one
+  --   (i.e. the input join functions are not injective), some messages in the
+  --   input streams could be lost.
+  Stream1to1Join :: (Messageable a, Messageable b, Messageable c)
+                 => StreamName
+                 -> Stream a
+                 -> Stream b
+                 -> (a -> c)
+                 -> (b -> c)
+                 -> Stream (a,b)
 
+subspace1to1JoinForKey :: Messageable k
+                       => FDBStreamConfig
+                       -> StreamName
+                       -> k
+                       -> Subspace
+subspace1to1JoinForKey sc sn k =
+  extend (streamConfigSS sc)
+         [BytesElem (sn <> "_11join"), BytesElem (toMessage k)]
 
+get1to1JoinData :: (Messageable a, Messageable b, Messageable k)
+                => FDBStreamConfig
+                -> StreamName
+                -> k
+                -> Transaction (Maybe (Either a b))
+                -- ^ Returns whichever of the two join types was processed first
+                -- for the given key, or Nothing if neither has yet been
+                -- seen.
+get1to1JoinData c sn k = do
+  let ss = subspace1to1JoinForKey c sn k
+  xs <- getEntireRange $ subspaceRange ss
+  return $ case fmap (unpack ss . fst) xs of
+    (Right [BoolElem True, BytesElem x] :<| Empty) -> Just $ Left (fromMessage x)
+    (Right [BoolElem False, BytesElem x] :<| Empty) -> Just $ Right (fromMessage x)
+    -- TODO: uncommenting this triggers https://ghc.haskell.org/trac/ghc/ticket/11822
+    -- (_ :<| _ :<| Empty) -> error "consistency violation in 1-to-1 join logic"
+    Empty -> Nothing
+    -- (Left err :<| _) -> error $ "1to1 join deserialization error: " ++ show err
+    _ -> error "Unexpected data in 1-to-1 join table"
+
+delete1to1JoinData :: Messageable k
+                   => FDBStreamConfig -> StreamName -> k -> Transaction ()
+delete1to1JoinData c sn k = do
+  let ss = subspace1to1JoinForKey c sn k
+  let (x,y) = rangeKeys $ subspaceRange ss
+  clearRange x y
+
+write1to1JoinData :: (Messageable k, Messageable a, Messageable b)
+                  => FDBStreamConfig
+                  -> StreamName
+                  -> k
+                  -> Either a b
+                  -> Transaction ()
+write1to1JoinData c sn k x = do
+  let ss = subspace1to1JoinForKey c sn k
+  case x of
+    Left y -> set (pack ss [BoolElem True, BytesElem (toMessage y)]) ""
+    Right y -> set (pack ss [BoolElem False, BytesElem (toMessage y)]) ""
 
 streamName :: Stream a -> StreamName
 streamName (StreamProducer sn _) = sn
 streamName (StreamConsumer sn _ _) = sn
 streamName (StreamPipe sn _ _) = sn
+streamName (Stream1to1Join sn _ _ _ _) = sn
 
 -- TODO: other persistence backends
+-- TODO: should probably rename to TopologyConfig
 data FDBStreamConfig = FDBStreamConfig {
   streamConfigDB :: FDB.Database,
   streamConfigSS :: FDB.Subspace
 }
 
-inputTopic :: FDBStreamConfig -> Stream a -> TopicConfig
--- TODO: actually StreamProducer has no input topic.
-inputTopic sc (StreamProducer sn _) =
-  makeTopicConfig (streamConfigDB sc) (streamConfigSS sc) sn
-inputTopic sc (StreamConsumer _ inp _) = outputTopic sc inp
-inputTopic sc (StreamPipe _ inp _) = outputTopic sc inp
+inputTopics :: FDBStreamConfig -> Stream a -> [TopicConfig]
+inputTopics _ (StreamProducer _ _) = []
+inputTopics sc (StreamConsumer _ inp _) = [outputTopic sc inp]
+inputTopics sc (StreamPipe _ inp _) = [outputTopic sc inp]
+inputTopics sc (Stream1to1Join _ l r _ _) = [outputTopic sc l, outputTopic sc r]
 
 outputTopic :: FDBStreamConfig -> Stream a -> TopicConfig
 -- TODO: StreamConsumer has no output
@@ -409,24 +466,34 @@ outputTopic sc s =
                   (streamConfigSS sc)
                   (streamName s <> "_out")
 
+foreverLogErrors :: StreamName -> IO () -> IO ()
+foreverLogErrors sn x =
+  forever $
+  handle (\(e :: SomeException) -> putStrLn $ show sn ++ " thread caught " ++ show e) x
+
 -- | Runs a stream. For each StreamPipe in the tree, reads from its input topic
 -- in chunks, runs the monadic action on each input, and writes the result to
 -- its output topic.
 -- TODO: handle cyclical inputs
+-- TODO: this function is responsible for
+-- 1. traversing the structure
+-- 2. executing a segment in the structure
+-- 3. managing a thread that executes a segment in the structure
+-- It should be broken up into multiple functions.
 runStream :: FDBStreamConfig -> Stream a -> IO ()
-runStream c@FDBStreamConfig{..} s@(StreamProducer _rn step) = do
+runStream c@FDBStreamConfig{..} s@(StreamProducer rn step) = do
   -- TODO: what if this thread dies?
   -- TODO: this keeps spinning even if the producer is done and will never
   -- produce again.
   let outCfg = outputTopic c s
-  void $ forkIO $ forever $ do
+  void $ forkIO $ foreverLogErrors rn $ do
     xs <- catMaybes <$> replicateM 10 step -- TODO: batch size config
     writeTopic outCfg (fmap toMessage xs)
 
 runStream c@FDBStreamConfig{..} s@(StreamConsumer rn inp step) = do
   runStream c inp
-  let inCfg = inputTopic c s
-  void $ forkIO $ forever $ do
+  let [inCfg] = inputTopics c s
+  void $ forkIO $ foreverLogErrors rn $ do
     -- TODO: if parsing the message fails, should we still checkpoint?
     -- TODO: blockUntilNew
     xs <- readNAndCheckpoint inCfg rn 10
@@ -434,19 +501,73 @@ runStream c@FDBStreamConfig{..} s@(StreamConsumer rn inp step) = do
 
 runStream c@FDBStreamConfig{..} s@(StreamPipe rn inp step) = do
   runStream c inp
-  let inCfg = inputTopic c s
+  let [inCfg] = inputTopics c s
   let outCfg = outputTopic c s
   -- TODO: blockUntilNew
-  void $ forkIO $ forever $ FDB.runTransactionWithConfig cnf (topicConfigDB inCfg) $ do
-    xs <- readNPastCheckpoint inCfg rn 10 --TODO: auto-adjust batch size
-    case xs of
-      Empty -> return ()
-      (_ :|> (vs,_)) -> do
-        let inMsgs = fmap (fromMessage . snd) xs
-        ys <- catMaybes . toList <$> liftIO (mapM step inMsgs)
-        let outMsgs = fmap toMessage ys
-        writeTopic' outCfg outMsgs
-        checkpoint' inCfg rn vs
-  -- TODO: auto-adjust retries?
-  where cnf = FDB.defaultConfig {maxRetries = maxBound}
+  void $ forkIO $ foreverLogErrors rn $ FDB.runTransactionWithConfig infRetry (topicConfigDB inCfg) $ do
+    xs <- readNAndCheckpoint' inCfg rn 10 --TODO: auto-adjust batch size
+    let inMsgs = fmap (fromMessage . snd) xs
+    ys <- catMaybes . toList <$> liftIO (mapM step inMsgs)
+    let outMsgs = fmap toMessage ys
+    writeTopic' outCfg outMsgs
 
+runStream c@FDBStreamConfig{..} s@(Stream1to1Join rn (lstr :: Stream a) (rstr :: Stream b) pl pr) = do
+  runStream c lstr
+  runStream c rstr
+  let [lCfg, rCfg] = inputTopics c s
+  let outCfg = outputTopic c s
+  void $ forkIO $ foreverLogErrors rn $ do
+    FDB.runTransactionWithConfig infRetry (topicConfigDB lCfg) $ do
+      xs <- readNAndCheckpoint' lCfg rn 10
+      let inMsgs = fmap (fromMessage . snd) xs
+      toWrite <- fmap (catMaybes . toList) $ forM inMsgs $ \(msg :: a) -> do
+        let e = pl msg
+        get1to1JoinData c rn e >>= \case
+          Just (Right (v :: b)) -> do
+            delete1to1JoinData c rn e
+            return $ Just (msg,v)
+          Just (Left (_ :: a)) -> return Nothing -- TODO: warn (or error?) about non-one-to-one join
+          Nothing -> do
+            write1to1JoinData c rn e (Left msg :: Either a b)
+            return Nothing
+      unless (null toWrite) $ do
+        liftIO $ putStrLn $ "join writing " ++ show (unsafeCoerce toWrite :: [(Int, Int)])
+        writeTopic' outCfg (map toMessage toWrite)
+    FDB.runTransactionWithConfig infRetry (topicConfigDB rCfg) $ do
+      xs <- readNAndCheckpoint' rCfg rn 10
+      let inMsgs = fmap (fromMessage . snd) xs
+      toWrite <- fmap (catMaybes . toList) $ forM inMsgs $ \msg -> do
+        let e = pr msg
+        get1to1JoinData c rn e >>= \case
+          Just (Left (v :: a)) -> do
+            delete1to1JoinData c rn e
+            return $ Just (v,msg)
+          Just (Right (_ :: b)) -> return Nothing -- TODO: warn (or error?) about non-one-to-one join
+          Nothing -> do
+            write1to1JoinData c rn e (Right msg :: Either a b)
+            return Nothing
+      -- TODO: I think we could dry out the above by using a utility function to
+      -- return the list of stuff to write and then call swap before writing.
+      unless (null toWrite) $ do
+        liftIO $ putStrLn $ "join writing " ++ show (unsafeCoerce toWrite :: [(Int,Int)])
+        writeTopic' outCfg (map toMessage toWrite)
+
+{-
+completeJoinBatch :: (Messageable a, Messageable b)
+                  => _
+                  -> _
+                  -> Transaction [(a,b)]
+halfJoin inCfg rn isLeft = do
+  xs <- readNAndCheckpoint' inCfg rn 10
+  let inMsgs = fmap (fromMessage . snd) xs
+  toWrite <- fmap (catMaybes . toList) $ forM inMsgs $ \(msg :: a) -> do
+    let e = pl msg
+    get1to1JoinData c rn e >>= \case
+      Just (Right (v :: b)) | isLeft -> do
+        delete1to1JoinData c rn e
+        return $ Just (msg,v)
+      Just (Left (_ :: a)) | not isLeft -> return Nothing -- TODO: warn (or error?) about non-one-to-one join
+      Nothing -> do
+        write1to1JoinData c rn e (Left msg :: Either a b)
+        return Nothing
+-}
