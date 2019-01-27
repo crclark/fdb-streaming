@@ -27,7 +27,6 @@ writeInts sn state n = StreamProducer sn $ do
   curr <- readTVarIO state
   if curr < n
     then do atomically $ modifyTVar' state (+1)
-            putStrLn $ show sn ++ " writing " ++ show curr
             return $ Just curr
     else return Nothing
 

@@ -41,8 +41,6 @@ import FoundationDB.Versionstamp (Versionstamp
                                   decodeVersionstamp)
 import System.IO (stderr, hPutStrLn)
 
-import Unsafe.Coerce
-
 -- TODO: something less insane
 infRetry :: TransactionConfig
 infRetry = FDB.defaultConfig {maxRetries = maxBound}
@@ -418,7 +416,7 @@ get1to1JoinData c sn k = do
     -- TODO: uncommenting this triggers https://ghc.haskell.org/trac/ghc/ticket/11822
     -- (_ :<| _ :<| Empty) -> error "consistency violation in 1-to-1 join logic"
     Empty -> Nothing
-    -- (Left err :<| _) -> error $ "1to1 join deserialization error: " ++ show err
+    (Left err :<| _) -> error $ "1to1 join deserialization error: " ++ show err
     _ -> error "Unexpected data in 1-to-1 join table"
 
 delete1to1JoinData :: Messageable k
@@ -463,7 +461,7 @@ outputTopic :: FDBStreamConfig -> Stream a -> TopicConfig
 -- TODO: StreamConsumer has no output
 outputTopic sc s =
   makeTopicConfig (streamConfigDB sc)
-                  (streamConfigSS sc)
+                  (extend (streamConfigSS sc) [BytesElem (streamName s)])
                   (streamName s <> "_out")
 
 foreverLogErrors :: StreamName -> IO () -> IO ()
@@ -517,57 +515,44 @@ runStream c@FDBStreamConfig{..} s@(Stream1to1Join rn (lstr :: Stream a) (rstr ::
   let [lCfg, rCfg] = inputTopics c s
   let outCfg = outputTopic c s
   void $ forkIO $ foreverLogErrors rn $ do
+    -- TODO: the below two transactions are virtually identical, except
+    -- swapping the usages of Left and Right. Need to find a way to eliminate
+    -- the repetition.
+    -- What this does is read from one of the two join streams, and for each
+    -- message read, compute the join key. Using the join key, look in the
+    -- join table to see if the partner is already there. If so, write the tuple
+    -- downstream. If not, write the one message we do have to the join table.
+    -- TODO: there's a lot of unnecessary blocking in the below code. Use
+    -- futures to increase throughput.
     FDB.runTransactionWithConfig infRetry (topicConfigDB lCfg) $ do
-      xs <- readNAndCheckpoint' lCfg rn 10
-      let inMsgs = fmap (fromMessage . snd) xs
-      toWrite <- fmap (catMaybes . toList) $ forM inMsgs $ \(msg :: a) -> do
-        let e = pl msg
-        get1to1JoinData c rn e >>= \case
-          Just (Right (v :: b)) -> do
-            delete1to1JoinData c rn e
-            return $ Just (msg,v)
-          Just (Left (_ :: a)) -> return Nothing -- TODO: warn (or error?) about non-one-to-one join
+      lMsgs <- fmap (fromMessage.snd) <$> readNAndCheckpoint' lCfg rn 10
+      toWrite <- fmap (catMaybes . toList) $ forM lMsgs $ \(lmsg :: a) -> do
+        let k = pl lmsg
+        get1to1JoinData c rn k >>= \case
+          Just (Right (rmsg :: b)) -> do
+            delete1to1JoinData c rn k
+            return $ Just (lmsg, rmsg)
+          Just (Left (_ :: a)) -> do
+            liftIO $ putStrLn "Got unexpected Left"
+            return Nothing -- TODO: warn (or error?) about non-one-to-one join
           Nothing -> do
-            write1to1JoinData c rn e (Left msg :: Either a b)
+            write1to1JoinData c rn k (Left lmsg :: Either a b)
             return Nothing
-      unless (null toWrite) $ do
-        liftIO $ putStrLn $ "join writing " ++ show (unsafeCoerce toWrite :: [(Int, Int)])
-        writeTopic' outCfg (map toMessage toWrite)
+      writeTopic' outCfg (map toMessage toWrite)
     FDB.runTransactionWithConfig infRetry (topicConfigDB rCfg) $ do
-      xs <- readNAndCheckpoint' rCfg rn 10
-      let inMsgs = fmap (fromMessage . snd) xs
-      toWrite <- fmap (catMaybes . toList) $ forM inMsgs $ \msg -> do
-        let e = pr msg
-        get1to1JoinData c rn e >>= \case
-          Just (Left (v :: a)) -> do
-            delete1to1JoinData c rn e
-            return $ Just (v,msg)
-          Just (Right (_ :: b)) -> return Nothing -- TODO: warn (or error?) about non-one-to-one join
+      rMsgs <- fmap (fromMessage . snd) <$> readNAndCheckpoint' rCfg rn 10
+      toWrite <- fmap (catMaybes . toList) $ forM rMsgs $ \rmsg -> do
+        let k = pr rmsg
+        get1to1JoinData c rn k >>= \case
+          Just (Left (lmsg :: a)) -> do
+            delete1to1JoinData c rn k
+            return $ Just (lmsg, rmsg)
+          Just (Right (_ :: b)) -> do
+            liftIO $ putStrLn "Got unexpected Right"
+            return Nothing -- TODO: warn (or error?) about non-one-to-one join
           Nothing -> do
-            write1to1JoinData c rn e (Right msg :: Either a b)
+            write1to1JoinData c rn k (Right rmsg :: Either a b)
             return Nothing
       -- TODO: I think we could dry out the above by using a utility function to
       -- return the list of stuff to write and then call swap before writing.
-      unless (null toWrite) $ do
-        liftIO $ putStrLn $ "join writing " ++ show (unsafeCoerce toWrite :: [(Int,Int)])
-        writeTopic' outCfg (map toMessage toWrite)
-
-{-
-completeJoinBatch :: (Messageable a, Messageable b)
-                  => _
-                  -> _
-                  -> Transaction [(a,b)]
-halfJoin inCfg rn isLeft = do
-  xs <- readNAndCheckpoint' inCfg rn 10
-  let inMsgs = fmap (fromMessage . snd) xs
-  toWrite <- fmap (catMaybes . toList) $ forM inMsgs $ \(msg :: a) -> do
-    let e = pl msg
-    get1to1JoinData c rn e >>= \case
-      Just (Right (v :: b)) | isLeft -> do
-        delete1to1JoinData c rn e
-        return $ Just (msg,v)
-      Just (Left (_ :: a)) | not isLeft -> return Nothing -- TODO: warn (or error?) about non-one-to-one join
-      Nothing -> do
-        write1to1JoinData c rn e (Left msg :: Either a b)
-        return Nothing
--}
+      writeTopic' outCfg (map toMessage toWrite)
