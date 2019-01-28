@@ -22,9 +22,8 @@ import Data.Binary.Get ( runGet
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (fromStrict)
 import Data.Foldable (foldlM, toList)
-import Data.Maybe (fromJust, catMaybes)
-import qualified Data.Sequence as Seq
-import Data.Sequence (Seq(..), ViewL(..))
+import Data.Maybe (catMaybes)
+import Data.Sequence (Seq(..))
 import Data.Word (Word8, Word16, Word64)
 import Data.Void
 import FoundationDB as FDB
@@ -49,6 +48,8 @@ type TopicName = ByteString
 
 type ReaderName = ByteString
 
+-- TODO: consider switching to the directory layer so the subspace strings
+-- are shorter
 data TopicConfig = TopicConfig { topicConfigDB :: FDB.Database
                                , topicSS :: FDB.Subspace
                                , topicName :: TopicName
@@ -67,6 +68,7 @@ makeTopicConfig topicConfigDB topicSS topicName = TopicConfig{..} where
   topicMsgsSS = FDB.extend topicSS [BytesElem topicName, BytesElem "msgs"]
   topicWriteOneKey = FDB.pack topicMsgsSS [FDB.IncompleteVSElem (IncompleteVersionstamp 0)]
 
+-- TODO: currently not used by anything, but might be useful.
 incrTopicCount :: TopicConfig
                -> Transaction ()
 incrTopicCount conf = do
@@ -116,6 +118,7 @@ writeTopic' tc@TopicConfig{..} bss = do
 -- TODO: support messages larger than FDB size limit, via chunking.
 -- | Transactionally write a batch of messages to the given topic. The
 -- batch must be small enough to fit into a single FoundationDB transaction.
+-- DANGER: can only be called once per topic per transaction.
 writeTopic :: Traversable t
            => TopicConfig
            -> t ByteString
@@ -128,6 +131,8 @@ writeTopic tc@TopicConfig{..} bss = do
 -- | Optimized function for writing a single message to a topic. The key is
 -- precomputed once, so no time needs to be spent computing it. This may be
 -- faster than writing batches of keys. Profile the code to find out!
+-- DANGER: can only be called once per topic per transaction. Cannot be mixed
+-- with other write functions in a single transaction.
 writeOneMsgTopic :: TopicConfig
                  -> ByteString
                  -> IO ()
@@ -148,29 +153,6 @@ trOutput TopicConfig{..} (k,v) =
                         ++ " because "
                         ++ show err
 
-readLastN :: TopicConfig
-          -> Int
-          -> IO (Seq (Versionstamp 'Complete, ByteString))
-readLastN tc@TopicConfig{..} n =
-  FDB.runTransaction topicConfigDB $ do
-    let range = fromJust $
-                FDB.prefixRange $
-                FDB.subspaceKey topicMsgsSS
-    let rangeN = range { rangeReverse = True, rangeLimit = Just n}
-    fmap (trOutput tc) <$> FDB.getEntireRange rangeN
-
-getNAfter :: TopicConfig
-          -> Int
-          -> Versionstamp 'Complete
-          -> IO (Seq (Versionstamp 'Complete, ByteString))
-getNAfter tc@TopicConfig{..} n vs =
-  FDB.runTransaction topicConfigDB $ do
-    let range = fromJust $
-                FDB.prefixRange $
-                FDB.pack topicMsgsSS [FDB.CompleteVSElem vs]
-    let rangeN = range {rangeLimit = Just n}
-    fmap (trOutput tc) <$> FDB.getEntireRange rangeN
-
 -- TODO: should actually set the watch from the same transaction that did the
 -- last read, so that we are guaranteed to be woken by the next write.
 blockUntilNew :: TopicConfig -> IO ()
@@ -182,9 +164,6 @@ blockUntilNew conf@TopicConfig{..} = do
     Left err -> do
       hPutStrLn stderr $ "got error while watching: " ++ show err
       blockUntilNew conf
-
--- TODO: reader implementation
--- two versions: atomic read and checkpoint, non-atomic read and checkpoint
 
 checkpoint' :: TopicConfig
             -> ReaderName
@@ -243,35 +222,6 @@ readNAndCheckpoint :: TopicConfig
                    -> IO (Seq (Versionstamp 'Complete, ByteString))
 readNAndCheckpoint tc@TopicConfig{..} rn n =
   FDB.runTransactionWithConfig infRetry topicConfigDB (readNAndCheckpoint' tc rn n)
-
-readAndCheckpoint' :: TopicConfig
-                   -> ReaderName
-                   -> Transaction (Maybe (Versionstamp 'Complete, ByteString))
-readAndCheckpoint' tc@TopicConfig{..} rn =
-  (Seq.viewl <$> readNPastCheckpoint tc rn 1) >>= \case
-    EmptyL -> return Nothing
-    (x@(vs,_) :< _) -> do
-      checkpoint' tc rn vs
-      return (Just x)
-
--- | Exactly once delivery. Contention on a single key -- could scale poorly!
-readAndCheckpoint :: TopicConfig
-                  -> ReaderName
-                  -> IO (Maybe (Versionstamp 'Complete, ByteString))
-readAndCheckpoint tc@TopicConfig{..} rn =
-  FDB.runTransactionWithConfig infRetry topicConfigDB (readAndCheckpoint' tc rn)
-
--- | At least once delivery. No contention.
-nonAtomicReadThenCheckpoint :: TopicConfig
-                            -> ReaderName
-                            -> IO (Maybe (Versionstamp 'Complete, ByteString))
-nonAtomicReadThenCheckpoint tc@TopicConfig{..} rn = do
-  res <- FDB.runTransaction topicConfigDB (readNPastCheckpoint tc rn 1)
-  case Seq.viewl res of
-    EmptyL -> return Nothing
-    (x@(vs,_) :< _) -> do
-      FDB.runTransaction topicConfigDB (checkpoint' tc rn vs)
-      return (Just x)
 
 {-
 
@@ -355,9 +305,9 @@ type StreamName = ByteString
 -- TODO: consider generalizing IO to m in future
 -- TODO: what about state and folds?
 -- TODO: what about truncating old data by timestamp?
--- TODO: probably shouldn't contain Topic info -- pass in DB connection and
--- build it based on StreamName, perhaps.
 -- TODO: don't recurse infinitely on cyclical topologies.
+-- TODO: If we can make a constant stream that doesn't actually hit the DB, we
+-- would be able to implement 'pure' for this type.
 data Stream b where
   StreamProducer :: Messageable a
                  => StreamName
