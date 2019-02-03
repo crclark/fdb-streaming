@@ -64,7 +64,7 @@ joinTopo = do
   return printer
 
 topSS :: Subspace
-topSS = FDB.subspace [FDB.BytesElem "cool_subspace"]
+topSS = FDB.subspace [FDB.Bytes "cool_subspace"]
 
 mainLoop :: Database -> IO ()
 mainLoop db = do
@@ -74,9 +74,8 @@ mainLoop db = do
   forever $ threadDelay 1000000
 
 main :: IO ()
-main = withFoundationDB currentAPIVersion Nothing $ \case
-  Left err -> error (show err)
-  Right db -> finally (mainLoop db) $ do
+main = withFoundationDB defaultOptions $ \db ->
+  finally (mainLoop db) $ do
     putStrLn "Cleaning up FDB state"
     let (delBegin, delEnd) = rangeKeys $ subspaceRange topSS
     runTransaction db $ clearRange delBegin delEnd

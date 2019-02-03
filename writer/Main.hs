@@ -32,13 +32,11 @@ writeWord64 tc x = do
   writeOneMsgTopic tc (toStrict bs)
 
 main :: IO ()
-main = withFoundationDB currentAPIVersion Nothing $ \case
-  Left err -> error (show err)
-  Right db -> do
-    let ss = subspace [BytesElem "writetest"]
-    let tc = makeTopicConfig db ss "throughput_test"
-    ProgramOpts{..} <- getRecord "Throughput test"
-    let numWriters' = fromMaybe 1 numWriters
-    let numMsgs'    = fromMaybe 100 numMsgs
-    let msgs = [1.. fromIntegral numMsgs']
-    mapConcurrentlyBounded_ numWriters' (writeWord64 tc) msgs
+main = withFoundationDB defaultOptions $ \db -> do
+  let ss = subspace [Bytes "writetest"]
+  let tc = makeTopicConfig db ss "throughput_test"
+  ProgramOpts{..} <- getRecord "Throughput test"
+  let numWriters' = fromMaybe 1 numWriters
+  let numMsgs'    = fromMaybe 100 numMsgs
+  let msgs = [1.. fromIntegral numMsgs']
+  mapConcurrentlyBounded_ numWriters' (writeWord64 tc) msgs

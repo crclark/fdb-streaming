@@ -49,7 +49,7 @@ readIntMsgAndCheckpoint tc = do
 
 -- | returns (sum, count of messages read)
 readSum :: TopicConfig -> (Integer, Integer) -> IO (Integer, Integer)
-readSum tc (!i,!n) = do
+readSum tc (!i,!n) =
   race timeout (readIntMsgAndCheckpoint tc) >>= \case
     Left () -> return (i,n)
     Right j -> do
@@ -59,21 +59,19 @@ readSum tc (!i,!n) = do
   where timeout = threadDelay 1000000 -- 1 second in microseconds
 
 main :: IO ()
-main = withFoundationDB currentAPIVersion Nothing $ \case
-  Left err -> error (show err)
-  Right db -> do
-    let ss = subspace [BytesElem "writetest"]
-    let tc = makeTopicConfig db ss "throughput_test"
-    ProgramOpts{..} <- getRecord "Throughput test"
-    let numReaders' = fromMaybe 1 numReaders
-    let numMsgs'    = fromMaybe 100 numMsgs
-    let start = replicate numReaders' (0,0)
-    sumsCounts <- mapConcurrentlyBounded numReaders' (readSum tc) start
-    putStrLn $ "Sum of received messages is "
-                ++ show (sum $ map fst sumsCounts)
-                ++ " and we expected "
-                ++ show (div (numMsgs' * (numMsgs' + 1)) 2)
-                ++ "\ntotal read transactions: "
-                ++ show (sum $ map snd sumsCounts)
-    let (delBegin, delEnd) = rangeKeys $ subspaceRange ss
-    runTransaction db $ clearRange delBegin delEnd
+main = withFoundationDB defaultOptions $ \db -> do
+  let ss = subspace [Bytes "writetest"]
+  let tc = makeTopicConfig db ss "throughput_test"
+  ProgramOpts{..} <- getRecord "Throughput test"
+  let numReaders' = fromMaybe 1 numReaders
+  let numMsgs'    = fromMaybe 100 numMsgs
+  let start = replicate numReaders' (0,0)
+  sumsCounts <- mapConcurrentlyBounded numReaders' (readSum tc) start
+  putStrLn $ "Sum of received messages is "
+              ++ show (sum $ map fst sumsCounts)
+              ++ " and we expected "
+              ++ show (div (numMsgs' * (numMsgs' + 1)) 2)
+              ++ "\ntotal read transactions: "
+              ++ show (sum $ map snd sumsCounts)
+  let (delBegin, delEnd) = rangeKeys $ subspaceRange ss
+  runTransaction db $ clearRange delBegin delEnd

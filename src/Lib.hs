@@ -27,6 +27,7 @@ import Data.Sequence (Seq(..))
 import Data.Word (Word8, Word16, Word64)
 import Data.Void
 import FoundationDB as FDB
+import FoundationDB.Options as Op
 import FoundationDB.Layer.Subspace as FDB
 import FoundationDB.Layer.Tuple as FDB
 -- TODO: move prefixRangeEnd out of Advanced usage section.
@@ -61,12 +62,12 @@ data TopicConfig = TopicConfig { topicConfigDB :: FDB.Database
 
 makeTopicConfig :: FDB.Database -> FDB.Subspace -> TopicName -> TopicConfig
 makeTopicConfig topicConfigDB topicSS topicName = TopicConfig{..} where
-  topicCountKey = FDB.pack topicSS [ BytesElem topicName
-                                   , BytesElem "meta"
-                                   , BytesElem "count"
+  topicCountKey = FDB.pack topicSS [ Bytes topicName
+                                   , Bytes "meta"
+                                   , Bytes "count"
                                    ]
-  topicMsgsSS = FDB.extend topicSS [BytesElem topicName, BytesElem "msgs"]
-  topicWriteOneKey = FDB.pack topicMsgsSS [FDB.IncompleteVSElem (IncompleteVersionstamp 0)]
+  topicMsgsSS = FDB.extend topicSS [Bytes topicName, Bytes "msgs"]
+  topicWriteOneKey = FDB.pack topicMsgsSS [FDB.IncompleteVS (IncompleteVersionstamp 0)]
 
 -- TODO: currently not used by anything, but might be useful.
 incrTopicCount :: TopicConfig
@@ -74,7 +75,7 @@ incrTopicCount :: TopicConfig
 incrTopicCount conf = do
   let k = topicCountKey conf
   let one = "\x01"
-  FDB.atomicOp FDB.Add k one
+  FDB.atomicOp k (Op.add one)
 
 getTopicCount :: TopicConfig
               -> Transaction (Maybe Word64)
@@ -90,13 +91,13 @@ getTopicCount conf = do
 
 readerSS :: TopicConfig -> ReaderName -> Subspace
 readerSS TopicConfig{..} rn =
-  extend topicSS [BytesElem "rdrs", BytesElem rn]
+  extend topicSS [Bytes "rdrs", Bytes rn]
 
 readerCheckpointKey :: TopicConfig
                     -> ReaderName
                     -> ByteString
 readerCheckpointKey tc rn =
-  FDB.pack (readerSS tc rn) [BytesElem "ckpt"]
+  FDB.pack (readerSS tc rn) [Bytes "ckpt"]
 
 -- | Danger!! It's possible to write multiple messages with the same key
 -- if this is called more than once in a single transaction.
@@ -110,8 +111,8 @@ writeTopic' tc@TopicConfig{..} bss = do
     where
       go !i bs = do
         let vs = IncompleteVersionstamp i
-        let k = FDB.pack topicMsgsSS [FDB.IncompleteVSElem vs]
-        FDB.atomicOp FDB.SetVersionstampedKey k bs
+        let k = FDB.pack topicMsgsSS [FDB.IncompleteVS vs]
+        FDB.atomicOp k (setVersionstampedKey bs)
         incrTopicCount tc
         return (i+1)
 
@@ -138,7 +139,7 @@ writeOneMsgTopic :: TopicConfig
                  -> IO ()
 writeOneMsgTopic tc@TopicConfig{..} bs = do
   FDB.runTransaction topicConfigDB $ do
-    FDB.atomicOp FDB.SetVersionstampedKey topicWriteOneKey bs
+    FDB.atomicOp topicWriteOneKey (setVersionstampedKey bs)
     incrTopicCount tc
 
 trOutput :: TopicConfig
@@ -146,7 +147,7 @@ trOutput :: TopicConfig
          -> (Versionstamp 'Complete, ByteString)
 trOutput TopicConfig{..} (k,v) =
   case FDB.unpack topicMsgsSS k of
-    Right [CompleteVSElem vs] -> (vs, v)
+    Right [CompleteVS vs] -> (vs, v)
     Right t -> error $ "unexpected tuple: " ++ show t
     Left err -> error $ "failed to decode "
                         ++ show k
@@ -172,7 +173,7 @@ checkpoint' :: TopicConfig
 checkpoint' tc rn vs = do
   let k = readerCheckpointKey tc rn
   let v = encodeVersionstamp vs
-  FDB.atomicOp FDB.ByteMax k v
+  FDB.atomicOp k (Op.byteMax v)
 
 -- | For a given reader, returns a versionstamp that is guaranteed to be less
 -- than the first uncheckpointed message in the topic. If the reader hasn't
@@ -194,7 +195,7 @@ readNPastCheckpoint :: TopicConfig
                     -> Transaction (Seq (Versionstamp 'Complete, ByteString))
 readNPastCheckpoint tc rn n = do
   cpvs <- getCheckpoint' tc rn
-  let begin = FDB.pack (topicMsgsSS tc) [CompleteVSElem cpvs]
+  let begin = FDB.pack (topicMsgsSS tc) [CompleteVS cpvs]
   let end = prefixRangeEnd $ FDB.subspaceKey (topicMsgsSS tc)
   let r = Range { rangeBegin = FirstGreaterThan begin
                 , rangeEnd = FirstGreaterOrEq end
@@ -249,11 +250,11 @@ instance Messageable Void where
   fromMessage = error "impossible happened: called fromMessage on Void"
 
 instance (Messageable a, Messageable b) => Messageable (a,b) where
-  toMessage (x,y) = encodeTupleElems [BytesElem (toMessage x), BytesElem (toMessage y)]
+  toMessage (x,y) = encodeTupleElems [Bytes (toMessage x), Bytes (toMessage y)]
   fromMessage bs =
     case decodeTupleElems bs of
       Left err -> error $ "bad tuple decode " ++ show err
-      Right [BytesElem x, BytesElem y] -> (fromMessage x, fromMessage y)
+      Right [Bytes x, Bytes y] -> (fromMessage x, fromMessage y)
       Right xs -> error $ "unexpected decode " ++ show xs
 
 type StreamName = ByteString
@@ -347,7 +348,7 @@ subspace1to1JoinForKey :: Messageable k
                        -> Subspace
 subspace1to1JoinForKey sc sn k =
   extend (streamConfigSS sc)
-         [BytesElem (sn <> "_11join"), BytesElem (toMessage k)]
+         [Bytes (sn <> "_11join"), Bytes (toMessage k)]
 
 get1to1JoinData :: (Messageable a, Messageable b, Messageable k)
                 => FDBStreamConfig
@@ -361,8 +362,8 @@ get1to1JoinData c sn k = do
   let ss = subspace1to1JoinForKey c sn k
   xs <- getEntireRange $ subspaceRange ss
   return $ case fmap (unpack ss . fst) xs of
-    (Right [BoolElem True, BytesElem x] :<| Empty) -> Just $ Left (fromMessage x)
-    (Right [BoolElem False, BytesElem x] :<| Empty) -> Just $ Right (fromMessage x)
+    (Right [Bool True, Bytes x] :<| Empty) -> Just $ Left (fromMessage x)
+    (Right [Bool False, Bytes x] :<| Empty) -> Just $ Right (fromMessage x)
     -- TODO: uncommenting this triggers https://ghc.haskell.org/trac/ghc/ticket/11822
     -- (_ :<| _ :<| Empty) -> error "consistency violation in 1-to-1 join logic"
     Empty -> Nothing
@@ -385,8 +386,8 @@ write1to1JoinData :: (Messageable k, Messageable a, Messageable b)
 write1to1JoinData c sn k x = do
   let ss = subspace1to1JoinForKey c sn k
   case x of
-    Left y -> set (pack ss [BoolElem True, BytesElem (toMessage y)]) ""
-    Right y -> set (pack ss [BoolElem False, BytesElem (toMessage y)]) ""
+    Left y -> set (pack ss [Bool True, Bytes (toMessage y)]) ""
+    Right y -> set (pack ss [Bool False, Bytes (toMessage y)]) ""
 
 streamName :: Stream a -> StreamName
 streamName (StreamProducer sn _) = sn
@@ -411,7 +412,7 @@ outputTopic :: FDBStreamConfig -> Stream a -> TopicConfig
 -- TODO: StreamConsumer has no output
 outputTopic sc s =
   makeTopicConfig (streamConfigDB sc)
-                  (extend (streamConfigSS sc) [BytesElem (streamName s)])
+                  (extend (streamConfigSS sc) [Bytes (streamName s)])
                   (streamName s <> "_out")
 
 foreverLogErrors :: StreamName -> IO () -> IO ()
