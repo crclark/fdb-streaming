@@ -26,7 +26,8 @@ source-repository head
 
 library
   exposed-modules:
-      Lib
+      FDBStreaming,
+      FDBStreaming.Topic
   other-modules:
       Paths_fdb_streaming
   hs-source-dirs:
