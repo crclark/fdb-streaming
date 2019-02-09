@@ -1,20 +1,19 @@
 {-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
 
 module FDBStreaming.Topic where
 
-import Control.Applicative
 import Control.Monad
 import Data.Binary.Get ( runGet
-                       , getWord64le
-                       , getWord32le
-                       , getWord16le
-                       , getWord8)
+                       , getWord64le)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import Data.ByteString.Lazy (fromStrict)
 import Data.Foldable (foldlM)
+import Data.Maybe (fromMaybe)
 import Data.Sequence (Seq(..))
 import Data.Word (Word8, Word16, Word64)
 import FoundationDB as FDB
@@ -53,32 +52,44 @@ data TopicConfig = TopicConfig { topicConfigDB :: FDB.Database
 
 makeTopicConfig :: FDB.Database -> FDB.Subspace -> TopicName -> TopicConfig
 makeTopicConfig topicConfigDB topicSS topicName = TopicConfig{..} where
-  topicCountKey = FDB.pack topicSS [ Bytes topicName
+  topicCountKey = FDB.pack topicSS [ Bytes "tpcs"
+                                   , Bytes topicName
                                    , Bytes "meta"
                                    , Bytes "count"
                                    ]
-  topicMsgsSS = FDB.extend topicSS [Bytes topicName, Bytes "msgs"]
+  topicMsgsSS = FDB.extend topicSS [Bytes "tpcs", Bytes topicName, Bytes "msgs"]
   topicWriteOneKey = FDB.pack topicMsgsSS [FDB.IncompleteVS (IncompleteVersionstamp 0)]
+
+-- TODO: not efficient from either a Haskell or FDB perspective.
+listExistingTopics :: FDB.Database -> FDB.Subspace -> IO [TopicConfig]
+listExistingTopics db ss = runTransaction db $ go (FDB.pack ss [Bytes "tpcs"])
+  where go :: ByteString -> Transaction [TopicConfig]
+        go k = do
+          k' <- getKey (FirstGreaterThan k) >>= await
+          case FDB.unpack ss k' of
+            Right (Bytes "tpcs" : Bytes topicName : _) -> do
+              let nextK = FDB.pack ss [Bytes "tpcs", Bytes topicName] <> "0xff"
+              rest <- go nextK
+              let conf = makeTopicConfig db ss topicName
+              return (conf : rest)
+            _ -> return []
 
 -- TODO: currently not used by anything, but might be useful.
 incrTopicCount :: TopicConfig
                -> Transaction ()
 incrTopicCount conf = do
   let k = topicCountKey conf
-  let one = "\x01"
+  let one = "\x01\x00\x00\x00\x00\x00\x00\x00"
   FDB.atomicOp k (Op.add one)
 
 getTopicCount :: TopicConfig
-              -> Transaction (Maybe Word64)
+              -> Transaction Word64
 getTopicCount conf = do
   let k = topicCountKey conf
-  cBytes <- FDB.get k >>= await
-  -- TODO: partial
-  return $ fmap (runGet parse . fromStrict) cBytes
-  where parse = getWord64le
-                <|> fromIntegral <$> getWord32le
-                <|> fromIntegral <$> getWord16le
-                <|> fromIntegral <$> getWord8
+  cBytes <- fromMaybe "" <$> (FDB.get k >>= await)
+  let paddedBytes = cBytes
+                    <> (BS.pack (take (8 - BS.length cBytes) (cycle [0])))
+  return $ (runGet getWord64le . fromStrict) paddedBytes
 
 readerSS :: TopicConfig -> ReaderName -> Subspace
 readerSS TopicConfig{..} rn =

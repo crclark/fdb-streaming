@@ -39,7 +39,8 @@ library
       containers,
       text,
       binary,
-      foundationdb-haskell
+      foundationdb-haskell,
+      mtl
   default-language: Haskell2010
 
 executable fdb-streaming-writer

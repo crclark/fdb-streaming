@@ -5,7 +5,8 @@
 
 module Main where
 
-import Lib
+import FDBStreaming
+import FDBStreaming.Topic
 import Control.Concurrent.Async
 import Control.Concurrent.Async.Extra
 import Control.Concurrent.STM

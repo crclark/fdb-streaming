@@ -14,10 +14,12 @@ import Control.Concurrent
 import Control.Exception
 import Control.Monad
 import Control.Monad.IO.Class
+import qualified Control.Monad.State as State
 import Data.ByteString (ByteString)
 import Data.Foldable (toList)
 import Data.Maybe (catMaybes)
 import Data.Sequence (Seq(..))
+import qualified Data.Set as Set
 import Data.Void
 import FoundationDB as FDB
 import FoundationDB.Layer.Subspace as FDB
@@ -140,6 +142,34 @@ data Stream b where
                  -> (b -> c)
                  -> Stream (a,b)
 
+streamName :: Stream a -> StreamName
+streamName (StreamProducer sn _)         = sn
+streamName (StreamConsumer sn _ _)       = sn
+streamName (StreamPipe sn _ _)           = sn
+streamName (Stream1to1Join sn _ _ _ _)   = sn
+
+-- TODO: kind of surprising that this has to be run on every 'StreamConsumer' in
+-- the topology, and then shared upstream elements will get traversed repeatedly
+-- regardless. Maybe we should just use a graph library instead.
+-- | do something to each processor in a stream. Each stream is traversed once,
+-- even in the case of loops.
+traverseStream :: Stream b -> (forall a . Stream a -> IO ()) -> IO ()
+traverseStream s a = State.evalStateT (go s) mempty
+  where go :: forall c . Stream c -> State.StateT (Set.Set StreamName) IO ()
+        go st = do
+          done <- State.get
+          if Set.member (streamName st) done
+             then return ()
+             else do
+              State.put (Set.insert (streamName st) done)
+              process st
+
+        process :: forall d. Stream d -> State.StateT (Set.Set StreamName) IO ()
+        process st@(StreamProducer _ _)       = liftIO (a st)
+        process st@(StreamConsumer _ up _)    = liftIO (a st) >> go up
+        process st@(StreamPipe _ up _)        = liftIO (a st) >> go up
+        process st@(Stream1to1Join _ x y _ _) = liftIO (a st) >> go x >> go y
+
 subspace1to1JoinForKey :: Messageable k
                        => FDBStreamConfig
                        -> StreamName
@@ -147,7 +177,7 @@ subspace1to1JoinForKey :: Messageable k
                        -> Subspace
 subspace1to1JoinForKey sc sn k =
   extend (streamConfigSS sc)
-         [Bytes (sn <> "_11join"), Bytes (toMessage k)]
+         [Bytes "tpcs", Bytes sn, Bytes "1:1join", Bytes (toMessage k)]
 
 get1to1JoinData :: (Messageable a, Messageable b, Messageable k)
                 => FDBStreamConfig
@@ -174,6 +204,7 @@ delete1to1JoinData :: Messageable k
 delete1to1JoinData c sn k = do
   let ss = subspace1to1JoinForKey c sn k
   let (x,y) = rangeKeys $ subspaceRange ss
+  --liftIO $ putStrLn $ "clearing " ++ show (x,y)
   clearRange x y
 
 write1to1JoinData :: (Messageable k, Messageable a, Messageable b)
@@ -188,31 +219,27 @@ write1to1JoinData c sn k x = do
     Left y -> set (pack ss [Bool True, Bytes (toMessage y)]) ""
     Right y -> set (pack ss [Bool False, Bytes (toMessage y)]) ""
 
-streamName :: Stream a -> StreamName
-streamName (StreamProducer sn _) = sn
-streamName (StreamConsumer sn _ _) = sn
-streamName (StreamPipe sn _ _) = sn
-streamName (Stream1to1Join sn _ _ _ _) = sn
-
 -- TODO: other persistence backends
 -- TODO: should probably rename to TopologyConfig
 data FDBStreamConfig = FDBStreamConfig {
   streamConfigDB :: FDB.Database,
   streamConfigSS :: FDB.Subspace
+  -- ^ subspace that will contain all state for the stream topology
 }
 
 inputTopics :: FDBStreamConfig -> Stream a -> [TopicConfig]
 inputTopics _ (StreamProducer _ _) = []
-inputTopics sc (StreamConsumer _ inp _) = [outputTopic sc inp]
-inputTopics sc (StreamPipe _ inp _) = [outputTopic sc inp]
-inputTopics sc (Stream1to1Join _ l r _ _) = [outputTopic sc l, outputTopic sc r]
+inputTopics sc (StreamConsumer _ inp _) = catMaybes [outputTopic sc inp]
+inputTopics sc (StreamPipe _ inp _) = catMaybes [outputTopic sc inp]
+inputTopics sc (Stream1to1Join _ l r _ _) = catMaybes [outputTopic sc l, outputTopic sc r]
 
-outputTopic :: FDBStreamConfig -> Stream a -> TopicConfig
--- TODO: StreamConsumer has no output
-outputTopic sc s =
+outputTopic :: FDBStreamConfig -> Stream a -> Maybe TopicConfig
+-- TODO: StreamConsumer has no output. Should it not be included in this GADT?
+outputTopic _ (StreamConsumer _ _ _) = Nothing
+outputTopic sc s = Just $
   makeTopicConfig (streamConfigDB sc)
-                  (extend (streamConfigSS sc) [Bytes (streamName s)])
-                  (streamName s <> "_out")
+                  (streamConfigSS sc)
+                  (streamName s)
 
 foreverLogErrors :: StreamName -> IO () -> IO ()
 foreverLogErrors sn x =
@@ -236,7 +263,7 @@ runStream c@FDBStreamConfig{..} s@(StreamProducer rn step) = do
   -- TODO: what if this thread dies?
   -- TODO: this keeps spinning even if the producer is done and will never
   -- produce again.
-  let outCfg = outputTopic c s
+  let Just outCfg = outputTopic c s
   void $ forkIO $ foreverLogErrors rn $ do
     xs <- catMaybes <$> replicateM 10 step -- TODO: batch size config
     writeTopic outCfg (fmap toMessage xs)
@@ -253,7 +280,7 @@ runStream c@FDBStreamConfig{..} s@(StreamConsumer rn inp step) = do
 runStream c@FDBStreamConfig{..} s@(StreamPipe rn inp step) = do
   runStream c inp
   let [inCfg] = inputTopics c s
-  let outCfg = outputTopic c s
+  let Just outCfg = outputTopic c s
   -- TODO: blockUntilNew
   void $ forkIO $ foreverLogErrors rn $ FDB.runTransactionWithConfig infRetry (topicConfigDB inCfg) $ do
     xs <- readNAndCheckpoint' inCfg rn 10 --TODO: auto-adjust batch size
@@ -266,7 +293,7 @@ runStream c@FDBStreamConfig{..} s@(Stream1to1Join rn (lstr :: Stream a) (rstr ::
   runStream c lstr
   runStream c rstr
   let [lCfg, rCfg] = inputTopics c s
-  let outCfg = outputTopic c s
+  let Just outCfg = outputTopic c s
   void $ forkIO $ foreverLogErrors rn $ do
     -- TODO: the below two transactions are virtually identical, except
     -- swapping the usages of Left and Right. Need to find a way to eliminate
@@ -287,7 +314,6 @@ runStream c@FDBStreamConfig{..} s@(Stream1to1Join rn (lstr :: Stream a) (rstr ::
             delete1to1JoinData c rn k
             return $ Just (lmsg, rmsg)
           Just (Left (_ :: a)) -> do
-            liftIO $ putStrLn "Got unexpected Left"
             return Nothing -- TODO: warn (or error?) about non-one-to-one join
           Nothing -> do
             write1to1JoinData c rn k (Left lmsg :: Either a b)
