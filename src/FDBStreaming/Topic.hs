@@ -6,6 +6,7 @@
 
 module FDBStreaming.Topic where
 
+import Control.Concurrent.Async (async, waitAny)
 import Control.Monad
 import Data.Binary.Get ( runGet
                        , getWord64le)
@@ -67,7 +68,7 @@ data TopicConfig = TopicConfig { topicConfigDB :: FDB.Database
                                , topicCountKey :: ByteString
                                , partitionMsgsSS :: PartitionId -> FDB.Subspace
                                , partitionCountKey :: PartitionId -> ByteString
-                               , numPartitions :: Int
+                               , numPartitions :: Integer
                                -- ^ TODO: don't export
                                }
 
@@ -90,7 +91,7 @@ makeTopicConfig topicConfigDB topicSS topicName = TopicConfig{..}
                                       , Bytes "meta"
                                       , Bytes "count"
                                       ]
-    numPartitions = 10 -- TODO: configurable
+    numPartitions = 10 -- TODO: make configurable
 
 randPartition :: TopicConfig -> IO PartitionId
 randPartition TopicConfig{..} = fromIntegral <$> randomRIO (0,numPartitions)
@@ -205,19 +206,29 @@ blockUntilNew conf@TopicConfig{..} = do
       hPutStrLn stderr $ "got error while watching: " ++ show err
       blockUntilNew conf
 
--- TODO: contention on the checkpoint key means that I/O bound readers can't
--- scale effectively. This could be fixed by splitting a topic into n
--- partitions, dropping the total ordering on messages that we currently have.
--- Then each partition would have its own checkpoint, and readers would choose
--- a random (?) partition each read. This would make blocking on new messages
--- more complex, however -- we would need to make one watch per partition, and
--- upon unblocking, tell the blocked thread which partition to read to get new
--- messages.
---
--- If a user really does need a total ordering on messages (which seems
--- unlikely), they could set n to 1 and deal with the scalability consequences.
--- Actually, we would still have a total ordering thanks to versionstamps; it
--- just wouldn't be easy to read them all out in that order.
+-- | Returns a watch for each partition of the given topic.
+-- Caveats:
+-- 1. if numPartitions * numReaders is large, this could exhaust the
+--    max number of watches in FDB (default is 10k).
+-- 2. could increase conflicts if all readers are doing this and the write freq
+-- is low -- everyone would wake up and try to read from the same partition each
+-- time there's a write.
+watchTopic' :: TopicConfig -> Transaction [FutureIO PartitionId]
+watchTopic' tc = forM [0..numPartitions tc] $ \p ->
+  fmap (const p) <$> watch (partitionCountKey tc p)
+
+-- | For use with the return value of 'watchTopic''. Must be called from outside
+-- the transaction within which 'watchTopic'' was called.
+awaitTopic :: [FutureIO PartitionId] -> IO (Either FDB.Error PartitionId)
+awaitTopic fs = do
+  (_,x) <- mapM (async . awaitIO) fs >>= waitAny
+  return x
+
+watchTopic :: TopicConfig -> IO (Either FDB.Error PartitionId)
+watchTopic tc = do
+  ws <- runTransaction (topicConfigDB tc) (watchTopic' tc)
+  awaitTopic ws
+
 checkpoint' :: TopicConfig
             -> PartitionId
             -> ReaderName
@@ -268,7 +279,7 @@ readNAndCheckpoint' :: TopicConfig
                     -> Transaction (Seq (Versionstamp 'Complete, ByteString))
 readNAndCheckpoint' tc@TopicConfig{..} p rn n =
   readNPastCheckpoint tc p rn n >>= \case
-    (x@(_ :|> (vs,_))) -> do
+    x@(_ :|> (vs,_)) -> do
       checkpoint' tc p rn vs
       return x
     _ -> return mempty

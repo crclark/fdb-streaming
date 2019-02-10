@@ -35,7 +35,8 @@ library
       binary,
       foundationdb-haskell,
       mtl,
-      random
+      random,
+      async
   default-language: Haskell2010
 
 executable fdb-streaming-writer
