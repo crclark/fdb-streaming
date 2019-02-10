@@ -43,8 +43,7 @@ keepOdds input = StreamPipe "keepOdds" input $ \x ->
 -- TODO: obviously with state as a tvar this can't actually be split into
 -- multiple processes yet.
 sumInts :: TVar Int -> Stream Int -> Stream Void
-sumInts state input = StreamConsumer "sumInts" input $ \x -> do
-  curr <- readTVarIO state
+sumInts state input = StreamConsumer "sumInts" input $ \x ->
   atomically $ modifyTVar' state (+x)
 
 joinId :: Messageable a => StreamName -> Stream a -> Stream a -> Stream (a,a)
@@ -66,8 +65,8 @@ joinTopo = do
   writeState2 <- newTVarIO 0
   let writer1 = writeInts "write1" writeState1 100000
   let writer2 = writeInts "write2" writeState2 100000
-  let join = joinId "intjoin" writer1 writer2
-  let printer = StreamConsumer "print" join printEvery1000
+  let joiner = joinId "intjoin" writer1 writer2
+  let printer = StreamConsumer "print" joiner printEvery1000
   return printer
 
 topSS :: Subspace

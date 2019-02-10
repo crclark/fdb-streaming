@@ -5,6 +5,7 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE ViewPatterns #-}
 
 module FDBStreaming where
 
@@ -183,28 +184,35 @@ get1to1JoinData :: (Messageable a, Messageable b, Messageable k)
                 => FDBStreamConfig
                 -> StreamName
                 -> k
-                -> Transaction (Maybe (Either a b))
+                -> Transaction (Future (Maybe (Either a b)))
                 -- ^ Returns whichever of the two join types was processed first
                 -- for the given key, or Nothing if neither has yet been
                 -- seen.
 get1to1JoinData c sn k = do
-  let ss = subspace1to1JoinForKey c sn k
-  xs <- getEntireRange $ subspaceRange ss
-  return $ case fmap (unpack ss . fst) xs of
-    (Right [Bool True, Bytes x] :<| Empty) -> Just $ Left (fromMessage x)
-    (Right [Bool False, Bytes x] :<| Empty) -> Just $ Right (fromMessage x)
-    -- TODO: uncommenting this triggers https://ghc.haskell.org/trac/ghc/ticket/11822
-    -- (_ :<| _ :<| Empty) -> error "consistency violation in 1-to-1 join logic"
-    Empty -> Nothing
-    (Left err :<| _) -> error $ "1to1 join deserialization error: " ++ show err
-    _ -> error "Unexpected data in 1-to-1 join table"
+  xs <- getRange' (subspaceRange ss) FDB.StreamingModeWantAll
+  return $ flip fmap xs $ \case
+    RangeDone kvs -> parse kvs
+    RangeMore kvs _ -> parse kvs
+
+  where parse Empty = Nothing
+        parse ((unpack ss -> (Right [Bool True, Bytes x]),_) :<| Empty) =
+          Just $ Left (fromMessage x)
+        parse ((unpack ss -> (Right [Bool False, Bytes x]),_) :<| Empty) =
+          Just $ Right (fromMessage x)
+        parse ((unpack ss -> Left err,_) :<| Empty) =
+          error $ "Deserialization error in 1-to-1 join table: " ++ show err
+        parse (_ :<| Empty) =
+          error $ "1-to-1 join tuple in wrong format"
+        parse (_ :<| _ :<| _) =
+          error "consistency violation in 1-to-1 join table"
+
+        ss = subspace1to1JoinForKey c sn k
 
 delete1to1JoinData :: Messageable k
                    => FDBStreamConfig -> StreamName -> k -> Transaction ()
 delete1to1JoinData c sn k = do
   let ss = subspace1to1JoinForKey c sn k
   let (x,y) = rangeKeys $ subspaceRange ss
-  --liftIO $ putStrLn $ "clearing " ++ show (x,y)
   clearRange x y
 
 write1to1JoinData :: (Messageable k, Messageable a, Messageable b)
@@ -302,14 +310,20 @@ runStream c@FDBStreamConfig{..} s@(Stream1to1Join rn (lstr :: Stream a) (rstr ::
     -- message read, compute the join key. Using the join key, look in the
     -- join table to see if the partner is already there. If so, write the tuple
     -- downstream. If not, write the one message we do have to the join table.
-    -- TODO: there's a lot of unnecessary blocking in the below code. Use
-    -- futures to increase throughput.
     -- TODO: think of a way to garbage collect items that never get joined.
     FDB.runTransactionWithConfig infRetry (topicConfigDB lCfg) $ do
-      lMsgs <- fmap (fromMessage.snd) <$> readNAndCheckpoint' lCfg rn 10
-      toWrite <- fmap (catMaybes . toList) $ forM lMsgs $ \(lmsg :: a) -> do
+      lMsgs <- fmap (fromMessage . snd) <$> readNAndCheckpoint' lCfg rn 10
+      joinFutures <- forM lMsgs $ \(lmsg :: a) -> do
         let k = pl lmsg
-        get1to1JoinData c rn k >>= \case
+        future <- get1to1JoinData c rn k
+        return (future, lmsg)
+      -- Now that we have sent all the gets, await them
+      joinData <- forM joinFutures $ \(future, lmsg) -> do
+        j <- await future
+        return (j, lmsg)
+      toWrite <- fmap (catMaybes . toList) $ forM joinData $ \(d, lmsg) -> do
+        let k = pl lmsg
+        case d of
           Just (Right (rmsg :: b)) -> do
             delete1to1JoinData c rn k
             return $ Just (lmsg, rmsg)
@@ -321,9 +335,16 @@ runStream c@FDBStreamConfig{..} s@(Stream1to1Join rn (lstr :: Stream a) (rstr ::
       writeTopic' outCfg (map toMessage toWrite)
     FDB.runTransactionWithConfig infRetry (topicConfigDB rCfg) $ do
       rMsgs <- fmap (fromMessage . snd) <$> readNAndCheckpoint' rCfg rn 10
-      toWrite <- fmap (catMaybes . toList) $ forM rMsgs $ \rmsg -> do
+      joinFutures <- forM rMsgs $ \(rmsg :: b) -> do
         let k = pr rmsg
-        get1to1JoinData c rn k >>= \case
+        future <- get1to1JoinData c rn k
+        return (future, rmsg)
+      joinData <- forM joinFutures $ \(future, rmsg) -> do
+        j <- await future
+        return (j, rmsg)
+      toWrite <- fmap (catMaybes . toList) $ forM joinData $ \(d, rmsg) -> do
+        let k = pr rmsg
+        case d of
           Just (Left (lmsg :: a)) -> do
             delete1to1JoinData c rn k
             return $ Just (lmsg, rmsg)
