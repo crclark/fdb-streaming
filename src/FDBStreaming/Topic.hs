@@ -93,7 +93,7 @@ getTopicCount conf = do
 
 readerSS :: TopicConfig -> ReaderName -> Subspace
 readerSS TopicConfig{..} rn =
-  extend topicSS [Bytes "rdrs", Bytes rn]
+  extend topicSS [Bytes "tpcs", Bytes topicName, Bytes "rdrs", Bytes rn]
 
 readerCheckpointKey :: TopicConfig
                     -> ReaderName
@@ -168,6 +168,17 @@ blockUntilNew conf@TopicConfig{..} = do
       hPutStrLn stderr $ "got error while watching: " ++ show err
       blockUntilNew conf
 
+-- TODO: contention on the checkpoint key means that I/O bound readers can't
+-- scale effectively. This could be fixed by splitting a topic into n
+-- partitions, dropping the total ordering on messages that we currently have.
+-- Then each partition would have its own checkpoint, and readers would choose
+-- a random (?) partition each read. This would make blocking on new messages
+-- more complex, however -- we would need to make one watch per partition, and
+-- upon unblocking, tell the blocked thread which partition to read to get new
+-- messages.
+--
+-- If a user really does need a total ordering on messages (which seems
+-- unlikely), they could set n to 1 and deal with the scalability consequences.
 checkpoint' :: TopicConfig
             -> ReaderName
             -> Versionstamp 'Complete

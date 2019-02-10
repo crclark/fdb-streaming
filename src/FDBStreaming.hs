@@ -312,7 +312,7 @@ runStream c@FDBStreamConfig{..} s@(Stream1to1Join rn (lstr :: Stream a) (rstr ::
     -- downstream. If not, write the one message we do have to the join table.
     -- TODO: think of a way to garbage collect items that never get joined.
     FDB.runTransactionWithConfig infRetry (topicConfigDB lCfg) $ do
-      lMsgs <- fmap (fromMessage . snd) <$> readNAndCheckpoint' lCfg rn 10
+      lMsgs <- fmap (fromMessage . snd) <$> readNAndCheckpoint' lCfg rn 20
       joinFutures <- forM lMsgs $ \(lmsg :: a) -> do
         let k = pl lmsg
         future <- get1to1JoinData c rn k
@@ -334,7 +334,7 @@ runStream c@FDBStreamConfig{..} s@(Stream1to1Join rn (lstr :: Stream a) (rstr ::
             return Nothing
       writeTopic' outCfg (map toMessage toWrite)
     FDB.runTransactionWithConfig infRetry (topicConfigDB rCfg) $ do
-      rMsgs <- fmap (fromMessage . snd) <$> readNAndCheckpoint' rCfg rn 10
+      rMsgs <- fmap (fromMessage . snd) <$> readNAndCheckpoint' rCfg rn 20
       joinFutures <- forM rMsgs $ \(rmsg :: b) -> do
         let k = pr rmsg
         future <- get1to1JoinData c rn k
