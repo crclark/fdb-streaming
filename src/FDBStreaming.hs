@@ -208,7 +208,7 @@ get1to1JoinData c sn k = do
         parse ((unpack ss -> Left err,_) :<| Empty) =
           error $ "Deserialization error in 1-to-1 join table: " ++ show err
         parse (_ :<| Empty) =
-          error $ "1-to-1 join tuple in wrong format"
+          error "1-to-1 join tuple in wrong format"
         parse (_ :<| _ :<| _) =
           error "consistency violation in 1-to-1 join table"
 
@@ -251,7 +251,7 @@ inputTopics sc (Stream1to1Join _ l r _ _) = catMaybes [outputTopic sc l, outputT
 outputTopic :: FDBStreamConfig -> Stream a -> Maybe TopicConfig
 -- TODO: StreamConsumer has no output. Should it not be included in this GADT?
 outputTopic _ (StreamExistingTopic _ tc) = Just tc
-outputTopic _ (StreamConsumer _ _ _) = Nothing
+outputTopic _ StreamConsumer{} = Nothing
 outputTopic sc s = Just $
   makeTopicConfig (streamConfigDB sc)
                   (streamConfigSS sc)
@@ -339,7 +339,7 @@ runStream c@FDBStreamConfig{..} s@(Stream1to1Join rn (lstr :: Stream a) (rstr ::
           Just (Right (rmsg :: b)) -> do
             delete1to1JoinData c rn k
             return $ Just (lmsg, rmsg)
-          Just (Left (_ :: a)) -> do
+          Just (Left (_ :: a)) ->
             return Nothing -- TODO: warn (or error?) about non-one-to-one join
           Nothing -> do
             write1to1JoinData c rn k (Left lmsg :: Either a b)

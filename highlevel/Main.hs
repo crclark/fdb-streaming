@@ -1,5 +1,4 @@
 {-# LANGUAGE OverloadedStrings#-}
-{-# LANGUAGE LambdaCase #-}
 
 module Main where
 
@@ -13,8 +12,7 @@ import Control.Concurrent.STM (TVar, readTVarIO, atomically, modifyTVar', newTVa
 import Control.Exception
 import Data.Binary.Put (runPut, putWord64le)
 import Data.Binary.Get (runGet, getWord64le)
-import Data.List (sortBy)
-import Data.Ord (comparing)
+import Data.List (sortOn)
 import Data.Void
 import Data.ByteString.Lazy (toStrict, fromStrict)
 
@@ -36,12 +34,9 @@ writeInts sn state n = StreamProducer sn $ do
 
 writeIntsTopic :: TopicConfig -> Int -> IO ()
 writeIntsTopic tc n = go 0
-  where go i =
-          if i < n
-             then do
-              writeTopic tc (map toMessage [i..i+10])
-              go (i+11)
-             else return ()
+  where go i = when (i < n) $ do
+                 writeTopic tc (map toMessage [i..i+10])
+                 go (i+11)
 
 keepOdds :: Stream Int -> Stream Int
 keepOdds input = StreamPipe "keepOdds" input $ \x ->
@@ -90,8 +85,8 @@ printStats db ss = do
     threadDelay 1000000
     after <- runTransaction db $ getTopicCount tc
     return (topicName tc, fromIntegral after - fromIntegral before)
-  forM_ (sortBy (comparing fst) ts) $ \(tn, c) -> do
-    putStrLn $ (show tn) ++ ": " ++ show (c :: Int) ++ " msgs/sec"
+  forM_ (sortOn fst ts) $ \(tn, c) ->
+    putStrLn $ show tn ++ ": " ++ show (c :: Int) ++ " msgs/sec"
 
 mainLoop :: Database -> IO ()
 mainLoop db = do
