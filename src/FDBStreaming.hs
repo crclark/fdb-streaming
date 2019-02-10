@@ -291,11 +291,13 @@ runStream c@FDBStreamConfig{..} s@(StreamPipe rn inp step) = do
   let Just outCfg = outputTopic c s
   -- TODO: blockUntilNew
   void $ forkIO $ foreverLogErrors rn $ FDB.runTransactionWithConfig infRetry (topicConfigDB inCfg) $ do
-    xs <- readNAndCheckpoint' inCfg rn 10 --TODO: auto-adjust batch size
+    p <- liftIO $ randPartition inCfg
+    xs <- readNAndCheckpoint' inCfg p rn 10 --TODO: auto-adjust batch size
     let inMsgs = fmap (fromMessage . snd) xs
     ys <- catMaybes . toList <$> liftIO (mapM step inMsgs)
     let outMsgs = fmap toMessage ys
-    writeTopic' outCfg outMsgs
+    p' <- liftIO $ randPartition outCfg
+    writeTopic' outCfg p' outMsgs
 
 runStream c@FDBStreamConfig{..} s@(Stream1to1Join rn (lstr :: Stream a) (rstr :: Stream b) pl pr) = do
   runStream c lstr
@@ -312,7 +314,8 @@ runStream c@FDBStreamConfig{..} s@(Stream1to1Join rn (lstr :: Stream a) (rstr ::
     -- downstream. If not, write the one message we do have to the join table.
     -- TODO: think of a way to garbage collect items that never get joined.
     FDB.runTransactionWithConfig infRetry (topicConfigDB lCfg) $ do
-      lMsgs <- fmap (fromMessage . snd) <$> readNAndCheckpoint' lCfg rn 20
+      p <- liftIO $ randPartition lCfg
+      lMsgs <- fmap (fromMessage . snd) <$> readNAndCheckpoint' lCfg p rn 10
       joinFutures <- forM lMsgs $ \(lmsg :: a) -> do
         let k = pl lmsg
         future <- get1to1JoinData c rn k
@@ -332,9 +335,11 @@ runStream c@FDBStreamConfig{..} s@(Stream1to1Join rn (lstr :: Stream a) (rstr ::
           Nothing -> do
             write1to1JoinData c rn k (Left lmsg :: Either a b)
             return Nothing
-      writeTopic' outCfg (map toMessage toWrite)
+      p' <- liftIO $ randPartition outCfg
+      writeTopic' outCfg p' (map toMessage toWrite)
     FDB.runTransactionWithConfig infRetry (topicConfigDB rCfg) $ do
-      rMsgs <- fmap (fromMessage . snd) <$> readNAndCheckpoint' rCfg rn 20
+      p <- liftIO $ randPartition rCfg
+      rMsgs <- fmap (fromMessage . snd) <$> readNAndCheckpoint' rCfg p rn 10
       joinFutures <- forM rMsgs $ \(rmsg :: b) -> do
         let k = pr rmsg
         future <- get1to1JoinData c rn k
@@ -356,4 +361,5 @@ runStream c@FDBStreamConfig{..} s@(Stream1to1Join rn (lstr :: Stream a) (rstr ::
             return Nothing
       -- TODO: I think we could dry out the above by using a utility function to
       -- return the list of stuff to write and then call swap before writing.
-      writeTopic' outCfg (map toMessage toWrite)
+      p' <- liftIO $ randPartition outCfg
+      writeTopic' outCfg p' (map toMessage toWrite)

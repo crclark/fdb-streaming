@@ -1,9 +1,3 @@
--- This file has been generated from package.yaml by hpack version 0.28.2.
---
--- see: https://github.com/sol/hpack
---
--- hash: 6b20c277c7fb92aaa48b1e706097c42544ce9ec46117bb1064acea11acdd8329
-
 name:           fdb-streaming
 version:        0.1.0.0
 description:    Please see the README on GitHub at <https://github.com/githubuser/fdb-streaming#readme>
@@ -40,7 +34,8 @@ library
       text,
       binary,
       foundationdb-haskell,
-      mtl
+      mtl,
+      random
   default-language: Haskell2010
 
 executable fdb-streaming-writer

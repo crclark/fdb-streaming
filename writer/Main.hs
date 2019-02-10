@@ -30,7 +30,9 @@ instance ParseRecord ProgramOpts
 writeWord64 :: TopicConfig -> Word64 -> IO ()
 writeWord64 tc x = do
   let bs = runPut $ putWord64le x
-  writeOneMsgTopic tc (toStrict bs)
+  --writeOneMsgTopic tc (toStrict bs)
+  return () -- TODO: I deleted writeOneMsgTopic. fix?
+
 
 main :: IO ()
 main = withFoundationDB defaultOptions $ \db -> do
