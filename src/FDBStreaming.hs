@@ -112,6 +112,10 @@ type StreamName = ByteString
 -- TODO: If we can make a constant stream that doesn't actually hit the DB, we
 -- would be able to implement 'pure' for this type.
 data Stream b where
+  StreamExistingTopic :: Messageable a
+                      => StreamName
+                      -> TopicConfig
+                      -> Stream a
   StreamProducer :: Messageable a
                  => StreamName
                  -- Maybe allows for filtering
@@ -144,6 +148,7 @@ data Stream b where
                  -> Stream (a,b)
 
 streamName :: Stream a -> StreamName
+streamName (StreamExistingTopic sn _)    = sn
 streamName (StreamProducer sn _)         = sn
 streamName (StreamConsumer sn _ _)       = sn
 streamName (StreamPipe sn _ _)           = sn
@@ -166,6 +171,7 @@ traverseStream s a = State.evalStateT (go s) mempty
               process st
 
         process :: forall d. Stream d -> State.StateT (Set.Set StreamName) IO ()
+        process st@(StreamExistingTopic _ _)  = liftIO (a st)
         process st@(StreamProducer _ _)       = liftIO (a st)
         process st@(StreamConsumer _ up _)    = liftIO (a st) >> go up
         process st@(StreamPipe _ up _)        = liftIO (a st) >> go up
@@ -236,6 +242,7 @@ data FDBStreamConfig = FDBStreamConfig {
 }
 
 inputTopics :: FDBStreamConfig -> Stream a -> [TopicConfig]
+inputTopics _ (StreamExistingTopic _ _) = []
 inputTopics _ (StreamProducer _ _) = []
 inputTopics sc (StreamConsumer _ inp _) = catMaybes [outputTopic sc inp]
 inputTopics sc (StreamPipe _ inp _) = catMaybes [outputTopic sc inp]
@@ -243,6 +250,7 @@ inputTopics sc (Stream1to1Join _ l r _ _) = catMaybes [outputTopic sc l, outputT
 
 outputTopic :: FDBStreamConfig -> Stream a -> Maybe TopicConfig
 -- TODO: StreamConsumer has no output. Should it not be included in this GADT?
+outputTopic _ (StreamExistingTopic _ tc) = Just tc
 outputTopic _ (StreamConsumer _ _ _) = Nothing
 outputTopic sc s = Just $
   makeTopicConfig (streamConfigDB sc)
@@ -267,6 +275,7 @@ foreverLogErrors sn x =
 -- to the user's topology -- it only runs stream processors directly upstream
 -- of the one on which it is called.
 runStream :: FDBStreamConfig -> Stream a -> IO ()
+runStream _ (StreamExistingTopic _ _) = return ()
 runStream c@FDBStreamConfig{..} s@(StreamProducer rn step) = do
   -- TODO: what if this thread dies?
   -- TODO: this keeps spinning even if the producer is done and will never

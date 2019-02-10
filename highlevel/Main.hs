@@ -34,6 +34,15 @@ writeInts sn state n = StreamProducer sn $ do
             return $ Just curr
     else return Nothing
 
+writeIntsTopic :: TopicConfig -> Int -> IO ()
+writeIntsTopic tc n = go 0
+  where go i =
+          if i < n
+             then do
+              writeTopic tc (map toMessage [i..i+10])
+              go (i+11)
+             else return ()
+
 keepOdds :: Stream Int -> Stream Int
 keepOdds input = StreamPipe "keepOdds" input $ \x ->
   if odd x
@@ -59,12 +68,13 @@ printEvery1000 :: (Int, Int) -> IO ()
 printEvery1000 (x,_) = when (x `mod` 1000 == 0) (print x)
 
 
-joinTopo :: IO (Stream Void)
-joinTopo = do
+joinTopo :: Database -> IO (Stream Void)
+joinTopo db = do
   writeState1 <- newTVarIO 0
-  writeState2 <- newTVarIO 0
+  let rawTC = makeTopicConfig db topSS "raw_writes"
+  void $ forkIO $ writeIntsTopic rawTC 100000
   let writer1 = writeInts "write1" writeState1 100000
-  let writer2 = writeInts "write2" writeState2 100000
+  let writer2 = StreamExistingTopic "write2" rawTC
   let joiner = joinId "intjoin" writer1 writer2
   let printer = StreamConsumer "print" joiner printEvery1000
   return printer
@@ -86,7 +96,7 @@ printStats db ss = do
 mainLoop :: Database -> IO ()
 mainLoop db = do
   let conf = FDBStreamConfig db topSS
-  t <- joinTopo
+  t <- joinTopo db
   runStream conf t
   forever $ do
     printStats db topSS
