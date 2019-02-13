@@ -9,6 +9,8 @@
 
 module FDBStreaming where
 
+import qualified FDBStreaming.AggrTable as AT
+import FDBStreaming.Message (Message(..))
 import FDBStreaming.Topic
 
 import Control.Concurrent
@@ -21,7 +23,7 @@ import Data.Foldable (toList)
 import Data.Maybe (catMaybes)
 import Data.Sequence (Seq(..))
 import qualified Data.Set as Set
-import Data.Void
+import Data.Void (Void)
 import FoundationDB as FDB
 import FoundationDB.Layer.Subspace as FDB
 import FoundationDB.Layer.Tuple as FDB
@@ -41,25 +43,9 @@ still running the old version of the code?
 
 -}
 
--- TODO: error handling for bad parses
-class Messageable a where
-  toMessage :: a -> ByteString
-  fromMessage :: ByteString -> a
-
--- TODO: argh, find a way to avoid this.
-instance Messageable Void where
-  toMessage = error "impossible happened: called toMessage on Void"
-  fromMessage = error "impossible happened: called fromMessage on Void"
-
-instance (Messageable a, Messageable b) => Messageable (a,b) where
-  toMessage (x,y) = encodeTupleElems [Bytes (toMessage x), Bytes (toMessage y)]
-  fromMessage bs =
-    case decodeTupleElems bs of
-      Left err -> error $ "bad tuple decode " ++ show err
-      Right [Bytes x, Bytes y] -> (fromMessage x, fromMessage y)
-      Right xs -> error $ "unexpected decode " ++ show xs
-
 type StreamName = ByteString
+
+data GroupedBy k v
 
 -- TODO: need to think about grouping and windowing. Windowing appears to be a
 -- special case of grouping, where the groupBy function is a function of time.
@@ -112,16 +98,16 @@ type StreamName = ByteString
 -- TODO: If we can make a constant stream that doesn't actually hit the DB, we
 -- would be able to implement 'pure' for this type.
 data Stream b where
-  StreamExistingTopic :: Messageable a
+  StreamExistingTopic :: Message a
                       => StreamName
                       -> TopicConfig
                       -> Stream a
-  StreamProducer :: Messageable a
+  StreamProducer :: Message a
                  => StreamName
                  -- Maybe allows for filtering
                  -> IO (Maybe a)
                  -> Stream a
-  StreamConsumer :: (Messageable a)
+  StreamConsumer :: (Message a)
                  => StreamName
                  -> Stream a
                  -- TODO: if this handler type took a batch at a time,
@@ -131,7 +117,7 @@ data Stream b where
                  -> (a -> IO ())
                  -> Stream Void
   -- TODO: looks suspiciously similar to monadic bind
-  StreamPipe :: (Messageable a, Messageable b)
+  StreamPipe :: (Message a, Message b)
              => StreamName
              -> Stream a
              -> (a -> IO (Maybe b))
@@ -139,13 +125,45 @@ data Stream b where
   -- | Streaming one-to-one join. If the relationship is not actually one-to-one
   --   (i.e. the input join functions are not injective), some messages in the
   --   input streams could be lost.
-  Stream1to1Join :: (Messageable a, Messageable b, Messageable c)
+  Stream1to1Join :: (Message a, Message b, Message c)
                  => StreamName
                  -> Stream a
                  -> Stream b
                  -> (a -> c)
                  -> (b -> c)
+                 -- TODO: custom combining function so we don't waste space
+                 -- writing (a,b) to disk if the user is just going to throw it
+                 -- away.
                  -> Stream (a,b)
+  -- NOTE: the reason that this is a separate constructor from StreamAggregate
+  -- is so that our helper functions can be combined more easily. It's easier to
+  -- work with and refactor code that looks like @count . groupBy id@ rather
+  -- than the less compositional @countBy id@. At least, that's what it looks
+  -- like at the time of this writing. Kafka Streams does it that way. If it
+  -- ends up not being worth it, simplify.
+  -- TODO: because of Message instance for Void, this accepts consumers!
+  -- TODO: problem: this has an unused StreamName which is meaningless.
+  StreamGroupBy :: (Message a, Message k)
+                => StreamName
+                -> Stream a
+                -> (a -> k)
+                -> Stream (GroupedBy k a)
+  -- TODO: maybe consolidate TableValue and TableSemigroup
+  -- TODO: if we're exporting helpers anyway, maybe no need for classes
+  -- at all.
+  StreamAggregate :: (Message a, Message k, AT.TableValue v, AT.TableSemigroup v)
+                  => StreamName
+                  -> Stream (GroupedBy k a)
+                  -> (a -> v)
+                  -> Stream (AT.AggrTable k v)
+
+getAggrTable :: FDBStreamConfig -> Stream (AT.AggrTable k v) -> AT.AggrTable k v
+getAggrTable sc (StreamAggregate sn _ _) =
+  AT.AggrTable $
+  extend (streamConfigSS sc)
+         [Bytes "tpcs", Bytes sn, Bytes "AggrTable"]
+-- TODO: find a way to avoid this. type family, I suppose
+getAggrTable _ _ = error "Please don't make AggrTable an instance of Message"
 
 streamName :: Stream a -> StreamName
 streamName (StreamExistingTopic sn _)    = sn
@@ -153,6 +171,8 @@ streamName (StreamProducer sn _)         = sn
 streamName (StreamConsumer sn _ _)       = sn
 streamName (StreamPipe sn _ _)           = sn
 streamName (Stream1to1Join sn _ _ _ _)   = sn
+streamName (StreamGroupBy sn _  _)       = sn
+streamName (StreamAggregate sn _ _)      = sn
 
 -- TODO: kind of surprising that this has to be run on every 'StreamConsumer' in
 -- the topology, and then shared upstream elements will get traversed repeatedly
@@ -176,17 +196,21 @@ traverseStream s a = State.evalStateT (go s) mempty
         process st@(StreamConsumer _ up _)    = liftIO (a st) >> go up
         process st@(StreamPipe _ up _)        = liftIO (a st) >> go up
         process st@(Stream1to1Join _ x y _ _) = liftIO (a st) >> go x >> go y
+        process st@(StreamGroupBy _ up _)     = liftIO (a st) >> go up
+        process st@(StreamAggregate _ up _)   = liftIO (a st) >> go up
 
-subspace1to1JoinForKey :: Messageable k
+-- TODO: move join stuff to new namespace
+subspace1to1JoinForKey :: Message k
                        => FDBStreamConfig
                        -> StreamName
                        -> k
                        -> Subspace
 subspace1to1JoinForKey sc sn k =
   extend (streamConfigSS sc)
+         -- TODO: replace these Bytes constants with named small int constants
          [Bytes "tpcs", Bytes sn, Bytes "1:1join", Bytes (toMessage k)]
 
-get1to1JoinData :: (Messageable a, Messageable b, Messageable k)
+get1to1JoinData :: (Message a, Message b, Message k)
                 => FDBStreamConfig
                 -> StreamName
                 -> k
@@ -214,14 +238,14 @@ get1to1JoinData c sn k = do
 
         ss = subspace1to1JoinForKey c sn k
 
-delete1to1JoinData :: Messageable k
+delete1to1JoinData :: Message k
                    => FDBStreamConfig -> StreamName -> k -> Transaction ()
 delete1to1JoinData c sn k = do
   let ss = subspace1to1JoinForKey c sn k
   let (x,y) = rangeKeys $ subspaceRange ss
   clearRange x y
 
-write1to1JoinData :: (Messageable k, Messageable a, Messageable b)
+write1to1JoinData :: (Message k, Message a, Message b)
                   => FDBStreamConfig
                   -> StreamName
                   -> k
@@ -247,11 +271,15 @@ inputTopics _ (StreamProducer _ _) = []
 inputTopics sc (StreamConsumer _ inp _) = catMaybes [outputTopic sc inp]
 inputTopics sc (StreamPipe _ inp _) = catMaybes [outputTopic sc inp]
 inputTopics sc (Stream1to1Join _ l r _ _) = catMaybes [outputTopic sc l, outputTopic sc r]
+inputTopics sc (StreamGroupBy _ inp _) = catMaybes [outputTopic sc inp]
+inputTopics sc (StreamAggregate _ inp _) = inputTopics sc inp
 
 outputTopic :: FDBStreamConfig -> Stream a -> Maybe TopicConfig
 -- TODO: StreamConsumer has no output. Should it not be included in this GADT?
 outputTopic _ (StreamExistingTopic _ tc) = Just tc
 outputTopic _ StreamConsumer{} = Nothing
+outputTopic _ StreamGroupBy{} = Nothing
+outputTopic _ StreamAggregate{} = Nothing
 outputTopic sc s = Just $
   makeTopicConfig (streamConfigDB sc)
                   (streamConfigSS sc)
@@ -274,24 +302,33 @@ foreverLogErrors sn x =
 -- TODO: this traversal has surprising behavior if there are multiple branches
 -- to the user's topology -- it only runs stream processors directly upstream
 -- of the one on which it is called.
+-- TODO: if any of these processors reach a message they can't process because
+-- of an exception, they will get stuck trying to process that message in a loop
+-- forever. For example, what if we always generate a 30MiB message for one bad
+-- message? We can't write a message that big.
+-- Perhaps we could retry a few times, then put the message in a bad message
+-- topic and skip past it. The problem is that if we skip a message, we must
+-- be careful that all logic using the checkpoint knows that just because a
+-- given message is checkpointed, its transformed output is not necessarily in
+-- downstream topics.
 runStream :: FDBStreamConfig -> Stream a -> IO ()
 runStream _ (StreamExistingTopic _ _) = return ()
-runStream c@FDBStreamConfig{..} s@(StreamProducer rn step) = do
+runStream c@FDBStreamConfig{..} s@(StreamProducer sn step) = do
   -- TODO: what if this thread dies?
   -- TODO: this keeps spinning even if the producer is done and will never
   -- produce again.
   let Just outCfg = outputTopic c s
-  void $ forkIO $ foreverLogErrors rn $ do
+  void $ forkIO $ foreverLogErrors sn $ do
     xs <- catMaybes <$> replicateM 10 step -- TODO: batch size config
     writeTopic outCfg (fmap toMessage xs)
 
-runStream c@FDBStreamConfig{..} s@(StreamConsumer rn inp step) = do
+runStream c@FDBStreamConfig{..} s@(StreamConsumer sn inp step) = do
   runStream c inp
   let [inCfg] = inputTopics c s
-  void $ forkIO $ foreverLogErrors rn $ do
+  void $ forkIO $ foreverLogErrors sn $ do
     -- TODO: if parsing the message fails, should we still checkpoint?
     -- TODO: blockUntilNew
-    xs <- readNAndCheckpoint inCfg rn 10
+    xs <- readNAndCheckpoint inCfg sn 10
     mapM_ step (fmap (fromMessage . snd) xs)
 
 runStream c@FDBStreamConfig{..} s@(StreamPipe rn inp step) = do
@@ -322,9 +359,10 @@ runStream c@FDBStreamConfig{..} s@(Stream1to1Join rn (lstr :: Stream a) (rstr ::
     -- join table to see if the partner is already there. If so, write the tuple
     -- downstream. If not, write the one message we do have to the join table.
     -- TODO: think of a way to garbage collect items that never get joined.
-    FDB.runTransactionWithConfig infRetry (topicConfigDB lCfg) $ do
+    FDB.runTransactionWithConfig infRetry streamConfigDB $ do
       p <- liftIO $ randPartition lCfg
       lMsgs <- fmap (fromMessage . snd) <$> readNAndCheckpoint' lCfg p rn 10
+      -- TODO: move joinFutures, joinData into separate function
       joinFutures <- forM lMsgs $ \(lmsg :: a) -> do
         let k = pl lmsg
         future <- get1to1JoinData c rn k
@@ -346,7 +384,7 @@ runStream c@FDBStreamConfig{..} s@(Stream1to1Join rn (lstr :: Stream a) (rstr ::
             return Nothing
       p' <- liftIO $ randPartition outCfg
       writeTopic' outCfg p' (map toMessage toWrite)
-    FDB.runTransactionWithConfig infRetry (topicConfigDB rCfg) $ do
+    FDB.runTransactionWithConfig infRetry streamConfigDB $ do
       p <- liftIO $ randPartition rCfg
       rMsgs <- fmap (fromMessage . snd) <$> readNAndCheckpoint' rCfg p rn 10
       joinFutures <- forM rMsgs $ \(rmsg :: b) -> do
@@ -372,3 +410,25 @@ runStream c@FDBStreamConfig{..} s@(Stream1to1Join rn (lstr :: Stream a) (rstr ::
       -- return the list of stuff to write and then call swap before writing.
       p' <- liftIO $ randPartition outCfg
       writeTopic' outCfg p' (map toMessage toWrite)
+
+runStream c (StreamGroupBy _ up _) =
+  runStream c up
+
+runStream c@FDBStreamConfig{..}
+          s@(StreamAggregate sn up@(StreamGroupBy _  _ toKey) aggr) = do
+  runStream c up
+  void $ forkIO $ foreverLogErrors sn $ do
+    let table = getAggrTable c s
+    -- TODO: find way to avoid refutable pattern matches for cfgs
+    let [inCfg] = inputTopics c s
+    FDB.runTransactionWithConfig infRetry streamConfigDB $ do
+      p <- liftIO $ randPartition inCfg
+      -- TODO: helper to read n and parse to message. This is everywhere.
+      msgs <- fmap (fromMessage . snd) <$> readNAndCheckpoint' inCfg p sn 10
+      forM_ msgs $ \msg -> do
+        let v = aggr msg
+        let k = toKey msg
+        AT.mappendTable table k v
+
+-- TODO: stronger types
+runStream _ (StreamAggregate _ _ _) = error "tried to aggregate ungrouped stream"

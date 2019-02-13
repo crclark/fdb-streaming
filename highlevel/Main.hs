@@ -3,6 +3,7 @@
 module Main where
 
 import FDBStreaming
+import FDBStreaming.Message
 import FDBStreaming.Topic
 
 import Control.Monad
@@ -20,7 +21,7 @@ import FoundationDB as FDB
 import FoundationDB.Layer.Subspace as FDB
 import FoundationDB.Layer.Tuple as FDB
 
-instance Messageable Int where
+instance Message Int where
   toMessage = toStrict . runPut . putWord64le . fromIntegral
   fromMessage = fromIntegral . runGet getWord64le . fromStrict
 
@@ -50,7 +51,7 @@ sumInts :: TVar Int -> Stream Int -> Stream Void
 sumInts state input = StreamConsumer "sumInts" input $ \x ->
   atomically $ modifyTVar' state (+x)
 
-joinId :: Messageable a => StreamName -> Stream a -> Stream a -> Stream (a,a)
+joinId :: Message a => StreamName -> Stream a -> Stream a -> Stream (a,a)
 joinId sn l r = Stream1to1Join sn l r id id
 
 topo :: IO (Stream Void)

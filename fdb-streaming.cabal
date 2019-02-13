@@ -21,6 +21,8 @@ source-repository head
 library
   exposed-modules:
       FDBStreaming,
+      FDBStreaming.AggrTable,
+      FDBStreaming.Message,
       FDBStreaming.Topic
   other-modules:
       Paths_fdb_streaming
