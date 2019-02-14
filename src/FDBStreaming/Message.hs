@@ -1,21 +1,16 @@
 module FDBStreaming.Message where
 
 
-import Data.ByteString (ByteString)
-import Data.Void (Void)
-import FoundationDB.Layer.Tuple (decodeTupleElems,
-                                 encodeTupleElems,
-                                 Elem(Bytes))
+import           Data.ByteString                ( ByteString )
+import           FoundationDB.Layer.Tuple       ( decodeTupleElems
+                                                , encodeTupleElems
+                                                , Elem(Bytes)
+                                                )
 
 -- TODO: error handling for bad parses
 class Message a where
   toMessage :: a -> ByteString
   fromMessage :: ByteString -> a
-
--- TODO: argh, find a way to avoid this.
-instance Message Void where
-  toMessage = error "impossible happened: called toMessage on Void"
-  fromMessage = error "impossible happened: called fromMessage on Void"
 
 instance (Message a, Message b) => Message (a,b) where
   toMessage (x,y) = encodeTupleElems [Bytes (toMessage x), Bytes (toMessage y)]

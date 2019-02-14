@@ -28,7 +28,7 @@ library
       Paths_fdb_streaming
   hs-source-dirs:
       src
-  ghc-options: -Wall
+  ghc-options: -Wall -g
   build-depends:
       base >=4.7 && <5,
       bytestring,
@@ -88,7 +88,7 @@ executable fdb-streaming-highlevel
       Paths_fdb_streaming
   hs-source-dirs:
       highlevel
-  ghc-options: -threaded -rtsopts -with-rtsopts=-N -O2 -Wall
+  ghc-options: -threaded -rtsopts -with-rtsopts=-N -Wall -g
   build-depends:
       base >=4.7 && <5
     , async
