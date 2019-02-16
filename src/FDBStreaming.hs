@@ -22,11 +22,13 @@ import           Data.ByteString                ( ByteString )
 import           Data.Foldable                  ( toList )
 import           Data.Maybe                     ( catMaybes )
 import           Data.Sequence                  ( Seq(..) )
+import qualified Data.Sequence                 as Seq
 import qualified Data.Set                      as Set
 import           Data.Void                      ( Void )
 import           FoundationDB                  as FDB
 import           FoundationDB.Layer.Subspace   as FDB
 import           FoundationDB.Layer.Tuple      as FDB
+import           Data.Word                      ( Word8 )
 
 {-
 
@@ -153,6 +155,22 @@ data Stream b where
                   -> (a -> v)
                   -> Stream (AT.AggrTable k v)
 
+-- | reads a batch of messages from a stream and checkpoints so that the same
+-- value of 'ReaderName' is guaranteed to never receive the same messages again
+-- in subsequent calls to this function.
+readBatchExactlyOnce
+  :: Message a
+  => FDBStreamConfig
+  -> ReaderName
+  -> Stream a
+  -> Word8
+  -> Transaction (Seq a)
+readBatchExactlyOnce cfg rn s n = case outputTopic cfg s of
+  Nothing     -> return Empty
+  Just outCfg -> do
+    p <- liftIO $ randPartition outCfg
+    fmap (fromMessage . snd) <$> readNAndCheckpoint' outCfg p rn n
+
 getAggrTable :: FDBStreamConfig -> Stream (AT.AggrTable k v) -> AT.AggrTable k v
 getAggrTable sc (StreamAggregate sn _ _) = AT.AggrTable
   $ extend (streamConfigSS sc) [Bytes "tpcs", Bytes sn, Bytes "AggrTable"]
@@ -232,6 +250,18 @@ get1to1JoinData c sn k = do
 
   ss = subspace1to1JoinForKey c sn k
 
+-- | get join data for n keys concurrently
+get1to1JoinDataBatch
+  :: (Message a, Message b, Message k, Traversable t)
+  => FDBStreamConfig
+  -> StreamName
+  -> t k
+  -> Transaction (t (Maybe (Either a b)))
+get1to1JoinDataBatch c rn ks = do
+  joinFutures <- forM ks (get1to1JoinData c rn)
+  -- Now that we have sent all the gets, await them
+  forM joinFutures await
+
 delete1to1JoinData
   :: Message k => FDBStreamConfig -> StreamName -> k -> Transaction ()
 delete1to1JoinData c sn k = do
@@ -272,6 +302,7 @@ inputTopics sc (StreamAggregate _ inp _) = inputTopics sc inp
 
 outputTopic :: FDBStreamConfig -> Stream a -> Maybe TopicConfig
 -- TODO: StreamConsumer has no output. Should it not be included in this GADT?
+-- Or perhaps not exist at all?
 outputTopic _ (StreamExistingTopic _ tc) = Just tc
 outputTopic _ StreamConsumer{}           = Nothing
 outputTopic _ StreamGroupBy{}            = Nothing
@@ -292,14 +323,6 @@ runStream c s = traverseStream s $ \step -> do
 -- | Runs a single stream step. Reads from its input topic
 -- in chunks, runs the monadic action on each input, and writes the result to
 -- its output topic.
--- TODO: this function is responsible for
--- 1. traversing the structure
--- 2. executing a segment in the structure
--- 3. managing a thread that executes a segment in the structure
--- It should be broken up into multiple functions.
--- TODO: this traversal has surprising behavior if there are multiple branches
--- to the user's topology -- it only runs stream processors directly upstream
--- of the one on which it is called.
 -- TODO: if any of these processors reach a message they can't process because
 -- of an exception, they will get stuck trying to process that message in a loop
 -- forever. For example, what if we always generate a 30MiB message for one bad
@@ -312,7 +335,6 @@ runStream c s = traverseStream s $ \step -> do
 runStreamStep :: FDBStreamConfig -> Stream a -> IO ()
 runStreamStep _                      (  StreamExistingTopic _ _   ) = return ()
 runStreamStep c@FDBStreamConfig {..} s@(StreamProducer      _ step) = do
-  -- TODO: what if this thread dies?
   -- TODO: this keeps spinning even if the producer is done and will never
   -- produce again.
   let Just outCfg = outputTopic c s
@@ -326,24 +348,20 @@ runStreamStep c@FDBStreamConfig {..} s@(StreamConsumer sn _ step) = do
   xs <- readNAndCheckpoint inCfg sn 10
   mapM_ step (fmap (fromMessage . snd) xs)
 
-runStreamStep c@FDBStreamConfig {..} s@(StreamPipe rn _ step) = do
+runStreamStep c@FDBStreamConfig {..} s@(StreamPipe rn up step) = do
   -- TODO: blockUntilNew
-  let [inCfg]     = inputTopics c s
   let Just outCfg = outputTopic c s
   runTransactionWithConfig infRetry streamConfigDB $ do
-    p  <- liftIO $ randPartition inCfg
-    xs <- readNAndCheckpoint' inCfg p rn 10 --TODO: auto-adjust batch size
-    let inMsgs = fmap (fromMessage . snd) xs
-    ys <- catMaybes . toList <$> liftIO (mapM step inMsgs)
+    inMsgs <- readBatchExactlyOnce c rn up 10
+    ys     <- catMaybes . toList <$> liftIO (mapM step inMsgs)
     let outMsgs = fmap toMessage ys
     p' <- liftIO $ randPartition outCfg
     writeTopic' outCfg p' outMsgs
 
-runStreamStep c@FDBStreamConfig {..} s@(Stream1to1Join rn (_ :: Stream a) (_ :: Stream
+runStreamStep c@FDBStreamConfig {..} s@(Stream1to1Join rn (ls :: Stream a) (rs :: Stream
     b) pl pr combiner)
   = do
-    let [lCfg, rCfg] = inputTopics c s
-    let Just outCfg  = outputTopic c s
+    let Just outCfg = outputTopic c s
     -- TODO: the below two transactions are virtually identical, except
     -- swapping the usages of Left and Right. Need to find a way to eliminate
     -- the repetition.
@@ -353,18 +371,10 @@ runStreamStep c@FDBStreamConfig {..} s@(Stream1to1Join rn (_ :: Stream a) (_ :: 
     -- downstream. If not, write the one message we do have to the join table.
     -- TODO: think of a way to garbage collect items that never get joined.
     FDB.runTransactionWithConfig infRetry streamConfigDB $ do
-      p <- liftIO $ randPartition lCfg
-      lMsgs <- fmap (fromMessage . snd) <$> readNAndCheckpoint' lCfg p rn 10
+      lMsgs    <- readBatchExactlyOnce c rn ls 10
       -- TODO: move joinFutures, joinData into separate function
-      joinFutures <- forM lMsgs $ \(lmsg :: a) -> do
-        let k = pl lmsg
-        future <- get1to1JoinData c rn k
-        return (future, lmsg)
-      -- Now that we have sent all the gets, await them
-      joinData <- forM joinFutures $ \(future, lmsg) -> do
-        j <- await future
-        return (j, lmsg)
-      toWrite <- fmap (catMaybes . toList) $ forM joinData $ \(d, lmsg) -> do
+      joinData <- Seq.zip lMsgs <$> get1to1JoinDataBatch c rn (fmap pl lMsgs)
+      toWrite  <- fmap (catMaybes . toList) $ forM joinData $ \(lmsg, d) -> do
         let k = pl lmsg
         case d of
           Just (Right (rmsg :: b)) -> do
@@ -377,16 +387,9 @@ runStreamStep c@FDBStreamConfig {..} s@(Stream1to1Join rn (_ :: Stream a) (_ :: 
       p' <- liftIO $ randPartition outCfg
       writeTopic' outCfg p' (map toMessage toWrite)
     FDB.runTransactionWithConfig infRetry streamConfigDB $ do
-      p <- liftIO $ randPartition rCfg
-      rMsgs <- fmap (fromMessage . snd) <$> readNAndCheckpoint' rCfg p rn 10
-      joinFutures <- forM rMsgs $ \(rmsg :: b) -> do
-        let k = pr rmsg
-        future <- get1to1JoinData c rn k
-        return (future, rmsg)
-      joinData <- forM joinFutures $ \(future, rmsg) -> do
-        j <- await future
-        return (j, rmsg)
-      toWrite <- fmap (catMaybes . toList) $ forM joinData $ \(d, rmsg) -> do
+      rMsgs    <- readBatchExactlyOnce c rn rs 10
+      joinData <- Seq.zip rMsgs <$> get1to1JoinDataBatch c rn (fmap pr rMsgs)
+      toWrite  <- fmap (catMaybes . toList) $ forM joinData $ \(rmsg, d) -> do
         let k = pr rmsg
         case d of
           Just (Left (lmsg :: a)) -> do
@@ -403,22 +406,14 @@ runStreamStep c@FDBStreamConfig {..} s@(Stream1to1Join rn (_ :: Stream a) (_ :: 
       p' <- liftIO $ randPartition outCfg
       writeTopic' outCfg p' (map toMessage toWrite)
 
-runStreamStep _ (StreamGroupBy _ _ _) = return ()
+runStreamStep _ StreamGroupBy{} = return ()
 
-runStreamStep c@FDBStreamConfig {..} s@(StreamAggregate sn (StreamGroupBy _ _ toKey) aggr)
+runStreamStep c@FDBStreamConfig {..} s@(StreamAggregate sn (StreamGroupBy _ up toKey) aggr)
   = do
-    let table   = getAggrTable c s
-    -- TODO: find way to avoid refutable pattern matches for cfgs
-    let [inCfg] = inputTopics c s
+    let table = getAggrTable c s
     FDB.runTransactionWithConfig infRetry streamConfigDB $ do
-      p    <- liftIO $ randPartition inCfg
-      -- TODO: helper to read n and parse to message. This is everywhere.
-      msgs <- fmap (fromMessage . snd) <$> readNAndCheckpoint' inCfg p sn 10
-      forM_ msgs $ \msg -> do
-        let v = aggr msg
-        let k = toKey msg
-        AT.mappendTable table k v
+      msgs <- readBatchExactlyOnce c sn up 10
+      forM_ msgs $ \msg -> AT.mappendTable table (toKey msg) (aggr msg)
 
 -- TODO: stronger types
-runStreamStep _ (StreamAggregate _ _ _) =
-  error "tried to aggregate ungrouped stream"
+runStreamStep _ StreamAggregate{} = error "tried to aggregate ungrouped stream"

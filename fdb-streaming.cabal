@@ -28,7 +28,7 @@ library
       Paths_fdb_streaming
   hs-source-dirs:
       src
-  ghc-options: -Wall -g
+  ghc-options: -Wall -g -fno-omit-yields
   build-depends:
       base >=4.7 && <5,
       bytestring,
