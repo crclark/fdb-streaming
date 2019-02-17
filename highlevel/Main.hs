@@ -25,7 +25,6 @@ import           Control.Concurrent.STM         ( TVar
                                                 , modifyTVar'
                                                 , newTVarIO
                                                 )
-import           Control.Exception
 import           Data.List                      ( sortOn )
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -48,6 +47,11 @@ import qualified Data.Store                    as Store
 import Data.Functor.Identity (Identity(..))
 import Foreign.C.Types (CTime(..))
 import Data.Monoid (All (..))
+import qualified System.Metrics as Metrics
+import           System.Metrics.Distribution (Distribution)
+import qualified System.Metrics.Distribution as Distribution
+import System.Remote.Monitoring (forkServer, serverMetricStore)
+
 
 newtype Timestamp = Timestamp { unTimestamp :: UnixTime }
   deriving (Show, Eq, Ord, Generic)
@@ -138,14 +142,19 @@ instance Semigroup LatencyStats where
   (LatencyStats x1 y1) <> (LatencyStats x2 y2) =
     LatencyStats (x1 + x2) (y1 + y2)
 
+unixDiffTimeToMicroseconds :: UnixDiffTime -> Int
+unixDiffTimeToMicroseconds (UnixDiffTime (CTime secs) usecs) =
+  1000000 * (fromIntegral secs) + (fromIntegral usecs)
+
 -- | Creates a random order, pushes it onto the given topic, awaits its
 -- arrival in the given AggrTable, and updates the given latency statistics
 -- TVar.
 placeAndAwaitOrder :: TopicConfig
                    -> AT.AggrTable OrderID All
                    -> TVar LatencyStats
+                   -> Distribution
                    -> IO ()
-placeAndAwaitOrder orderTopic table stats = do
+placeAndAwaitOrder orderTopic table stats latencyDist = do
   order@Order{orderID} <- randOrder
   writeTopic orderTopic [(toMessage order)]
   _ <- AT.getBlocking (topicConfigDB orderTopic) table orderID
@@ -153,19 +162,21 @@ placeAndAwaitOrder orderTopic table stats = do
   let diff = diffUnixTime endTime (unTimestamp $ placedAt order)
   let statsDiff = LatencyStats diff 1
   atomically $ modifyTVar' stats (<> statsDiff)
+  let diffMillis = unixDiffTimeToMilliseconds diff
+  Distribution.add latencyDist diffMillis
 
 orderGeneratorLoop :: TopicConfig
                    -> AT.AggrTable OrderID All
                    -> Int
                    -- ^ requests per second
                    -> TVar LatencyStats
+                   -> Distribution
                    -> IO ()
-orderGeneratorLoop topic table rps stats = do
+orderGeneratorLoop topic table rps stats latencyDist = do
   let delay = 1000000 `div` rps
-  void $ forkIO $ placeAndAwaitOrder topic table stats
+  void $ forkIO $ placeAndAwaitOrder topic table stats latencyDist
   threadDelay delay
-  --putStrLn $ "delaying " ++ show delay
-  orderGeneratorLoop topic table rps stats
+  orderGeneratorLoop topic table rps stats latencyDist
 
 latencyReportLoop :: TVar LatencyStats -> IO ()
 latencyReportLoop stats = do
@@ -232,12 +243,14 @@ printStats db ss = do
 
 mainLoop :: Database -> IO ()
 mainLoop db = do
-  let conf = FDBStreamConfig db topSS
+  metricsStore <- serverMetricStore <$> forkServer "localhost" 8000
+  latencyDist <- Metrics.createDistribution "end_to_end_latency" metricsStore
+  let conf = FDBStreamConfig db topSS (Just metricsStore)
   let input = makeTopicConfig db topSS "incoming_orders"
   let t = topology input
   let table = getAggrTable conf t
   stats <- newTVarIO $ LatencyStats 0 1
-  void $ forkIO $ orderGeneratorLoop input table 200 stats
+  void $ forkIO $ orderGeneratorLoop input table 200 stats latencyDist
   void $ forkIO $ latencyReportLoop stats
   debugTraverseStream t
   runStream conf t
@@ -246,8 +259,10 @@ mainLoop db = do
     threadDelay 1000000
 
 main :: IO ()
-main = withFoundationDB defaultOptions $ \db -> finally (mainLoop db) $ do
+main = withFoundationDB defaultOptions $ \db -> do
   putStrLn "Cleaning up FDB state"
   let (delBegin, delEnd) = rangeKeys $ subspaceRange topSS
   runTransaction db $ clearRange delBegin delEnd
   putStrLn "Cleanup successful"
+  mainLoop db
+

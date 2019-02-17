@@ -38,7 +38,9 @@ library
       foundationdb-haskell,
       mtl,
       random,
-      async
+      async,
+      ekg-core,
+      unix-time
   default-language: Haskell2010
 
 executable fdb-streaming-writer
@@ -105,6 +107,9 @@ executable fdb-streaming-highlevel
     , uuid
     , random-bytestring
     , random
+    , ekg-core
+    , ekg-statsd
+    , ekg
   default-language: Haskell2010
 
 test-suite fdb-streaming-test

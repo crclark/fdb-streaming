@@ -6,6 +6,7 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE NamedFieldPuns #-}
 
 module FDBStreaming where
 
@@ -20,15 +21,54 @@ import           Control.Monad.IO.Class
 import qualified Control.Monad.State           as State
 import           Data.ByteString                ( ByteString )
 import           Data.Foldable                  ( toList )
+
+import           Foreign.C.Types             (CTime(..))
+import           Data.Map                    (Map)
+import qualified Data.Map                    as Map
 import           Data.Maybe                     ( catMaybes )
 import           Data.Sequence                  ( Seq(..) )
 import qualified Data.Sequence                 as Seq
 import qualified Data.Set                      as Set
+import           Data.UnixTime                  ( UnixTime
+                                                , UnixDiffTime(..)
+                                                , getUnixTime
+                                                , diffUnixTime
+                                                )
+import  Data.Text.Encoding           (decodeUtf8)
 import           Data.Void                      ( Void )
 import           FoundationDB                  as FDB
 import           FoundationDB.Layer.Subspace   as FDB
 import           FoundationDB.Layer.Tuple      as FDB
 import           Data.Word                      ( Word8 )
+import qualified System.Metrics                as Metrics
+import System.Metrics.Counter (Counter)
+import System.Metrics.Distribution (Distribution)
+import qualified System.Metrics.Counter as Counter
+import qualified System.Metrics.Distribution as Distribution
+
+data StreamEdgeMetrics = StreamEdgeMetrics
+  { messagesProcessed :: Counter
+  , emptyReads :: Counter
+  , batchLatency :: Distribution
+  }
+
+type MetricsMap = Map StreamName StreamEdgeMetrics
+
+registerTopologyMetrics :: Stream a
+                        -> Metrics.Store
+                        -> IO (Map StreamName StreamEdgeMetrics)
+registerTopologyMetrics topo store =
+  foldMStream topo $ \s -> do
+    let sn = decodeUtf8 $ streamName s
+    mp <- Metrics.createCounter ("stream." <> sn <> ".messagesProcessed") store
+    er <- Metrics.createCounter ("stream." <> sn <> ".emptyReads") store
+    bl <- Metrics.createDistribution ("stream." <> sn <> ".batchLatency") store
+    return (Map.singleton (streamName s) (StreamEdgeMetrics mp er bl))
+
+incrEmptyBatchCount :: StreamName -> Maybe MetricsMap -> IO ()
+incrEmptyBatchCount sn Nothing = return ()
+incrEmptyBatchCount sn (Just m) =
+  Counter.inc (emptyReads $ m Map.! sn)
 
 {-
 
@@ -161,28 +201,32 @@ data Stream b where
 readPartitionBatchExactlyOnce
   :: Message a
   => FDBStreamConfig
+  -> Maybe MetricsMap
   -> ReaderName
   -> Stream a
   -> PartitionId
   -> Word8
   -> Transaction (Seq a)
-readPartitionBatchExactlyOnce cfg rn s pid n = case outputTopic cfg s of
+readPartitionBatchExactlyOnce cfg metrics rn s pid n = case outputTopic cfg s of
   Nothing     -> return Empty
-  Just outCfg ->
-    fmap (fromMessage . snd) <$> readNAndCheckpoint' outCfg pid rn n
+  Just outCfg -> do
+    rawMsgs <- readNAndCheckpoint' outCfg pid rn n
+    liftIO $ when (Seq.null rawMsgs) (incrEmptyBatchCount rn metrics)
+    return $ fmap (fromMessage . snd) rawMsgs
 
 readBatchExactlyOnce
   :: Message a
   => FDBStreamConfig
+  -> Maybe MetricsMap
   -> ReaderName
   -> Stream a
   -> Word8
   -> Transaction (Seq a)
-readBatchExactlyOnce cfg rn s n = case outputTopic cfg s of
+readBatchExactlyOnce cfg metrics rn s n = case outputTopic cfg s of
   Nothing -> return Empty
   Just outCfg -> do
     pid <- liftIO $ randPartition outCfg
-    readPartitionBatchExactlyOnce cfg rn s pid n
+    readPartitionBatchExactlyOnce cfg metrics rn s pid n
 
 getAggrTable :: FDBStreamConfig -> Stream (AT.AggrTable k v) -> AT.AggrTable k v
 getAggrTable sc (StreamAggregate sn _ _) = AT.AggrTable
@@ -198,6 +242,31 @@ streamName (StreamPipe     sn _ _      ) = sn
 streamName (Stream1to1Join sn _ _ _ _ _) = sn
 streamName (StreamGroupBy   sn _ _     ) = sn
 streamName (StreamAggregate sn _ _     ) = sn
+
+foldMStream :: forall a m. Monoid m => Stream a -> (forall b . Stream b -> IO m) -> IO m
+foldMStream s f = State.evalStateT (go s) mempty
+  where
+   go :: forall c . Stream c -> State.StateT (Set.Set StreamName) IO m
+   go st = do
+     visited <- State.get
+     if Set.member (streamName st) visited
+       then return mempty
+       else do
+         State.put (Set.insert (streamName st) visited)
+         process st
+
+   process :: forall d . Stream d -> State.StateT (Set.Set StreamName) IO m
+   process st@(StreamExistingTopic _ _   ) = liftIO (f st)
+   process st@(StreamProducer      _ _   ) = liftIO (f st)
+   process st@(StreamConsumer _ up _     ) = mappend <$> liftIO (f st) <*> go up
+   process st@(StreamPipe     _ up _     ) = mappend <$> liftIO (f st) <*> go up
+   process st@(Stream1to1Join _ x y _ _ _) = do
+    xs <- go x
+    ys <- go y
+    z <- liftIO (f st)
+    return (z <> xs <> ys)
+   process st@(StreamGroupBy   _ up _    ) = mappend <$> liftIO (f st) <*> go up
+   process st@(StreamAggregate _ up _    ) = mappend <$> liftIO (f st) <*> go up
 
 -- TODO: kind of surprising that this has to be run on every 'StreamConsumer' in
 -- the topology, and then shared upstream elements will get traversed repeatedly
@@ -297,11 +366,12 @@ write1to1JoinData c sn k x = do
 
 -- TODO: other persistence backends
 -- TODO: should probably rename to TopologyConfig
-data FDBStreamConfig = FDBStreamConfig {
-  streamConfigDB :: FDB.Database,
-  streamConfigSS :: FDB.Subspace
+data FDBStreamConfig = FDBStreamConfig
+  { streamConfigDB :: FDB.Database
+  , streamConfigSS :: FDB.Subspace
   -- ^ subspace that will contain all state for the stream topology
-}
+  , streamMetricsStore :: Maybe Metrics.Store
+  }
 
 inputTopics :: FDBStreamConfig -> Stream a -> [TopicConfig]
 inputTopics _  (StreamExistingTopic _ _) = []
@@ -323,8 +393,15 @@ outputTopic _ StreamAggregate{}          = Nothing
 outputTopic sc s =
   Just $ makeTopicConfig (streamConfigDB sc) (streamConfigSS sc) (streamName s)
 
-foreverLogErrors :: StreamName -> IO () -> IO ()
-foreverLogErrors sn x = forever $ handle
+unixDiffTimeToMilliseconds :: UnixDiffTime -> Double
+unixDiffTimeToMilliseconds (UnixDiffTime (CTime secs) usecs) =
+  1000.0 * (fromIntegral secs) + (fromIntegral usecs / 1000.0)
+
+foreverLogErrors :: Maybe (Map StreamName StreamEdgeMetrics)
+                 -> StreamName
+                 -> IO ()
+                 -> IO ()
+foreverLogErrors metrics sn x = forever $ handle
   (\(e :: SomeException) -> putStrLn $ show sn ++ " thread caught " ++ show e)
   $ do
     -- Problem: busy looping, constantly reading for more data, is wasteful.
@@ -345,12 +422,20 @@ foreverLogErrors sn x = forever $ handle
     -- exactly the same write.
     -- w <- x
     -- awaitTopicOrTimeout 500 w
+    t1 <- getUnixTime
     x
+    t2 <- getUnixTime
+    let timeMillis = unixDiffTimeToMilliseconds $ diffUnixTime t2 t1
+    -- TODO: helper function and probably ReaderT for recording metrics
+    forM_ (metrics >>= Map.lookup sn) $ \StreamEdgeMetrics{..} -> do
+      Distribution.add batchLatency timeMillis
 
 runStream :: FDBStreamConfig -> Stream a -> IO ()
-runStream c s = traverseStream s $ \step -> do
-  putStrLn $ "starting " ++ show (streamName step)
-  void $ forkIO $ foreverLogErrors (streamName step) $ runStreamStep c step
+runStream cfg@FDBStreamConfig{streamMetricsStore} s = do
+  metrics <- forM streamMetricsStore $ registerTopologyMetrics s
+  traverseStream s $ \step -> do
+    putStrLn $ "starting " ++ show (streamName step)
+    void $ forkIO $ foreverLogErrors metrics (streamName step) $ runStreamStep cfg metrics step
 
 -- | Runs a single stream step. Reads from its input topic
 -- in chunks, runs the monadic action on each input, and writes the result to
@@ -364,33 +449,33 @@ runStream c s = traverseStream s $ \step -> do
 -- be careful that all logic using the checkpoint knows that just because a
 -- given message is checkpointed, its transformed output is not necessarily in
 -- downstream topics.
-runStreamStep :: FDBStreamConfig -> Stream a -> IO ()
-runStreamStep _                      (  StreamExistingTopic _ _   ) = return ()
-runStreamStep c@FDBStreamConfig {..} s@(StreamProducer      _ step) = do
+runStreamStep :: FDBStreamConfig -> Maybe MetricsMap -> Stream a -> IO ()
+runStreamStep _                    _ (  StreamExistingTopic _ _   ) = return ()
+runStreamStep c@FDBStreamConfig {..} _ s@(StreamProducer      _ step) = do
   -- TODO: this keeps spinning even if the producer is done and will never
   -- produce again.
   let Just outCfg = outputTopic c s
   xs <- catMaybes <$> replicateM 10 step -- TODO: batch size config
   writeTopic outCfg (fmap toMessage xs)
 
-runStreamStep c@FDBStreamConfig {..} s@(StreamConsumer sn _ step) = do
+runStreamStep c@FDBStreamConfig {..} metrics s@(StreamConsumer sn _ step) = do
   -- TODO: if parsing the message fails, should we still checkpoint?
   -- TODO: blockUntilNew
   let [inCfg] = inputTopics c s
   xs <- readNAndCheckpoint inCfg sn 10
   mapM_ step (fmap (fromMessage . snd) xs)
 
-runStreamStep c@FDBStreamConfig {..} s@(StreamPipe rn up step) = do
+runStreamStep c@FDBStreamConfig {..} metrics s@(StreamPipe rn up step) = do
   -- TODO: blockUntilNew
   let Just outCfg = outputTopic c s
   runTransactionWithConfig infRetry streamConfigDB $ do
-    inMsgs <- readBatchExactlyOnce c rn up 10
+    inMsgs <- readBatchExactlyOnce c metrics rn up 10
     ys     <- catMaybes . toList <$> liftIO (mapM step inMsgs)
     let outMsgs = fmap toMessage ys
     p' <- liftIO $ randPartition outCfg
     writeTopic' outCfg p' outMsgs
 
-runStreamStep c@FDBStreamConfig {..} s@(Stream1to1Join rn (ls :: Stream a) (rs :: Stream
+runStreamStep c@FDBStreamConfig {..} metrics s@(Stream1to1Join rn (ls :: Stream a) (rs :: Stream
     b) pl pr combiner)
   = do
     let Just outCfg = outputTopic c s
@@ -403,7 +488,7 @@ runStreamStep c@FDBStreamConfig {..} s@(Stream1to1Join rn (ls :: Stream a) (rs :
     -- downstream. If not, write the one message we do have to the join table.
     -- TODO: think of a way to garbage collect items that never get joined.
     FDB.runTransactionWithConfig infRetry streamConfigDB $ do
-      lMsgs    <- readBatchExactlyOnce c rn ls 10
+      lMsgs    <- readBatchExactlyOnce c metrics rn ls 10
       -- TODO: move joinFutures, joinData into separate function
       joinData <- Seq.zip lMsgs <$> get1to1JoinDataBatch c rn (fmap pl lMsgs)
       toWrite  <- fmap (catMaybes . toList) $ forM joinData $ \(lmsg, d) -> do
@@ -419,7 +504,7 @@ runStreamStep c@FDBStreamConfig {..} s@(Stream1to1Join rn (ls :: Stream a) (rs :
       p' <- liftIO $ randPartition outCfg
       writeTopic' outCfg p' (map toMessage toWrite)
     FDB.runTransactionWithConfig infRetry streamConfigDB $ do
-      rMsgs    <- readBatchExactlyOnce c rn rs 10
+      rMsgs    <- readBatchExactlyOnce c metrics rn rs 10
       joinData <- Seq.zip rMsgs <$> get1to1JoinDataBatch c rn (fmap pr rMsgs)
       toWrite  <- fmap (catMaybes . toList) $ forM joinData $ \(rmsg, d) -> do
         let k = pr rmsg
@@ -438,14 +523,14 @@ runStreamStep c@FDBStreamConfig {..} s@(Stream1to1Join rn (ls :: Stream a) (rs :
       p' <- liftIO $ randPartition outCfg
       writeTopic' outCfg p' (map toMessage toWrite)
 
-runStreamStep _ StreamGroupBy{} = return ()
+runStreamStep _ _ StreamGroupBy{} = return ()
 
-runStreamStep c@FDBStreamConfig {..} s@(StreamAggregate sn (StreamGroupBy _ up toKey) aggr)
+runStreamStep c@FDBStreamConfig {..} metrics s@(StreamAggregate sn (StreamGroupBy _ up toKey) aggr)
   = do
     let table = getAggrTable c s
     FDB.runTransactionWithConfig infRetry streamConfigDB $ do
-      msgs <- readBatchExactlyOnce c sn up 10
+      msgs <- readBatchExactlyOnce c metrics sn up 10
       forM_ msgs $ \msg -> AT.mappendTable table (toKey msg) (aggr msg)
 
 -- TODO: stronger types
-runStreamStep _ StreamAggregate{} = error "tried to aggregate ungrouped stream"
+runStreamStep _ _ StreamAggregate{} = error "tried to aggregate ungrouped stream"

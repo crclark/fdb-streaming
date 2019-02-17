@@ -44,7 +44,7 @@ readIntMsgAndCheckpoint tc = do
   readNAndCheckpoint tc testReader 10 >>= \case
     Empty -> do
       putStrLn "Blocking until new message"
-      blockUntilNew tc
+      --blockUntilNew tc -- TODO: deleted this. fix
       readIntMsgAndCheckpoint tc
     xs -> return $ sum $ fmap (parseWord64 . snd) xs
 
