@@ -1,4 +1,5 @@
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE LambdaCase #-}
 
 module FDBStreaming.AggrTable where
 
@@ -23,7 +24,7 @@ import Data.Binary.Put (runPut,
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (fromStrict, toStrict)
 import Data.Int (Int8, Int16, Int32, Int64)
-import Data.Monoid (Sum(..))
+import Data.Monoid (Sum(..), All(..))
 import Data.Word (Word8, Word16, Word32, Word64)
 
 import qualified FoundationDB as FDB
@@ -36,9 +37,27 @@ newtype AggrTable k v = AggrTable {
 }
 
 -- TODO: get is partial
+-- TODO: requires the user to decide how to structure keys in FDB. That's weird.
 class TableValue v where
   set :: Message k => AggrTable k v -> k -> v -> FDB.Transaction ()
   get :: Message k => AggrTable k v -> k -> FDB.Transaction (FDB.Future (Maybe v))
+
+-- | Gets a value from the table. If the key is not present, blocks until it
+-- is written.
+getBlocking :: (TableValue v, Message k)
+            => FDB.Database
+            -> AggrTable k v
+            -> k
+            -> IO v
+getBlocking db at k = do
+  result <- FDB.runTransaction db $ get at k >>= FDB.await >>= \case
+    Nothing -> do
+      let kbs = SS.pack (aggrTableSS at) [Bytes (toMessage k)]
+      Left <$> FDB.watch kbs
+    Just v -> return (Right v)
+  case result of
+    Right v -> return v
+    Left w -> FDB.awaitIO w >> getBlocking db at k
 
 class (Semigroup v, TableValue v) => TableSemigroup v where
   -- | mappends to the existing value at k in the table. If k has not been set,
@@ -74,6 +93,10 @@ mappendAtomicVia f op t k v = do
   let kbs = SS.pack (aggrTableSS t) [Bytes (toMessage k)]
   let vbs = f v
   FDB.atomicOp kbs (op vbs)
+
+instance TableValue Bool where
+  set = setVia (toStrict . runPut . putWord8 . fromIntegral . fromEnum)
+  get = getVia (toEnum . fromIntegral . runGet getWord8 . fromStrict)
 
 instance TableValue (Sum Int64) where
   set = setVia (toStrict . runPut . putInt64le . getSum)
@@ -139,3 +162,14 @@ instance TableValue (Sum Word8) where
 instance TableSemigroup (Sum Word8) where
   mappendTable =
     mappendAtomicVia (toStrict . runPut . putWord8 . getSum) Op.add
+
+allToByte :: All -> ByteString
+allToByte = toStrict . runPut . putWord8. fromIntegral . fromEnum . getAll
+
+instance TableValue All where
+  set = setVia allToByte
+  get = getVia (All . toEnum . fromIntegral . runGet getWord8 . fromStrict)
+
+instance TableSemigroup All where
+  mappendTable =
+    mappendAtomicVia allToByte Op.and

@@ -6,7 +6,8 @@
 
 module FDBStreaming.Topic where
 
-import Control.Concurrent.Async (async, waitAny)
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (async, race, waitAny)
 import Control.Monad
 import Data.Binary.Get ( runGet
                        , getWord64le)
@@ -17,7 +18,7 @@ import Data.Maybe (fromMaybe)
 import Data.Sequence (Seq(..))
 import Data.Word (Word8, Word16, Word64)
 import FoundationDB as FDB
-import FoundationDB.Options as Op
+import qualified FoundationDB.Options as Op
 import FoundationDB.Layer.Subspace as FDB
 import FoundationDB.Layer.Tuple as FDB
 -- TODO: move prefixRangeEnd out of Advanced usage section.
@@ -29,7 +30,6 @@ import FoundationDB.Versionstamp (Versionstamp
                                   TransactionVersionstamp(..),
                                   VersionstampCompleteness(..),
                                   decodeVersionstamp)
-import System.IO (stderr, hPutStrLn)
 import System.Random (randomRIO)
 
 -- TODO: something less insane
@@ -162,7 +162,7 @@ writeTopic' tc@TopicConfig{..} p bss =
       go !i bs = do
         let vs = IncompleteVersionstamp i
         let k = FDB.pack (partitionMsgsSS p) [FDB.IncompleteVS vs]
-        FDB.atomicOp k (setVersionstampedKey bs)
+        FDB.atomicOp k (Op.setVersionstampedKey bs)
         incrTopicCount tc
         incrPartitionCount tc p
         return (i+1)
@@ -194,17 +194,8 @@ trOutput TopicConfig{..} p (k,v) =
                         ++ " because "
                         ++ show err
 
--- TODO: should actually set the watch from the same transaction that did the
--- last read, so that we are guaranteed to be woken by the next write.
-blockUntilNew :: TopicConfig -> IO ()
-blockUntilNew conf@TopicConfig{..} = do
-  let k = topicCountKey
-  f <- FDB.runTransaction topicConfigDB (FDB.watch k)
-  FDB.awaitIO f >>= \case
-    Right () -> return ()
-    Left err -> do
-      hPutStrLn stderr $ "got error while watching: " ++ show err
-      blockUntilNew conf
+newtype TopicWatch = TopicWatch {unTopicWatch :: [FutureIO PartitionId]}
+  deriving (Show)
 
 -- | Returns a watch for each partition of the given topic.
 -- Caveats:
@@ -213,16 +204,26 @@ blockUntilNew conf@TopicConfig{..} = do
 -- 2. could increase conflicts if all readers are doing this and the write freq
 -- is low -- everyone would wake up and try to read from the same partition each
 -- time there's a write.
-watchTopic' :: TopicConfig -> Transaction [FutureIO PartitionId]
-watchTopic' tc = forM [0..numPartitions tc] $ \p ->
-  fmap (const p) <$> watch (partitionCountKey tc p)
+watchTopic' :: TopicConfig -> Transaction TopicWatch
+watchTopic' tc = fmap TopicWatch $ forM [0..numPartitions tc] $ \pid ->
+  fmap (const pid) <$> watch (partitionCountKey tc pid)
 
 -- | For use with the return value of 'watchTopic''. Must be called from outside
 -- the transaction within which 'watchTopic'' was called.
-awaitTopic :: [FutureIO PartitionId] -> IO (Either FDB.Error PartitionId)
-awaitTopic fs = do
+awaitTopic :: TopicWatch -> IO (Either FDB.Error PartitionId)
+awaitTopic (TopicWatch fs) = do
   (_,x) <- mapM (async . awaitIO) fs >>= waitAny
   return x
+
+-- | Waits at most n microseconds for a new message to be written to the given
+-- set of partitions. Returns the first partition to be written to within the
+-- time limit, if any. Returns 'Nothing' on timout.
+awaitTopicOrTimeout :: Int -> TopicWatch -> IO (Maybe PartitionId)
+awaitTopicOrTimeout timeout futures =
+  race (threadDelay timeout) (awaitTopic futures) >>= \case
+    Left _ -> return Nothing
+    Right (Left _) -> return Nothing -- TODO: handle errors better
+    Right (Right p) -> return (Just p)
 
 watchTopic :: TopicConfig -> IO (Either FDB.Error PartitionId)
 watchTopic tc = do

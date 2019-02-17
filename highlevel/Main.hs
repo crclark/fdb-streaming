@@ -1,8 +1,18 @@
-{-# LANGUAGE OverloadedStrings#-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DerivingVia #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE BangPatterns #-}
 
 module Main where
 
 import           FDBStreaming
+import qualified FDBStreaming.AggrTable as AT
 import           FDBStreaming.Message
 import           FDBStreaming.Topic
 
@@ -16,75 +26,195 @@ import           Control.Concurrent.STM         ( TVar
                                                 , newTVarIO
                                                 )
 import           Control.Exception
-import           Data.Binary.Put                ( runPut
-                                                , putWord64le
-                                                )
-import           Data.Binary.Get                ( runGet
-                                                , getWord64le
-                                                )
 import           Data.List                      ( sortOn )
-import           Data.Void
-import           Data.ByteString.Lazy           ( toStrict
-                                                , fromStrict
-                                                )
-
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Random.MWC as BS
 import           FoundationDB                  as FDB
 import           FoundationDB.Layer.Subspace   as FDB
 import           FoundationDB.Layer.Tuple      as FDB
+import           Data.UnixTime                  ( UnixTime
+                                                , UnixDiffTime(..)
+                                                , getUnixTime
+                                                , diffUnixTime
+                                                )
+import           Data.UUID                      ( UUID )
+import           Data.UUID.V4                  as UUID
+                                                ( nextRandom )
+import           GHC.Generics                   ( Generic )
+import           System.Random                  ( randomIO )
+import           Data.Store                     ( Store )
+import qualified Data.Store                    as Store
+import Data.Functor.Identity (Identity(..))
+import Foreign.C.Types (CTime(..))
+import Data.Monoid (All (..))
 
-instance Message Int where
-  toMessage = toStrict . runPut . putWord64le . fromIntegral
-  fromMessage = fromIntegral . runGet getWord64le . fromStrict
+newtype Timestamp = Timestamp { unTimestamp :: UnixTime }
+  deriving (Show, Eq, Ord, Generic)
+  deriving Store via (Identity UnixTime)
 
-writeInts :: StreamName -> TVar Int -> Int -> Stream Int
-writeInts sn state n = StreamProducer sn $ do
-  curr <- readTVarIO state
-  if curr < n
-    then do
-      atomically $ modifyTVar' state (+ 1)
-      return $ Just curr
-    else return Nothing
+newtype OrderID = OrderID { unOrderID :: UUID }
+  deriving (Show, Eq, Ord, Generic)
+  deriving Store via (Identity UUID)
 
-writeIntsTopic :: TopicConfig -> Int -> IO ()
-writeIntsTopic tc n = go 0
- where
-  go i = when (i < n) $ do
-    writeTopic tc (map toMessage [i .. i + 10])
-    go (i + 11)
+instance Message OrderID where
+  toMessage = Store.encode
+  fromMessage = Store.decodeEx
 
-keepOdds :: Stream Int -> Stream Int
-keepOdds input = StreamPipe "keepOdds" input
-  $ \x -> if odd x then return (Just x) else return Nothing
+data Order = Order
+  { placedAt :: Timestamp
+  , orderID :: OrderID
+  , isFraud :: Bool
+  , isInStock :: Bool
+  } deriving (Show, Eq, Generic, Store)
 
--- TODO: obviously with state as a tvar this can't actually be split into
--- multiple processes yet.
-sumInts :: TVar Int -> Stream Int -> Stream Void
-sumInts state input =
-  StreamConsumer "sumInts" input $ \x -> atomically $ modifyTVar' state (+ x)
+instance Message Order where
+  toMessage = Store.encode
+  fromMessage = Store.decodeEx
 
-joinId :: Message a => StreamName -> Stream a -> Stream a -> Stream (a, a)
-joinId sn l r = Stream1to1Join sn l r id id (,)
+randOrder :: IO Order
+randOrder = do
+  placedAt  <- Timestamp <$> getUnixTime
+  orderID   <- OrderID <$> UUID.nextRandom
+  isFraud   <- randomIO
+  isInStock <- randomIO
+  return Order { .. }
 
-topo :: IO (Stream Void)
-topo = do
-  writeState <- newTVarIO 0
-  sumState   <- newTVarIO 0
-  return $ sumInts sumState $ keepOdds (writeInts "write_ints" writeState 100)
+data FraudResult = FraudResult
+  { orderID :: OrderID
+  , isFraud :: Bool
+  } deriving (Show, Eq, Generic, Store)
 
-printEvery1000 :: (Int, Int) -> IO ()
-printEvery1000 (x, _) = when (x `mod` 1000 == 0) (print x)
+instance Message FraudResult where
+  toMessage = Store.encode
+  fromMessage = Store.decodeEx
 
+-- TODO: use getField
+fraudOrderID :: FraudResult -> OrderID
+fraudOrderID FraudResult{orderID} = orderID
 
-joinTopo :: Database -> IO (Stream Void)
-joinTopo db = do
-  writeState1 <- newTVarIO 0
-  let rawTC = makeTopicConfig db topSS "raw_writes"
-  void $ forkIO $ writeIntsTopic rawTC 100000
-  let writer1 = writeInts "write1" writeState1 100000
-  let writer2 = StreamExistingTopic "write2" rawTC
-  let joiner  = joinId "intjoin" writer1 writer2
-  let printer = StreamConsumer "print" joiner printEvery1000
-  return printer
+-- | Super-sophisticated fraud detection! Asks the order if it is fraudulent.
+isFraudulent :: Order -> FraudResult
+isFraudulent Order{..} = FraudResult{..}
+
+data InStockResult = InStockResult
+  { orderID ::  OrderID
+  , isInStock :: Bool
+  } deriving (Show, Eq, Generic, Store)
+
+instance Message InStockResult where
+  toMessage = Store.encode
+  fromMessage = Store.decodeEx
+
+invOrderID :: InStockResult -> OrderID
+invOrderID InStockResult{orderID} = orderID
+
+inventoryCheck :: Order -> InStockResult
+inventoryCheck Order { .. } = InStockResult { .. }
+
+data OrderDetails = OrderDetails
+  { orderID :: OrderID
+  , details :: ByteString
+  } deriving (Show, Eq, Ord, Generic, Store)
+
+instance Message OrderDetails where
+  toMessage = Store.encode
+  fromMessage = Store.decodeEx
+
+randOrderDetails :: Order -> IO OrderDetails
+randOrderDetails Order { .. } = do
+  details <- BS.random 500
+  return OrderDetails { .. }
+
+goodDetails :: ByteString -> Bool
+goodDetails bs = odd $ sum $ BS.unpack bs
+
+data LatencyStats = LatencyStats
+  { timeElapsed :: !UnixDiffTime
+  , numFinished :: !Int
+  } deriving (Show, Eq, Ord)
+
+instance Semigroup LatencyStats where
+  (LatencyStats x1 y1) <> (LatencyStats x2 y2) =
+    LatencyStats (x1 + x2) (y1 + y2)
+
+-- | Creates a random order, pushes it onto the given topic, awaits its
+-- arrival in the given AggrTable, and updates the given latency statistics
+-- TVar.
+placeAndAwaitOrder :: TopicConfig
+                   -> AT.AggrTable OrderID All
+                   -> TVar LatencyStats
+                   -> IO ()
+placeAndAwaitOrder orderTopic table stats = do
+  order@Order{orderID} <- randOrder
+  writeTopic orderTopic [(toMessage order)]
+  _ <- AT.getBlocking (topicConfigDB orderTopic) table orderID
+  endTime <- getUnixTime
+  let diff = diffUnixTime endTime (unTimestamp $ placedAt order)
+  let statsDiff = LatencyStats diff 1
+  atomically $ modifyTVar' stats (<> statsDiff)
+
+orderGeneratorLoop :: TopicConfig
+                   -> AT.AggrTable OrderID All
+                   -> Int
+                   -- ^ requests per second
+                   -> TVar LatencyStats
+                   -> IO ()
+orderGeneratorLoop topic table rps stats = do
+  let delay = 1000000 `div` rps
+  void $ forkIO $ placeAndAwaitOrder topic table stats
+  threadDelay delay
+  --putStrLn $ "delaying " ++ show delay
+  orderGeneratorLoop topic table rps stats
+
+latencyReportLoop :: TVar LatencyStats -> IO ()
+latencyReportLoop stats = do
+  LatencyStats{..} <- readTVarIO stats
+  let (UnixDiffTime (CTime secs) usecs) = timeElapsed
+  let totalMicroseconds = 1000000 * (fromIntegral secs) + (fromIntegral usecs) :: Integer
+  let avgMilliseconds = (totalMicroseconds `div` fromIntegral numFinished) `div` 1000
+  putStrLn $ "Processed "
+             ++ show numFinished
+             ++ " orders with average latency of "
+             ++ show avgMilliseconds
+             ++ " milliseconds"
+  threadDelay 1000000
+  latencyReportLoop stats
+
+instance Message Bool where
+  toMessage = Store.encode
+  fromMessage = Store.decodeEx
+
+instance Message All where
+  toMessage = Store.encode
+  fromMessage = Store.decodeEx
+
+topology :: TopicConfig -> Stream (AT.AggrTable OrderID All)
+topology incoming = StreamAggregate "order_table" grouped snd
+  where
+    input = StreamExistingTopic "existing_orders" incoming
+    fraudChecks = StreamPipe "fraud_checks" input $ \order ->
+      return $ Just $ isFraudulent order
+    invChecks = StreamPipe "inv_checks" input $ \order ->
+      return $ Just $ inventoryCheck order
+    detailsPipe = StreamPipe "details" input (fmap Just . randOrderDetails)
+    fraudInvJoin = Stream1to1Join "f_i_join"
+                                  fraudChecks
+                                  invChecks
+                                  fraudOrderID
+                                  invOrderID
+                                  (\FraudResult{orderID, isFraud}
+                                    InStockResult{isInStock}
+                                    -> (orderID, not isFraud && isInStock))
+    finalJoin = Stream1to1Join "final_join"
+                               fraudInvJoin
+                               detailsPipe
+                               fst
+                               (\OrderDetails{orderID} -> orderID)
+                               (\(oid, isGood) OrderDetails{details}
+                                 -> (oid, All $ isGood && goodDetails details))
+    grouped = StreamGroupBy "groupby" finalJoin fst
+
 
 topSS :: Subspace
 topSS = FDB.subspace [FDB.Bytes "cool_subspace"]
@@ -103,7 +233,12 @@ printStats db ss = do
 mainLoop :: Database -> IO ()
 mainLoop db = do
   let conf = FDBStreamConfig db topSS
-  t <- joinTopo db
+  let input = makeTopicConfig db topSS "incoming_orders"
+  let t = topology input
+  let table = getAggrTable conf t
+  stats <- newTVarIO $ LatencyStats 0 1
+  void $ forkIO $ orderGeneratorLoop input table 200 stats
+  void $ forkIO $ latencyReportLoop stats
   debugTraverseStream t
   runStream conf t
   forever $ do
@@ -115,3 +250,4 @@ main = withFoundationDB defaultOptions $ \db -> finally (mainLoop db) $ do
   putStrLn "Cleaning up FDB state"
   let (delBegin, delEnd) = rangeKeys $ subspaceRange topSS
   runTransaction db $ clearRange delBegin delEnd
+  putStrLn "Cleanup successful"

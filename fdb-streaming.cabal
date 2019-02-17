@@ -100,6 +100,11 @@ executable fdb-streaming-highlevel
     , optparse-generic
     , stm
     , containers
+    , store
+    , unix-time
+    , uuid
+    , random-bytestring
+    , random
   default-language: Haskell2010
 
 test-suite fdb-streaming-test

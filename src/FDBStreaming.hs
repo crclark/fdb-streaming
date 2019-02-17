@@ -158,6 +158,19 @@ data Stream b where
 -- | reads a batch of messages from a stream and checkpoints so that the same
 -- value of 'ReaderName' is guaranteed to never receive the same messages again
 -- in subsequent calls to this function.
+readPartitionBatchExactlyOnce
+  :: Message a
+  => FDBStreamConfig
+  -> ReaderName
+  -> Stream a
+  -> PartitionId
+  -> Word8
+  -> Transaction (Seq a)
+readPartitionBatchExactlyOnce cfg rn s pid n = case outputTopic cfg s of
+  Nothing     -> return Empty
+  Just outCfg ->
+    fmap (fromMessage . snd) <$> readNAndCheckpoint' outCfg pid rn n
+
 readBatchExactlyOnce
   :: Message a
   => FDBStreamConfig
@@ -166,10 +179,10 @@ readBatchExactlyOnce
   -> Word8
   -> Transaction (Seq a)
 readBatchExactlyOnce cfg rn s n = case outputTopic cfg s of
-  Nothing     -> return Empty
+  Nothing -> return Empty
   Just outCfg -> do
-    p <- liftIO $ randPartition outCfg
-    fmap (fromMessage . snd) <$> readNAndCheckpoint' outCfg p rn n
+    pid <- liftIO $ randPartition outCfg
+    readPartitionBatchExactlyOnce cfg rn s pid n
 
 getAggrTable :: FDBStreamConfig -> Stream (AT.AggrTable k v) -> AT.AggrTable k v
 getAggrTable sc (StreamAggregate sn _ _) = AT.AggrTable
@@ -313,7 +326,26 @@ outputTopic sc s =
 foreverLogErrors :: StreamName -> IO () -> IO ()
 foreverLogErrors sn x = forever $ handle
   (\(e :: SomeException) -> putStrLn $ show sn ++ " thread caught " ++ show e)
-  x
+  $ do
+    -- Problem: busy looping, constantly reading for more data, is wasteful.
+    -- Possible solution: create a watch after each iteration, and only loop
+    -- again once the watch is delivered. Subsequent problem: we need to pass
+    -- the partition id of the partition with new messages into the iteration
+    -- body. However, if we do that, we could conceivably cause all the reader
+    -- threads to synchronize, with all of them waking up on each write and
+    -- contending the same partition, which breaks the reader scalability we
+    -- created with the partitions.
+    -- On the other hand, we can't watch and then read a random partition,
+    -- because then we might read the wrong one and the message could be delayed
+    -- in a low-write situation.
+    -- On the third or fourth hand, perhaps the readers would only get synched
+    -- in low-write situations where contention wouldn't matter, anyway -- if
+    -- tons of messages are coming in, presumably threads will be spending more
+    -- time working than waiting, and they won't be woken up together for
+    -- exactly the same write.
+    -- w <- x
+    -- awaitTopicOrTimeout 500 w
+    x
 
 runStream :: FDBStreamConfig -> Stream a -> IO ()
 runStream c s = traverseStream s $ \step -> do
