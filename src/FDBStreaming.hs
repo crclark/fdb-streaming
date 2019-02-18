@@ -379,6 +379,7 @@ data FDBStreamConfig = FDBStreamConfig
   , streamConfigSS :: FDB.Subspace
   -- ^ subspace that will contain all state for the stream topology
   , streamMetricsStore :: Maybe Metrics.Store
+  , threadsPerEdge :: Int
   }
 
 inputTopics :: FDBStreamConfig -> Stream a -> [TopicConfig]
@@ -439,11 +440,12 @@ foreverLogErrors metrics sn x = forever $ handle
       Distribution.add batchLatency timeMillis
 
 runStream :: FDBStreamConfig -> Stream a -> IO ()
-runStream cfg@FDBStreamConfig{streamMetricsStore} s = do
+runStream cfg@FDBStreamConfig{streamMetricsStore, threadsPerEdge} s = do
   metrics <- forM streamMetricsStore $ registerTopologyMetrics s
   traverseStream s $ \step -> do
     putStrLn $ "starting " ++ show (streamName step)
-    void $ forkIO $ foreverLogErrors metrics (streamName step) $ runStreamStep cfg metrics step
+    replicateM_ threadsPerEdge
+      $ void $ forkIO $ foreverLogErrors metrics (streamName step) $ runStreamStep cfg metrics step
 
 -- | Runs a single stream step. Reads from its input topic
 -- in chunks, runs the monadic action on each input, and writes the result to

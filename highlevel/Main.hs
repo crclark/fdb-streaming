@@ -245,12 +245,12 @@ mainLoop :: Database -> IO ()
 mainLoop db = do
   metricsStore <- serverMetricStore <$> forkServer "localhost" 8000
   latencyDist <- Metrics.createDistribution "end_to_end_latency" metricsStore
-  let conf = FDBStreamConfig db topSS (Just metricsStore)
+  let conf = FDBStreamConfig db topSS (Just metricsStore) 8
   let input = makeTopicConfig db topSS "incoming_orders"
   let t = topology input
   let table = getAggrTable conf t
   stats <- newTVarIO $ LatencyStats 0 1
-  void $ forkIO $ orderGeneratorLoop input table 200 stats latencyDist
+  void $ forkIO $ orderGeneratorLoop input table 500 stats latencyDist
   void $ forkIO $ latencyReportLoop stats
   debugTraverseStream t
   runStream conf t
