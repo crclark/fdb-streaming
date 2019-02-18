@@ -277,8 +277,10 @@ mainLoop db = do
   let t = topology input
   let table = getAggrTable conf t
   stats <- newTVarIO $ LatencyStats 0 1
-  void $ forkIO $ orderGeneratorLoop input table 500 10 stats latencyDist awaitedOrders
-  void $ forkIO $ orderGeneratorLoop input table 500 10 stats latencyDist awaitedOrders
+  void $ forkIO $ orderGeneratorLoop input table 500 40 stats latencyDist awaitedOrders
+  void $ forkIO $ orderGeneratorLoop input table 500 40 stats latencyDist awaitedOrders
+  void $ forkIO $ orderGeneratorLoop input table 500 40 stats latencyDist awaitedOrders
+  void $ forkIO $ orderGeneratorLoop input table 500 40 stats latencyDist awaitedOrders
   void $ forkIO $ latencyReportLoop stats
   debugTraverseStream t
   runStream conf t

@@ -15,6 +15,7 @@ import           FDBStreaming.Message           ( Message(..) )
 import           FDBStreaming.Topic
 
 import           Control.Concurrent
+import           Control.Concurrent.Async       (async, wait)
 import           Control.Exception
 import           Control.Monad
 import           Control.Monad.IO.Class
@@ -518,9 +519,8 @@ runStreamStep c@FDBStreamConfig {..} metrics s@(Stream1to1Join rn (ls :: Stream
     -- join table to see if the partner is already there. If so, write the tuple
     -- downstream. If not, write the one message we do have to the join table.
     -- TODO: think of a way to garbage collect items that never get joined.
-    FDB.runTransactionWithConfig lowRetries streamConfigDB $ do
+    l <- async $ FDB.runTransactionWithConfig lowRetries streamConfigDB $ do
       lMsgs    <- readBatchExactlyOnce c metrics rn ls 10
-      -- TODO: move joinFutures, joinData into separate function
       joinData <- Seq.zip lMsgs <$> get1to1JoinDataBatch c rn (fmap pl lMsgs)
       toWrite  <- fmap (catMaybes . toList) $ forM joinData $ \(lmsg, d) -> do
         let k = pl lmsg
@@ -553,6 +553,7 @@ runStreamStep c@FDBStreamConfig {..} metrics s@(Stream1to1Join rn (ls :: Stream
       -- return the list of stuff to write and then call swap before writing.
       p' <- liftIO $ randPartition outCfg
       writeTopic' outCfg p' (map toMessage toWrite)
+    wait l
 
 runStreamStep _ _ StreamGroupBy{} = return ()
 
