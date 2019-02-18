@@ -258,11 +258,15 @@ mainLoop db = do
     printStats db topSS
     threadDelay 1000000
 
-main :: IO ()
-main = withFoundationDB defaultOptions $ \db -> do
+cleanup :: Database -> IO ()
+cleanup db = do
   putStrLn "Cleaning up FDB state"
   let (delBegin, delEnd) = rangeKeys $ subspaceRange topSS
   runTransaction db $ clearRange delBegin delEnd
   putStrLn "Cleanup successful"
+
+main :: IO ()
+main = withFoundationDB defaultOptions $ \db -> do
+  cleanup db
   mainLoop db
 
