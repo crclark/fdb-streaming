@@ -50,6 +50,8 @@ import Data.Monoid (All (..))
 import qualified System.Metrics as Metrics
 import           System.Metrics.Distribution (Distribution)
 import qualified System.Metrics.Distribution as Distribution
+import           System.Metrics.Gauge (Gauge)
+import qualified System.Metrics.Gauge as Gauge
 import System.Remote.Monitoring (forkServer, serverMetricStore)
 
 
@@ -146,17 +148,21 @@ unixDiffTimeToMicroseconds :: UnixDiffTime -> Int
 unixDiffTimeToMicroseconds (UnixDiffTime (CTime secs) usecs) =
   1000000 * (fromIntegral secs) + (fromIntegral usecs)
 
--- | Creates a random order, pushes it onto the given topic, awaits its
--- arrival in the given AggrTable, and updates the given latency statistics
--- TVar.
-placeAndAwaitOrder :: TopicConfig
-                   -> AT.AggrTable OrderID All
-                   -> TVar LatencyStats
-                   -> Distribution
-                   -> IO ()
-placeAndAwaitOrder orderTopic table stats latencyDist = do
-  order@Order{orderID} <- randOrder
-  writeTopic orderTopic [(toMessage order)]
+unixDiffTimeToMilliseconds :: UnixDiffTime -> Double
+unixDiffTimeToMilliseconds (UnixDiffTime (CTime secs) usecs) =
+  1000.0 * (fromIntegral secs) + (fromIntegral usecs / 1000.0)
+
+
+awaitOrder
+  :: TopicConfig
+  -> AT.AggrTable OrderID All
+  -> TVar LatencyStats
+  -> Distribution
+  -> Gauge
+  -> Order
+  -> IO ()
+awaitOrder orderTopic table stats latencyDist awaitGauge order@Order{orderID} = do
+  Gauge.inc awaitGauge
   _ <- AT.getBlocking (topicConfigDB orderTopic) table orderID
   endTime <- getUnixTime
   let diff = diffUnixTime endTime (unTimestamp $ placedAt order)
@@ -164,19 +170,39 @@ placeAndAwaitOrder orderTopic table stats latencyDist = do
   atomically $ modifyTVar' stats (<> statsDiff)
   let diffMillis = unixDiffTimeToMilliseconds diff
   Distribution.add latencyDist diffMillis
+  Gauge.dec awaitGauge
+
+-- | Creates a random order, pushes it onto the given topic, awaits its
+-- arrival in the given AggrTable, and updates the given latency statistics
+-- TVar.
+placeAndAwaitOrders :: TopicConfig
+                    -> AT.AggrTable OrderID All
+                    -> TVar LatencyStats
+                    -> Distribution
+                    -> Gauge
+                    -> Int
+                    -- ^ batch size
+                    -> IO ()
+placeAndAwaitOrders orderTopic table stats latencyDist awaitGauge batchSize = do
+  orders <- replicateM batchSize randOrder
+  writeTopic orderTopic (map toMessage orders)
+  forM_ orders $ awaitOrder orderTopic table stats latencyDist awaitGauge
 
 orderGeneratorLoop :: TopicConfig
                    -> AT.AggrTable OrderID All
                    -> Int
                    -- ^ requests per second
+                   -> Int
+                   -- ^ batch size
                    -> TVar LatencyStats
                    -> Distribution
+                   -> Gauge
                    -> IO ()
-orderGeneratorLoop topic table rps stats latencyDist = do
-  let delay = 1000000 `div` rps
-  void $ forkIO $ placeAndAwaitOrder topic table stats latencyDist
+orderGeneratorLoop topic table rps batchSize stats latencyDist awaitGauge = do
+  let delay = 1000000 `div` (rps `div` batchSize)
+  void $ forkIO $ placeAndAwaitOrders topic table stats latencyDist awaitGauge batchSize
   threadDelay delay
-  orderGeneratorLoop topic table rps stats latencyDist
+  orderGeneratorLoop topic table rps batchSize stats latencyDist awaitGauge
 
 latencyReportLoop :: TVar LatencyStats -> IO ()
 latencyReportLoop stats = do
@@ -245,12 +271,14 @@ mainLoop :: Database -> IO ()
 mainLoop db = do
   metricsStore <- serverMetricStore <$> forkServer "localhost" 8000
   latencyDist <- Metrics.createDistribution "end_to_end_latency" metricsStore
+  awaitedOrders <- Metrics.createGauge "waitingOrders" metricsStore
   let conf = FDBStreamConfig db topSS (Just metricsStore) 8
   let input = makeTopicConfig db topSS "incoming_orders"
   let t = topology input
   let table = getAggrTable conf t
   stats <- newTVarIO $ LatencyStats 0 1
-  void $ forkIO $ orderGeneratorLoop input table 500 stats latencyDist
+  void $ forkIO $ orderGeneratorLoop input table 500 10 stats latencyDist awaitedOrders
+  void $ forkIO $ orderGeneratorLoop input table 500 10 stats latencyDist awaitedOrders
   void $ forkIO $ latencyReportLoop stats
   debugTraverseStream t
   runStream conf t
