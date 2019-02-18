@@ -50,6 +50,7 @@ data StreamEdgeMetrics = StreamEdgeMetrics
   { messagesProcessed :: Counter
   , emptyReads :: Counter
   , batchLatency :: Distribution
+  , messagesPerBatch :: Distribution
   }
 
 type MetricsMap = Map StreamName StreamEdgeMetrics
@@ -63,12 +64,18 @@ registerTopologyMetrics topo store =
     mp <- Metrics.createCounter ("stream." <> sn <> ".messagesProcessed") store
     er <- Metrics.createCounter ("stream." <> sn <> ".emptyReads") store
     bl <- Metrics.createDistribution ("stream." <> sn <> ".batchLatency") store
-    return (Map.singleton (streamName s) (StreamEdgeMetrics mp er bl))
+    mb <- Metrics.createDistribution ("stream." <> sn <> ".msgsPerBatch") store
+    return (Map.singleton (streamName s) (StreamEdgeMetrics mp er bl mb))
 
 incrEmptyBatchCount :: StreamName -> Maybe MetricsMap -> IO ()
 incrEmptyBatchCount sn Nothing = return ()
 incrEmptyBatchCount sn (Just m) =
   Counter.inc (emptyReads $ m Map.! sn)
+
+recordMsgsPerBatch :: StreamName -> Maybe MetricsMap -> Int -> IO ()
+recordMsgsPerBatch _ Nothing _ = return ()
+recordMsgsPerBatch sn (Just m) n =
+  Distribution.add (messagesPerBatch $ m Map.! sn) (fromIntegral n)
 
 {-
 
@@ -212,6 +219,7 @@ readPartitionBatchExactlyOnce cfg metrics rn s pid n = case outputTopic cfg s of
   Just outCfg -> do
     rawMsgs <- readNAndCheckpoint' outCfg pid rn n
     liftIO $ when (Seq.null rawMsgs) (incrEmptyBatchCount rn metrics)
+    liftIO $ recordMsgsPerBatch rn metrics (Seq.length rawMsgs)
     return $ fmap (fromMessage . snd) rawMsgs
 
 readBatchExactlyOnce
