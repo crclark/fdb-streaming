@@ -52,8 +52,8 @@ import           System.Metrics.Distribution (Distribution)
 import qualified System.Metrics.Distribution as Distribution
 import           System.Metrics.Gauge (Gauge)
 import qualified System.Metrics.Gauge as Gauge
-import System.Remote.Monitoring (forkServer, serverMetricStore)
-
+import           System.Remote.Monitoring (forkServer, serverMetricStore)
+import System.Remote.Monitoring.Statsd (defaultStatsdOptions, forkStatsd)
 
 newtype Timestamp = Timestamp { unTimestamp :: UnixTime }
   deriving (Show, Eq, Ord, Generic)
@@ -269,16 +269,15 @@ printStats db ss = do
 
 mainLoop :: Database -> IO ()
 mainLoop db = do
-  metricsStore <- serverMetricStore <$> forkServer "localhost" 8000
+  metricsStore <- Metrics.newStore
   latencyDist <- Metrics.createDistribution "end_to_end_latency" metricsStore
   awaitedOrders <- Metrics.createGauge "waitingOrders" metricsStore
-  let conf = FDBStreamConfig db topSS (Just metricsStore) 8
+  forkStatsd defaultStatsdOptions metricsStore
+  let conf = FDBStreamConfig db topSS (Just metricsStore) 4
   let input = makeTopicConfig db topSS "incoming_orders"
   let t = topology input
   let table = getAggrTable conf t
   stats <- newTVarIO $ LatencyStats 0 1
-  void $ forkIO $ orderGeneratorLoop input table 500 40 stats latencyDist awaitedOrders
-  void $ forkIO $ orderGeneratorLoop input table 500 40 stats latencyDist awaitedOrders
   void $ forkIO $ orderGeneratorLoop input table 500 40 stats latencyDist awaitedOrders
   void $ forkIO $ orderGeneratorLoop input table 500 40 stats latencyDist awaitedOrders
   void $ forkIO $ latencyReportLoop stats

@@ -91,7 +91,7 @@ makeTopicConfig topicConfigDB topicSS topicName = TopicConfig{..}
                                       , Bytes "meta"
                                       , Bytes "count"
                                       ]
-    numPartitions = 10 -- TODO: make configurable
+    numPartitions = 20 -- TODO: make configurable
 
 randPartition :: TopicConfig -> IO PartitionId
 randPartition TopicConfig{..} = fromIntegral <$> randomRIO (0,numPartitions)
@@ -273,6 +273,8 @@ readNPastCheckpoint tc p rn n = do
 
 -- TODO: would be useful to have a version of this that returns a watch if
 -- there are no new messages.
+-- NOTE: doing readNPastCheckpoint as a snapshot read breaks the exactly-once
+-- guarantee.
 readNAndCheckpoint' :: TopicConfig
                     -> PartitionId
                     -> ReaderName

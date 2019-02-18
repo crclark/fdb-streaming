@@ -429,8 +429,9 @@ foreverLogErrors metrics sn x =
         )
     $ handle
         (\case
-          Error (MaxRetriesExceeded (CError NotCommitted)) ->
+          Error (MaxRetriesExceeded (CError NotCommitted)) -> do
             incrConflicts sn metrics
+            threadDelay 2500
           e -> throw e
         )
     $ do
@@ -452,6 +453,9 @@ foreverLogErrors metrics sn x =
     -- exactly the same write.
     -- w <- x
     -- awaitTopicOrTimeout 500 w
+        --NOTE: a small delay here (<10 milliseconds) helps us reach
+        -- msgs/second
+        threadDelay 150
         t1 <- getTime Monotonic
         x
         t2 <- getTime Monotonic
