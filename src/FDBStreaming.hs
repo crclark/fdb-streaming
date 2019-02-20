@@ -15,7 +15,9 @@ import           FDBStreaming.Message           ( Message(..) )
 import           FDBStreaming.Topic
 
 import           Control.Concurrent
-import           Control.Concurrent.Async       (async, wait)
+import           Control.Concurrent.Async       ( async
+                                                , wait
+                                                )
 import           Control.Exception
 import           Control.Monad
 import           Control.Monad.IO.Class
@@ -36,10 +38,11 @@ import           FoundationDB.Error            as FDB
 import           FoundationDB.Layer.Subspace   as FDB
 import           FoundationDB.Layer.Tuple      as FDB
 import           Data.Word                      ( Word8 )
-import           System.Clock                   ( Clock(Monotonic),
-                                                  diffTimeSpec,
-                                                  getTime,
-                                                  toNanoSecs)
+import           System.Clock                   ( Clock(Monotonic)
+                                                , diffTimeSpec
+                                                , getTime
+                                                , toNanoSecs
+                                                )
 import qualified System.Metrics                as Metrics
 import           System.Metrics.Counter         ( Counter )
 import           System.Metrics.Distribution    ( Distribution )
@@ -75,7 +78,7 @@ registerTopologyMetrics topo store = foldMStream topo $ \s -> do
   return (Map.singleton (streamName s) (StreamEdgeMetrics mp er bl mb cs))
 
 incrEmptyBatchCount :: StreamName -> Maybe MetricsMap -> IO ()
-incrEmptyBatchCount sn Nothing  = return ()
+incrEmptyBatchCount _ Nothing  = return ()
 incrEmptyBatchCount sn (Just m) = Counter.inc (emptyReads $ m Map.! sn)
 
 recordMsgsPerBatch :: StreamName -> Maybe MetricsMap -> Int -> IO ()
@@ -84,11 +87,11 @@ recordMsgsPerBatch sn (Just m) n =
   Distribution.add (messagesPerBatch $ m Map.! sn) (fromIntegral n)
 
 incrConflicts :: StreamName -> Maybe MetricsMap -> IO ()
-incrConflicts sn Nothing  = return ()
+incrConflicts _ Nothing  = return ()
 incrConflicts sn (Just m) = Counter.inc (conflicts $ m Map.! sn)
 
 recordBatchLatency :: Integral a => StreamName -> Maybe MetricsMap -> a -> IO ()
-recordBatchLatency sn Nothing = const $ return ()
+recordBatchLatency _ Nothing = const $ return ()
 recordBatchLatency sn (Just m) =
   Distribution.add (batchLatency $ m Map.! sn) . fromIntegral
 
@@ -409,6 +412,13 @@ inputTopics sc (Stream1to1Join _ l r _ _ _) =
 inputTopics sc (StreamGroupBy   _ inp _) = catMaybes [outputTopic sc inp]
 inputTopics sc (StreamAggregate _ inp _) = inputTopics sc inp
 
+-- NOTE: assumes that all topics in the topology have the same number of
+-- partitions, which is safe to assume for now.
+inputTopicNumPartitions :: FDBStreamConfig -> Stream a -> Integer
+inputTopicNumPartitions sc s = case inputTopics sc s of
+  []       -> 0
+  (tc : _) -> numPartitions tc
+
 outputTopic :: FDBStreamConfig -> Stream a -> Maybe TopicConfig
 -- TODO: StreamConsumer has no output. Should it not be included in this GADT?
 -- Or perhaps not exist at all?
@@ -420,7 +430,7 @@ outputTopic sc s =
   Just $ makeTopicConfig (streamConfigDB sc) (streamConfigSS sc) (streamName s)
 
 foreverLogErrors
-  :: Maybe (Map StreamName StreamEdgeMetrics) -> StreamName -> IO () -> IO ()
+  :: Maybe (Map StreamName StreamEdgeMetrics) -> StreamName -> IO Int -> IO ()
 foreverLogErrors metrics sn x =
   forever
     $ handle
@@ -431,7 +441,7 @@ foreverLogErrors metrics sn x =
         (\case
           Error (MaxRetriesExceeded (CError NotCommitted)) -> do
             incrConflicts sn metrics
-            threadDelay 2500
+            threadDelay 25000
           e -> throw e
         )
     $ do
@@ -453,25 +463,32 @@ foreverLogErrors metrics sn x =
     -- exactly the same write.
     -- w <- x
     -- awaitTopicOrTimeout 500 w
-        --NOTE: a small delay here (<10 milliseconds) helps us reach
+        --NOTE: a small delay here (<10 milliseconds) helps us do more
         -- msgs/second
         threadDelay 150
         t1 <- getTime Monotonic
-        x
+        numProcessed <- x
         t2 <- getTime Monotonic
         let timeMillis = (`div` 1000000) $ toNanoSecs $ diffTimeSpec t2 t1
         recordBatchLatency sn metrics timeMillis
+        when (numProcessed == 0) (threadDelay 20000)
 
 runStream :: FDBStreamConfig -> Stream a -> IO ()
 runStream cfg@FDBStreamConfig { streamMetricsStore, threadsPerEdge } s = do
   metrics <- forM streamMetricsStore $ registerTopologyMetrics s
   traverseStream s $ \step -> do
     putStrLn $ "starting " ++ show (streamName step)
-    replicateM_ threadsPerEdge
-      $ void
-      $ forkIO
-      $ foreverLogErrors metrics (streamName step)
-      $ runStreamStep cfg metrics step
+    let numPartitions = inputTopicNumPartitions cfg s
+    forM_ [0 .. numPartitions - 1] $ \pid ->
+      replicateM_ threadsPerEdge
+        $ void
+        $ forkIO
+        $ foreverLogErrors metrics (streamName step)
+        $ runStreamStep cfg metrics step pid
+
+
+magicBatchSizeNumber :: Num a => a
+magicBatchSizeNumber = 50
 
 -- | Runs a single stream step. Reads from its input topic
 -- in chunks, runs the monadic action on each input, and writes the result to
@@ -485,34 +502,40 @@ runStream cfg@FDBStreamConfig { streamMetricsStore, threadsPerEdge } s = do
 -- be careful that all logic using the checkpoint knows that just because a
 -- given message is checkpointed, its transformed output is not necessarily in
 -- downstream topics.
-runStreamStep :: FDBStreamConfig -> Maybe MetricsMap -> Stream a -> IO ()
-runStreamStep _ _ (StreamExistingTopic _ _) = return ()
-runStreamStep c@FDBStreamConfig {..} _ s@(StreamProducer _ step) = do
+-- Returns number of items processed.
+runStreamStep
+  :: FDBStreamConfig -> Maybe MetricsMap -> Stream a -> PartitionId -> IO Int
+runStreamStep _ _ (StreamExistingTopic _ _) _ = return 1
+runStreamStep c@FDBStreamConfig {..} _ s@(StreamProducer _ step) _ = do
   -- TODO: this keeps spinning even if the producer is done and will never
   -- produce again.
   let Just outCfg = outputTopic c s
-  xs <- catMaybes <$> replicateM 10 step -- TODO: batch size config
+  xs <- catMaybes <$> replicateM magicBatchSizeNumber step -- TODO: batch size config
   writeTopic outCfg (fmap toMessage xs)
+  return (length xs)
 
-runStreamStep c@FDBStreamConfig {..} metrics s@(StreamConsumer sn _ step) = do
+runStreamStep c@FDBStreamConfig {..} metrics (StreamConsumer sn up step) pid =
+  do
   -- TODO: if parsing the message fails, should we still checkpoint?
   -- TODO: blockUntilNew
-  let [inCfg] = inputTopics c s
-  xs <- readNAndCheckpoint inCfg sn 10
-  mapM_ step (fmap (fromMessage . snd) xs)
+    xs <- runTransactionWithConfig lowRetries streamConfigDB $
+            readPartitionBatchExactlyOnce c metrics sn up pid magicBatchSizeNumber
+    mapM_ step xs
+    return (length xs)
 
-runStreamStep c@FDBStreamConfig {..} metrics s@(StreamPipe rn up step) = do
+runStreamStep c@FDBStreamConfig {..} metrics s@(StreamPipe rn up step) pid = do
   -- TODO: blockUntilNew
   let Just outCfg = outputTopic c s
   runTransactionWithConfig lowRetries streamConfigDB $ do
-    inMsgs <- readBatchExactlyOnce c metrics rn up 10
+    inMsgs <- readPartitionBatchExactlyOnce c metrics rn up pid magicBatchSizeNumber
     ys     <- catMaybes . toList <$> liftIO (mapM step inMsgs)
     let outMsgs = fmap toMessage ys
     p' <- liftIO $ randPartition outCfg
     writeTopic' outCfg p' outMsgs
+    return (length inMsgs)
 
 runStreamStep c@FDBStreamConfig {..} metrics s@(Stream1to1Join rn (ls :: Stream
-    a) (rs :: Stream b) pl pr combiner)
+    a) (rs :: Stream b) pl pr combiner) pid
   = do
     let Just outCfg = outputTopic c s
     -- TODO: the below two transactions are virtually identical, except
@@ -524,7 +547,7 @@ runStreamStep c@FDBStreamConfig {..} metrics s@(Stream1to1Join rn (ls :: Stream
     -- downstream. If not, write the one message we do have to the join table.
     -- TODO: think of a way to garbage collect items that never get joined.
     l <- async $ FDB.runTransactionWithConfig lowRetries streamConfigDB $ do
-      lMsgs    <- readBatchExactlyOnce c metrics rn ls 10
+      lMsgs    <- readPartitionBatchExactlyOnce c metrics rn ls pid magicBatchSizeNumber
       joinData <- Seq.zip lMsgs <$> get1to1JoinDataBatch c rn (fmap pl lMsgs)
       toWrite  <- fmap (catMaybes . toList) $ forM joinData $ \(lmsg, d) -> do
         let k = pl lmsg
@@ -538,8 +561,9 @@ runStreamStep c@FDBStreamConfig {..} metrics s@(Stream1to1Join rn (ls :: Stream
             return Nothing
       p' <- liftIO $ randPartition outCfg
       writeTopic' outCfg p' (map toMessage toWrite)
+      return (length lMsgs)
     FDB.runTransactionWithConfig lowRetries streamConfigDB $ do
-      rMsgs    <- readBatchExactlyOnce c metrics rn rs 10
+      rMsgs    <- readPartitionBatchExactlyOnce c metrics rn rs pid magicBatchSizeNumber
       joinData <- Seq.zip rMsgs <$> get1to1JoinDataBatch c rn (fmap pr rMsgs)
       toWrite  <- fmap (catMaybes . toList) $ forM joinData $ \(rmsg, d) -> do
         let k = pr rmsg
@@ -559,15 +583,16 @@ runStreamStep c@FDBStreamConfig {..} metrics s@(Stream1to1Join rn (ls :: Stream
       writeTopic' outCfg p' (map toMessage toWrite)
     wait l
 
-runStreamStep _ _ StreamGroupBy{} = return ()
+runStreamStep _ _ StreamGroupBy{} _ = return 1 --TODO: don't run this
 
-runStreamStep c@FDBStreamConfig {..} metrics s@(StreamAggregate sn (StreamGroupBy _ up toKey) aggr)
+runStreamStep c@FDBStreamConfig {..} metrics s@(StreamAggregate sn (StreamGroupBy _ up toKey) aggr) pid
   = do
     let table = getAggrTable c s
     FDB.runTransactionWithConfig lowRetries streamConfigDB $ do
-      msgs <- readBatchExactlyOnce c metrics sn up 10
+      msgs <- readPartitionBatchExactlyOnce c metrics sn up pid magicBatchSizeNumber
       forM_ msgs $ \msg -> AT.mappendTable table (toKey msg) (aggr msg)
+      return (length msgs)
 
 -- TODO: stronger types
-runStreamStep _ _ StreamAggregate{} =
+runStreamStep _ _ StreamAggregate{} _ =
   error "tried to aggregate ungrouped stream"

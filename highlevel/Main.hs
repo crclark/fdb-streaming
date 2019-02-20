@@ -273,13 +273,17 @@ mainLoop db = do
   latencyDist <- Metrics.createDistribution "end_to_end_latency" metricsStore
   awaitedOrders <- Metrics.createGauge "waitingOrders" metricsStore
   forkStatsd defaultStatsdOptions metricsStore
-  let conf = FDBStreamConfig db topSS (Just metricsStore) 4
+  let conf = FDBStreamConfig db topSS (Just metricsStore) 1
   let input = makeTopicConfig db topSS "incoming_orders"
   let t = topology input
   let table = getAggrTable conf t
   stats <- newTVarIO $ LatencyStats 0 1
-  void $ forkIO $ orderGeneratorLoop input table 500 40 stats latencyDist awaitedOrders
-  void $ forkIO $ orderGeneratorLoop input table 500 40 stats latencyDist awaitedOrders
+  void $ forkIO $ orderGeneratorLoop input table 500 50 stats latencyDist awaitedOrders
+  void $ forkIO $ orderGeneratorLoop input table 500 50 stats latencyDist awaitedOrders
+  void $ forkIO $ orderGeneratorLoop input table 500 50 stats latencyDist awaitedOrders
+  void $ forkIO $ orderGeneratorLoop input table 500 50 stats latencyDist awaitedOrders
+  void $ forkIO $ orderGeneratorLoop input table 500 50 stats latencyDist awaitedOrders
+  void $ forkIO $ orderGeneratorLoop input table 500 50 stats latencyDist awaitedOrders
   void $ forkIO $ latencyReportLoop stats
   debugTraverseStream t
   runStream conf t
