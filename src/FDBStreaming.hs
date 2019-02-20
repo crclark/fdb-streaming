@@ -333,45 +333,6 @@ subspace1to1JoinForKey sc sn k = extend
          -- TODO: replace these Bytes constants with named small int constants
   [Bytes "tpcs", Bytes sn, Bytes "1:1join", Bytes (toMessage k)]
 
-get1to1JoinData
-  :: (Message a, Message b, Message k)
-  => FDBStreamConfig
-  -> StreamName
-  -> k
-  -> Transaction (Future (Maybe (Either a b)))
-                -- ^ Returns whichever of the two join types was processed first
-                -- for the given key, or Nothing if neither has yet been
-                -- seen.
-get1to1JoinData c sn k = do
-  xs <- getRange' (subspaceRange ss) FDB.StreamingModeWantAll
-  return $ flip fmap xs $ \case
-    RangeDone kvs   -> parse kvs
-    RangeMore kvs _ -> parse kvs
- where
-  parse Empty = Nothing
-  parse ((unpack ss -> (Right [Bool True, Bytes x]), _) :<| Empty) =
-    Just $ Left (fromMessage x)
-  parse ((unpack ss -> (Right [Bool False, Bytes x]), _) :<| Empty) =
-    Just $ Right (fromMessage x)
-  parse ((unpack ss -> Left err, _) :<| Empty) =
-    error $ "Deserialization error in 1-to-1 join table: " ++ show err
-  parse (_       :<| Empty) = error "1-to-1 join tuple in wrong format"
-  parse (_ :<| _ :<| _    ) = error "consistency violation in 1-to-1 join table"
-
-  ss = subspace1to1JoinForKey c sn k
-
--- | get join data for n keys concurrently
-get1to1JoinDataBatch
-  :: (Message a, Message b, Message k, Traversable t)
-  => FDBStreamConfig
-  -> StreamName
-  -> t k
-  -> Transaction (t (Maybe (Either a b)))
-get1to1JoinDataBatch c rn ks = do
-  joinFutures <- forM ks (get1to1JoinData c rn)
-  -- Now that we have sent all the gets, await them
-  forM joinFutures await
-
 delete1to1JoinData
   :: Message k => FDBStreamConfig -> StreamName -> k -> Transaction ()
 delete1to1JoinData c sn k = do
@@ -389,8 +350,22 @@ write1to1JoinData
 write1to1JoinData c sn k x = do
   let ss = subspace1to1JoinForKey c sn k
   case x of
-    Left  y -> set (pack ss [Bool True, Bytes (toMessage y)]) ""
-    Right y -> set (pack ss [Bool False, Bytes (toMessage y)]) ""
+    Left  y -> set (pack ss [Bool True]) (toMessage y)
+    Right y -> set (pack ss [Bool False]) (toMessage y)
+
+get1to1JoinData :: (Message k, Message a)
+                    => FDBStreamConfig
+                    -> StreamName
+                    -> Bool
+                    -- ^ True for the left stream, False for the right
+                    -- TODO: replace this with an int and support n-way
+                    -- joins?
+                    -> k
+                    -> Transaction (Future (Maybe a))
+get1to1JoinData cfg sn isLeft k = do
+  let ss = subspace1to1JoinForKey cfg sn k
+  f <- get (pack ss [Bool isLeft])
+  return (fmap (fmap fromMessage) f)
 
 -- TODO: other persistence backends
 -- TODO: should probably rename to TopologyConfig
@@ -548,14 +523,14 @@ runStreamStep c@FDBStreamConfig {..} metrics s@(Stream1to1Join rn (ls :: Stream
     -- TODO: think of a way to garbage collect items that never get joined.
     l <- async $ FDB.runTransactionWithConfig lowRetries streamConfigDB $ do
       lMsgs    <- readPartitionBatchExactlyOnce c metrics rn ls pid magicBatchSizeNumber
-      joinData <- Seq.zip lMsgs <$> get1to1JoinDataBatch c rn (fmap pl lMsgs)
+      joinFutures <- forM (fmap pl lMsgs) (get1to1JoinData c rn False)
+      joinData <- Seq.zip lMsgs <$> mapM await joinFutures
       toWrite  <- fmap (catMaybes . toList) $ forM joinData $ \(lmsg, d) -> do
         let k = pl lmsg
         case d of
-          Just (Right (rmsg :: b)) -> do
+          Just (rmsg :: b) -> do
             delete1to1JoinData c rn k
             return $ Just $ combiner lmsg rmsg
-          Just (Left (_ :: a)) -> return Nothing -- TODO: warn (or error?) about non-one-to-one join
           Nothing              -> do
             write1to1JoinData c rn k (Left lmsg :: Either a b)
             return Nothing
@@ -564,16 +539,14 @@ runStreamStep c@FDBStreamConfig {..} metrics s@(Stream1to1Join rn (ls :: Stream
       return (length lMsgs)
     FDB.runTransactionWithConfig lowRetries streamConfigDB $ do
       rMsgs    <- readPartitionBatchExactlyOnce c metrics rn rs pid magicBatchSizeNumber
-      joinData <- Seq.zip rMsgs <$> get1to1JoinDataBatch c rn (fmap pr rMsgs)
+      joinFutures <- forM (fmap pr rMsgs) (get1to1JoinData c rn True)
+      joinData <- Seq.zip rMsgs <$> mapM await joinFutures
       toWrite  <- fmap (catMaybes . toList) $ forM joinData $ \(rmsg, d) -> do
         let k = pr rmsg
         case d of
-          Just (Left (lmsg :: a)) -> do
+          Just (lmsg :: a) -> do
             delete1to1JoinData c rn k
             return $ Just $ combiner lmsg rmsg
-          Just (Right (_ :: b)) -> do
-            liftIO $ putStrLn "Got unexpected Right"
-            return Nothing -- TODO: warn (or error?) about non-one-to-one join
           Nothing -> do
             write1to1JoinData c rn k (Right rmsg :: Either a b)
             return Nothing

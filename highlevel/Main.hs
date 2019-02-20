@@ -42,6 +42,7 @@ import           Data.UUID.V4                  as UUID
                                                 ( nextRandom )
 import           GHC.Generics                   ( Generic )
 import           System.Random                  ( randomIO )
+import           Data.Maybe                     ( fromMaybe )
 import           Data.Store                     ( Store )
 import qualified Data.Store                    as Store
 import Data.Functor.Identity (Identity(..))
@@ -54,6 +55,7 @@ import           System.Metrics.Gauge (Gauge)
 import qualified System.Metrics.Gauge as Gauge
 import           System.Remote.Monitoring (forkServer, serverMetricStore)
 import System.Remote.Monitoring.Statsd (defaultStatsdOptions, forkStatsd)
+import Options.Generic
 
 newtype Timestamp = Timestamp { unTimestamp :: UnixTime }
   deriving (Show, Eq, Ord, Generic)
@@ -252,10 +254,6 @@ topology incoming = StreamAggregate "order_table" grouped snd
                                  -> (oid, All $ isGood && goodDetails details))
     grouped = StreamGroupBy "groupby" finalJoin fst
 
-
-topSS :: Subspace
-topSS = FDB.subspace [FDB.Bytes "cool_subspace"]
-
 printStats :: Database -> Subspace -> IO ()
 printStats db ss = do
   tcs <- listExistingTopics db ss
@@ -263,18 +261,23 @@ printStats db ss = do
     before <- runTransaction db $ getTopicCount tc
     threadDelay 1000000
     after <- runTransaction db $ getTopicCount tc
-    return (topicName tc, fromIntegral after - fromIntegral before)
-  forM_ (sortOn fst ts)
-    $ \(tn, c) -> putStrLn $ show tn ++ ": " ++ show (c :: Int) ++ " msgs/sec"
+    return (topicName tc, fromIntegral after - fromIntegral before, after)
+  forM_ (sortOn (\(x,_,_) -> x) ts)
+    $ \(tn, c, after) -> putStrLn $ show tn
+                                    ++ ": "
+                                    ++ show (c :: Int)
+                                    ++ " msgs/sec "
+                                    ++ show after
+                                    ++ "msgs total"
 
-mainLoop :: Database -> IO ()
-mainLoop db = do
+mainLoop :: Database -> Subspace -> IO ()
+mainLoop db ss = do
   metricsStore <- Metrics.newStore
   latencyDist <- Metrics.createDistribution "end_to_end_latency" metricsStore
   awaitedOrders <- Metrics.createGauge "waitingOrders" metricsStore
   forkStatsd defaultStatsdOptions metricsStore
-  let conf = FDBStreamConfig db topSS (Just metricsStore) 1
-  let input = makeTopicConfig db topSS "incoming_orders"
+  let conf = FDBStreamConfig db ss (Just metricsStore) 1
+  let input = makeTopicConfig db ss "incoming_orders"
   let t = topology input
   let table = getAggrTable conf t
   stats <- newTVarIO $ LatencyStats 0 1
@@ -288,18 +291,22 @@ mainLoop db = do
   debugTraverseStream t
   runStream conf t
   forever $ do
-    printStats db topSS
+    printStats db ss
     threadDelay 1000000
 
-cleanup :: Database -> IO ()
-cleanup db = do
+cleanup :: Database -> Subspace -> IO ()
+cleanup db ss = do
   putStrLn "Cleaning up FDB state"
-  let (delBegin, delEnd) = rangeKeys $ subspaceRange topSS
+  let (delBegin, delEnd) = rangeKeys $ subspaceRange ss
   runTransaction db $ clearRange delBegin delEnd
   putStrLn "Cleanup successful"
 
+data Args = Args { subspaceName :: Maybe ByteString }
+  deriving (Generic, Show, ParseRecord)
+
 main :: IO ()
 main = withFoundationDB defaultOptions $ \db -> do
-  cleanup db
-  mainLoop db
-
+  Args {subspaceName} <- getRecord "stream test"
+  let ss = FDB.subspace [FDB.Bytes (fromMaybe "cool_subspace" subspaceName)]
+  cleanup db ss
+  mainLoop db ss

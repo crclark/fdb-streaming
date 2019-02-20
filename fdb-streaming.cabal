@@ -110,6 +110,7 @@ executable fdb-streaming-highlevel
     , ekg-core
     , ekg-statsd
     , ekg
+    , optparse-generic
   default-language: Haskell2010
 
 test-suite fdb-streaming-test
