@@ -41,10 +41,6 @@ import           FoundationDB.Versionstamp      ( Versionstamp
                                                 )
 import           System.Random                  ( randomRIO )
 
--- TODO: something less insane
-infRetry :: TransactionConfig
-infRetry = FDB.defaultConfig { maxRetries = maxBound }
-
 zeroLE :: ByteString
 zeroLE = "\x00\x00\x00\x00\x00\x00\x00\x00"
 
@@ -95,7 +91,7 @@ makeTopicConfig topicConfigDB topicSS topicName = TopicConfig { .. }
   topicCountSS = FDB.extend
     topicSS
     [Bytes "tpcs", Bytes topicName, Bytes "meta", Bytes "count"]
-  numPartitions = 40 -- TODO: make configurable
+  numPartitions = 80 -- TODO: make configurable
 
 randPartition :: TopicConfig -> IO PartitionId
 randPartition TopicConfig {..} =
@@ -145,6 +141,7 @@ readerSS TopicConfig {..} rn =
 readerCheckpointKey :: TopicConfig -> PartitionId -> ReaderName -> ByteString
 readerCheckpointKey tc i rn = FDB.pack (readerSS tc rn) [Int i, Bytes "ckpt"]
 
+-- TODO: make idempotent to deal with CommitUnknownResult
 -- | Danger!! It's possible to write multiple messages with the same key
 -- if this is called more than once in a single transaction.
 writeTopic'
@@ -292,6 +289,4 @@ readNAndCheckpoint
   -> IO (Seq (Versionstamp 'Complete, ByteString))
 readNAndCheckpoint tc@TopicConfig {..} rn n = do
   p <- randPartition tc
-  FDB.runTransactionWithConfig infRetry
-                               topicConfigDB
-                               (readNAndCheckpoint' tc p rn n)
+  FDB.runTransaction topicConfigDB (readNAndCheckpoint' tc p rn n)

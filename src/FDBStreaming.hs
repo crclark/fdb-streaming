@@ -492,14 +492,12 @@ runStreamStep c@FDBStreamConfig {..} _ s@(StreamProducer _ step) _ = do
 runStreamStep c@FDBStreamConfig {..} metrics (StreamConsumer sn up step) pid =
   do
   -- TODO: if parsing the message fails, should we still checkpoint?
-  -- TODO: blockUntilNew
     xs <- runTransactionWithConfig lowRetries streamConfigDB $
             readPartitionBatchExactlyOnce c metrics sn up pid magicBatchSizeNumber
     mapM_ step xs
     return (length xs)
 
 runStreamStep c@FDBStreamConfig {..} metrics s@(StreamPipe rn up step) pid = do
-  -- TODO: blockUntilNew
   let Just outCfg = outputTopic c s
   runTransactionWithConfig lowRetries streamConfigDB $ do
     inMsgs <- readPartitionBatchExactlyOnce c metrics rn up pid magicBatchSizeNumber

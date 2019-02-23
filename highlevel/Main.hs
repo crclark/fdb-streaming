@@ -5,7 +5,12 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE QuantifiedConstraints #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE BangPatterns #-}
 
@@ -25,11 +30,19 @@ import           Control.Concurrent.STM         ( TVar
                                                 , modifyTVar'
                                                 , newTVarIO
                                                 )
+import           Control.Exception              ( catches
+                                                , Handler(..)
+                                                , SomeException
+                                                , throw
+                                                )
 import           Data.List                      ( sortOn )
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Random.MWC as BS
+import           Data.Coerce                    ( coerce )
+import           Data.Word                      ( Word16 )
 import           FoundationDB                  as FDB
+import           FoundationDB.Error
 import           FoundationDB.Layer.Subspace   as FDB
 import           FoundationDB.Layer.Tuple      as FDB
 import           Data.UnixTime                  ( UnixTime
@@ -74,6 +87,7 @@ data Order = Order
   , orderID :: OrderID
   , isFraud :: Bool
   , isInStock :: Bool
+  , orderInstructions :: Text
   } deriving (Show, Eq, Generic, Store)
 
 instance Message Order where
@@ -86,6 +100,7 @@ randOrder = do
   orderID   <- OrderID <$> UUID.nextRandom
   isFraud   <- randomIO
   isInStock <- randomIO
+  let orderInstructions = "This is a bunch of bytes containing text, to bulk up the total message size. Hwæt! Wé Gárdena      in géardagum þéodcyninga      þrym gefrúnon Oft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatum"
   return Order { .. }
 
 data FraudResult = FraudResult
@@ -184,12 +199,35 @@ placeAndAwaitOrders :: TopicConfig
                     -> Gauge
                     -> Int
                     -- ^ batch size
+                    -> Bool
+                    -- ^ whether to watch orders to measure end_to_end_latency
                     -> IO ()
-placeAndAwaitOrders orderTopic table stats latencyDist awaitGauge batchSize = do
+placeAndAwaitOrders orderTopic table stats latencyDist awaitGauge batchSize shouldWatch = do
   orders <- replicateM batchSize randOrder
-  writeTopic orderTopic (map toMessage orders)
-  forM_ orders $ awaitOrder orderTopic table stats latencyDist awaitGauge
+  catches ( do
+    writeTopicNoRetry orderTopic (map toMessage orders)
+    when shouldWatch
+      $ forM_ orders $ awaitOrder orderTopic table stats latencyDist awaitGauge
+    )
+    [ Handler (\case
+                 Error (MaxRetriesExceeded (CError NotCommitted)) ->
+                   putStrLn "Caught NotCommitted when writing to topic!"
+                 e -> throw e)
+    , Handler (\(e :: SomeException) ->
+                  putStrLn $ "Caught " ++ show e ++ " while writing to topic!")
+    ]
 
+writeTopicNoRetry :: Traversable t => TopicConfig -> t ByteString -> IO ()
+writeTopicNoRetry tc@TopicConfig {..} bss = do
+  -- TODO: proper error handling
+  guard (fromIntegral (length bss) < (maxBound :: Word16))
+  p <- randPartition tc
+  FDB.runTransactionWithConfig
+    defaultConfig { maxRetries = 0 }
+    topicConfigDB
+    $ writeTopic' tc p bss
+
+-- TODO: far too many params!
 orderGeneratorLoop :: TopicConfig
                    -> AT.AggrTable OrderID All
                    -> Int
@@ -199,12 +237,14 @@ orderGeneratorLoop :: TopicConfig
                    -> TVar LatencyStats
                    -> Distribution
                    -> Gauge
+                   -> Bool
+                   -- ^ whether to watch orders to measure end-to-end latency
                    -> IO ()
-orderGeneratorLoop topic table rps batchSize stats latencyDist awaitGauge = do
+orderGeneratorLoop topic table rps batchSize stats latencyDist awaitGauge shouldWatch = do
   let delay = 1000000 `div` (rps `div` batchSize)
-  void $ forkIO $ placeAndAwaitOrders topic table stats latencyDist awaitGauge batchSize
+  void $ forkIO $ placeAndAwaitOrders topic table stats latencyDist awaitGauge batchSize shouldWatch
   threadDelay delay
-  orderGeneratorLoop topic table rps batchSize stats latencyDist awaitGauge
+  orderGeneratorLoop topic table rps batchSize stats latencyDist awaitGauge shouldWatch
 
 latencyReportLoop :: TVar LatencyStats -> IO ()
 latencyReportLoop stats = do
@@ -258,9 +298,9 @@ printStats :: Database -> Subspace -> IO ()
 printStats db ss = do
   tcs <- listExistingTopics db ss
   ts  <- forConcurrently tcs $ \tc -> do
-    before <- runTransaction db $ getTopicCount tc
+    before <- runTransaction db $ withSnapshot $ getTopicCount tc
     threadDelay 1000000
-    after <- runTransaction db $ getTopicCount tc
+    after <- runTransaction db $ withSnapshot $ getTopicCount tc
     return (topicName tc, fromIntegral after - fromIntegral before, after)
   forM_ (sortOn (\(x,_,_) -> x) ts)
     $ \(tn, c, after) -> putStrLn $ show tn
@@ -270,26 +310,37 @@ printStats db ss = do
                                     ++ show after
                                     ++ "msgs total"
 
-mainLoop :: Database -> Subspace -> IO ()
-mainLoop db ss = do
+mainLoop :: Database -> Subspace -> Args Identity -> IO ()
+mainLoop db ss Args{ generatorNumThreads
+                   , generatorMsgsPerSecond
+                   , generatorBatchSize
+                   , generatorWatchResults
+                   , streamThreadsPerPartition
+                   , streamRun } = do
   metricsStore <- Metrics.newStore
   latencyDist <- Metrics.createDistribution "end_to_end_latency" metricsStore
   awaitedOrders <- Metrics.createGauge "waitingOrders" metricsStore
   forkStatsd defaultStatsdOptions metricsStore
-  let conf = FDBStreamConfig db ss (Just metricsStore) 1
+  let conf = FDBStreamConfig db
+                             ss
+                             (Just metricsStore)
+                             (coerce streamThreadsPerPartition)
   let input = makeTopicConfig db ss "incoming_orders"
   let t = topology input
   let table = getAggrTable conf t
   stats <- newTVarIO $ LatencyStats 0 1
-  void $ forkIO $ orderGeneratorLoop input table 500 50 stats latencyDist awaitedOrders
-  void $ forkIO $ orderGeneratorLoop input table 500 50 stats latencyDist awaitedOrders
-  void $ forkIO $ orderGeneratorLoop input table 500 50 stats latencyDist awaitedOrders
-  void $ forkIO $ orderGeneratorLoop input table 500 50 stats latencyDist awaitedOrders
-  void $ forkIO $ orderGeneratorLoop input table 500 50 stats latencyDist awaitedOrders
-  void $ forkIO $ orderGeneratorLoop input table 500 50 stats latencyDist awaitedOrders
+  replicateM_ (coerce generatorNumThreads)
+    $ forkIO $ orderGeneratorLoop input
+                                  table
+                                  (coerce generatorMsgsPerSecond)
+                                  (coerce generatorBatchSize)
+                                  stats
+                                  latencyDist
+                                  awaitedOrders
+                                  (coerce generatorWatchResults)
   void $ forkIO $ latencyReportLoop stats
   debugTraverseStream t
-  runStream conf t
+  when (coerce streamRun) $ runStream conf t
   forever $ do
     printStats db ss
     threadDelay 1000000
@@ -301,12 +352,39 @@ cleanup db ss = do
   runTransaction db $ clearRange delBegin delEnd
   putStrLn "Cleanup successful"
 
-data Args = Args { subspaceName :: Maybe ByteString }
-  deriving (Generic, Show, ParseRecord)
+data Args f = Args
+  { subspaceName :: f ByteString
+  , generatorNumThreads :: f Int
+  , generatorMsgsPerSecond :: f Int
+  , generatorBatchSize :: f Int
+  , generatorWatchResults :: f Bool
+  , streamThreadsPerPartition :: f Int
+  , streamRun :: f Bool
+  , cleanupFirst :: f Bool }
+  deriving (Generic)
+
+deriving instance (forall a . Show a => Show (f a)) => Show (Args f)
+
+deriving instance ( forall a . ParseField a => ParseFields (f a))
+                  => ParseRecord (Args f)
+
+applyDefaults :: Args Maybe -> Args Identity
+applyDefaults Args{..} = Args
+  { subspaceName = dflt "streamTest" subspaceName
+  , generatorNumThreads = dflt 3 generatorNumThreads
+  , generatorMsgsPerSecond = dflt 1000 generatorMsgsPerSecond
+  , generatorBatchSize = dflt 200 generatorBatchSize
+  , generatorWatchResults = dflt True generatorWatchResults
+  , streamThreadsPerPartition = dflt 1 streamThreadsPerPartition
+  , streamRun = dflt True streamRun
+  , cleanupFirst = dflt True cleanupFirst
+  }
+
+  where dflt d x = Identity $ fromMaybe d x
 
 main :: IO ()
 main = withFoundationDB defaultOptions $ \db -> do
-  Args {subspaceName} <- getRecord "stream test"
-  let ss = FDB.subspace [FDB.Bytes (fromMaybe "cool_subspace" subspaceName)]
-  cleanup db ss
-  mainLoop db ss
+  args@Args {subspaceName, cleanupFirst} <- applyDefaults <$> getRecord "stream test"
+  let ss = FDB.subspace [FDB.Bytes (runIdentity subspaceName)]
+  when (runIdentity cleanupFirst) $ cleanup db ss
+  mainLoop db ss args
