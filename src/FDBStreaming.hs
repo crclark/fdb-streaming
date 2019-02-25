@@ -78,7 +78,7 @@ registerTopologyMetrics topo store = foldMStream topo $ \s -> do
   return (Map.singleton (streamName s) (StreamEdgeMetrics mp er bl mb cs))
 
 incrEmptyBatchCount :: StreamName -> Maybe MetricsMap -> IO ()
-incrEmptyBatchCount _ Nothing  = return ()
+incrEmptyBatchCount _  Nothing  = return ()
 incrEmptyBatchCount sn (Just m) = Counter.inc (emptyReads $ m Map.! sn)
 
 recordMsgsPerBatch :: StreamName -> Maybe MetricsMap -> Int -> IO ()
@@ -87,7 +87,7 @@ recordMsgsPerBatch sn (Just m) n =
   Distribution.add (messagesPerBatch $ m Map.! sn) (fromIntegral n)
 
 incrConflicts :: StreamName -> Maybe MetricsMap -> IO ()
-incrConflicts _ Nothing  = return ()
+incrConflicts _  Nothing  = return ()
 incrConflicts sn (Just m) = Counter.inc (conflicts $ m Map.! sn)
 
 recordBatchLatency :: Integral a => StreamName -> Maybe MetricsMap -> a -> IO ()
@@ -353,15 +353,16 @@ write1to1JoinData c sn k x = do
     Left  y -> set (pack ss [Bool True]) (toMessage y)
     Right y -> set (pack ss [Bool False]) (toMessage y)
 
-get1to1JoinData :: (Message k, Message a)
-                    => FDBStreamConfig
-                    -> StreamName
-                    -> Bool
+get1to1JoinData
+  :: (Message k, Message a)
+  => FDBStreamConfig
+  -> StreamName
+  -> Bool
                     -- ^ True for the left stream, False for the right
                     -- TODO: replace this with an int and support n-way
                     -- joins?
-                    -> k
-                    -> Transaction (Future (Maybe a))
+  -> k
+  -> Transaction (Future (Maybe a))
 get1to1JoinData cfg sn isLeft k = do
   let ss = subspace1to1JoinForKey cfg sn k
   f <- get (pack ss [Bool isLeft])
@@ -441,12 +442,14 @@ foreverLogErrors metrics sn x =
         --NOTE: a small delay here (<10 milliseconds) helps us do more
         -- msgs/second
         threadDelay 150
-        t1 <- getTime Monotonic
+        t1           <- getTime Monotonic
         numProcessed <- x
-        t2 <- getTime Monotonic
+        t2           <- getTime Monotonic
         let timeMillis = (`div` 1000000) $ toNanoSecs $ diffTimeSpec t2 t1
         recordBatchLatency sn metrics timeMillis
-        when (numProcessed == 0) (threadDelay 20000)
+        -- TODO: maybe an expectedPeakRPS param for the config so we can compute
+        -- optimal sleep time?
+        when (numProcessed == 0) (threadDelay 1000000)
 
 runStream :: FDBStreamConfig -> Stream a -> IO ()
 runStream cfg@FDBStreamConfig { streamMetricsStore, threadsPerEdge } s = do
@@ -492,16 +495,22 @@ runStreamStep c@FDBStreamConfig {..} _ s@(StreamProducer _ step) _ = do
 runStreamStep c@FDBStreamConfig {..} metrics (StreamConsumer sn up step) pid =
   do
   -- TODO: if parsing the message fails, should we still checkpoint?
-    xs <- runTransactionWithConfig lowRetries streamConfigDB $
-            readPartitionBatchExactlyOnce c metrics sn up pid magicBatchSizeNumber
+    xs <-
+      runTransactionWithConfig lowRetries streamConfigDB
+        $ readPartitionBatchExactlyOnce c metrics sn up pid magicBatchSizeNumber
     mapM_ step xs
     return (length xs)
 
 runStreamStep c@FDBStreamConfig {..} metrics s@(StreamPipe rn up step) pid = do
   let Just outCfg = outputTopic c s
   runTransactionWithConfig lowRetries streamConfigDB $ do
-    inMsgs <- readPartitionBatchExactlyOnce c metrics rn up pid magicBatchSizeNumber
-    ys     <- catMaybes . toList <$> liftIO (mapM step inMsgs)
+    inMsgs <- readPartitionBatchExactlyOnce c
+                                            metrics
+                                            rn
+                                            up
+                                            pid
+                                            magicBatchSizeNumber
+    ys <- catMaybes . toList <$> liftIO (mapM step inMsgs)
     let outMsgs = fmap toMessage ys
     p' <- liftIO $ randPartition outCfg
     writeTopic' outCfg p' outMsgs
@@ -520,26 +529,36 @@ runStreamStep c@FDBStreamConfig {..} metrics s@(Stream1to1Join rn (ls :: Stream
     -- downstream. If not, write the one message we do have to the join table.
     -- TODO: think of a way to garbage collect items that never get joined.
     l <- async $ FDB.runTransactionWithConfig lowRetries streamConfigDB $ do
-      lMsgs    <- readPartitionBatchExactlyOnce c metrics rn ls pid magicBatchSizeNumber
+      lMsgs <- readPartitionBatchExactlyOnce c
+                                             metrics
+                                             rn
+                                             ls
+                                             pid
+                                             magicBatchSizeNumber
       joinFutures <- forM (fmap pl lMsgs) (get1to1JoinData c rn False)
       joinData <- Seq.zip lMsgs <$> mapM await joinFutures
-      toWrite  <- fmap (catMaybes . toList) $ forM joinData $ \(lmsg, d) -> do
+      toWrite <- fmap (catMaybes . toList) $ forM joinData $ \(lmsg, d) -> do
         let k = pl lmsg
         case d of
           Just (rmsg :: b) -> do
             delete1to1JoinData c rn k
             return $ Just $ combiner lmsg rmsg
-          Nothing              -> do
+          Nothing -> do
             write1to1JoinData c rn k (Left lmsg :: Either a b)
             return Nothing
       p' <- liftIO $ randPartition outCfg
       writeTopic' outCfg p' (map toMessage toWrite)
       return (length lMsgs)
     FDB.runTransactionWithConfig lowRetries streamConfigDB $ do
-      rMsgs    <- readPartitionBatchExactlyOnce c metrics rn rs pid magicBatchSizeNumber
+      rMsgs <- readPartitionBatchExactlyOnce c
+                                             metrics
+                                             rn
+                                             rs
+                                             pid
+                                             magicBatchSizeNumber
       joinFutures <- forM (fmap pr rMsgs) (get1to1JoinData c rn True)
       joinData <- Seq.zip rMsgs <$> mapM await joinFutures
-      toWrite  <- fmap (catMaybes . toList) $ forM joinData $ \(rmsg, d) -> do
+      toWrite <- fmap (catMaybes . toList) $ forM joinData $ \(rmsg, d) -> do
         let k = pr rmsg
         case d of
           Just (lmsg :: a) -> do
@@ -560,7 +579,12 @@ runStreamStep c@FDBStreamConfig {..} metrics s@(StreamAggregate sn (StreamGroupB
   = do
     let table = getAggrTable c s
     FDB.runTransactionWithConfig lowRetries streamConfigDB $ do
-      msgs <- readPartitionBatchExactlyOnce c metrics sn up pid magicBatchSizeNumber
+      msgs <- readPartitionBatchExactlyOnce c
+                                            metrics
+                                            sn
+                                            up
+                                            pid
+                                            magicBatchSizeNumber
       forM_ msgs $ \msg -> AT.mappendTable table (toKey msg) (aggr msg)
       return (length msgs)
 

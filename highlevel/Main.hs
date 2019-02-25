@@ -58,9 +58,10 @@ import           System.Random                  ( randomIO )
 import           Data.Maybe                     ( fromMaybe )
 import           Data.Store                     ( Store )
 import qualified Data.Store                    as Store
-import Data.Functor.Identity (Identity(..))
-import Foreign.C.Types (CTime(..))
-import Data.Monoid (All (..))
+import           Data.Functor.Identity (Identity(..))
+import           Foreign.C.Types (CTime(..))
+import           Data.Monoid (All (..))
+import           System.Clock (Clock(Monotonic), getTime, toNanoSecs, diffTimeSpec)
 import qualified System.Metrics as Metrics
 import           System.Metrics.Distribution (Distribution)
 import qualified System.Metrics.Distribution as Distribution
@@ -68,6 +69,7 @@ import           System.Metrics.Gauge (Gauge)
 import qualified System.Metrics.Gauge as Gauge
 import           System.Remote.Monitoring (forkServer, serverMetricStore)
 import System.Remote.Monitoring.Statsd (defaultStatsdOptions, forkStatsd)
+import           Text.Printf                    ( printf )
 import Options.Generic
 
 newtype Timestamp = Timestamp { unTimestamp :: UnixTime }
@@ -298,17 +300,20 @@ printStats :: Database -> Subspace -> IO ()
 printStats db ss = do
   tcs <- listExistingTopics db ss
   ts  <- forConcurrently tcs $ \tc -> do
+    beforeT <- getTime Monotonic
     before <- runTransaction db $ withSnapshot $ getTopicCount tc
     threadDelay 1000000
     after <- runTransaction db $ withSnapshot $ getTopicCount tc
-    return (topicName tc, fromIntegral after - fromIntegral before, after)
+    afterT <- getTime Monotonic
+    let diffSecs = (fromIntegral $ toNanoSecs $ diffTimeSpec afterT beforeT)
+                   / 10**9
+    return ( topicName tc
+           , ((fromIntegral after - fromIntegral before) / diffSecs)
+           , after
+           )
   forM_ (sortOn (\(x,_,_) -> x) ts)
-    $ \(tn, c, after) -> putStrLn $ show tn
-                                    ++ ": "
-                                    ++ show (c :: Int)
-                                    ++ " msgs/sec "
-                                    ++ show after
-                                    ++ "msgs total"
+    $ \(tn, c, after) ->
+      printf "%s: %.1f msgs/sec and %d msgs total\n" (show tn) (c :: Double) after
 
 mainLoop :: Database -> Subspace -> Args Identity -> IO ()
 mainLoop db ss Args{ generatorNumThreads
