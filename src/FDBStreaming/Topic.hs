@@ -15,8 +15,10 @@ import           Control.Monad
 import           Data.Binary.Get                ( runGet
                                                 , getWord64le
                                                 )
+import           Data.Binary.Put                ( runPut
+                                                , putWord64le )
 import           Data.ByteString                ( ByteString )
-import           Data.ByteString.Lazy           ( fromStrict )
+import           Data.ByteString.Lazy           ( fromStrict, toStrict )
 import           Data.Foldable                  ( foldlM )
 import           Data.Maybe                     ( fromMaybe )
 import           Data.Sequence                  ( Seq(..) )
@@ -117,6 +119,12 @@ incrTopicCount conf = do
   let k = topicCountKey conf
   FDB.atomicOp k (Op.add oneLE)
 
+incrTopicCountBy :: TopicConfig -> Word64 -> Transaction ()
+incrTopicCountBy conf n = do
+  let k = topicCountKey conf
+  let bs = runPut $ putWord64le n
+  FDB.atomicOp k (Op.add $ toStrict bs)
+
 getTopicCount :: TopicConfig -> Transaction Word64
 getTopicCount conf = do
   let k = topicCountKey conf
@@ -127,6 +135,12 @@ incrPartitionCount :: TopicConfig -> PartitionId -> Transaction ()
 incrPartitionCount conf i = do
   let k = partitionCountKey conf i
   FDB.atomicOp k (Op.add oneLE)
+
+incrPartitionCountBy :: TopicConfig -> PartitionId -> Word64 -> Transaction ()
+incrPartitionCountBy conf pid n = do
+  let k = partitionCountKey conf pid
+  let bs = runPut $ putWord64le n
+  FDB.atomicOp k (Op.add $ toStrict bs)
 
 getPartitionCount :: TopicConfig -> PartitionId -> Transaction Word64
 getPartitionCount conf i = do
@@ -150,14 +164,18 @@ writeTopic'
   -> PartitionId
   -> t ByteString
   -> Transaction ()
-writeTopic' tc@TopicConfig {..} p bss = void $ foldlM go 1 bss
+writeTopic' tc@TopicConfig {..} p bss = do
+  -- TODO: switching to incrBy instead of adding one in a loop seems
+  -- to cause conflicts in stream processors where previously there were none.
+  -- Extremely confusing.
+  incrPartitionCountBy tc p (fromIntegral $ length bss)
+  incrTopicCountBy tc (fromIntegral $ length bss)
+  void $ foldlM go 1 bss
  where
   go !i bs = do
     let vs = IncompleteVersionstamp i
     let k  = FDB.pack (partitionMsgsSS p) [FDB.IncompleteVS vs]
     FDB.atomicOp k (Op.setVersionstampedKey bs)
-    incrTopicCount tc
-    incrPartitionCount tc p
     return (i + 1)
 
 -- TODO: support messages larger than FDB size limit, via chunking.
