@@ -172,4 +172,4 @@ instance TableValue All where
 
 instance TableSemigroup All where
   mappendTable =
-    mappendAtomicVia allToByte Op.and
+    mappendAtomicVia allToByte Op.bitAnd

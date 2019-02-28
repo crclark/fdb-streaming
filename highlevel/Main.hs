@@ -297,7 +297,7 @@ topology incoming = StreamAggregate "order_table" grouped snd
     grouped = StreamGroupBy "groupby" finalJoin fst
 
 printStats :: Database -> Subspace -> IO ()
-printStats db ss = do
+printStats db ss = catches (do
   tcs <- listExistingTopics db ss
   ts  <- forConcurrently tcs $ \tc -> do
     beforeT <- getTime Monotonic
@@ -313,7 +313,9 @@ printStats db ss = do
            )
   forM_ (sortOn (\(x,_,_) -> x) ts)
     $ \(tn, c, after) ->
-      printf "%s: %.1f msgs/sec and %d msgs total\n" (show tn) (c :: Double) after
+      printf "%s: %.1f msgs/sec and %d msgs total\n" (show tn) (c :: Double) after)
+  [ Handler (\(e :: SomeException) ->
+                putStrLn $ "Caught " ++ show e ++ " while getting stats!")]
 
 mainLoop :: Database -> Subspace -> Args Identity -> IO ()
 mainLoop db ss Args{ generatorNumThreads
@@ -321,15 +323,18 @@ mainLoop db ss Args{ generatorNumThreads
                    , generatorBatchSize
                    , generatorWatchResults
                    , streamThreadsPerPartition
-                   , streamRun } = do
+                   , streamRun
+                   , useWatches } = do
   metricsStore <- Metrics.newStore
   latencyDist <- Metrics.createDistribution "end_to_end_latency" metricsStore
   awaitedOrders <- Metrics.createGauge "waitingOrders" metricsStore
   forkStatsd defaultStatsdOptions metricsStore
-  let conf = FDBStreamConfig db
-                             ss
-                             (Just metricsStore)
-                             (coerce streamThreadsPerPartition)
+  let conf = FDBStreamConfig { streamConfigDB = db
+                             , streamConfigSS = ss
+                             , streamMetricsStore = Just metricsStore
+                             , threadsPerEdge = coerce streamThreadsPerPartition
+                             , useWatches = coerce useWatches
+                             }
   let input = makeTopicConfig db ss "incoming_orders"
   let t = topology input
   let table = getAggrTable conf t
@@ -354,7 +359,7 @@ cleanup :: Database -> Subspace -> IO ()
 cleanup db ss = do
   putStrLn "Cleaning up FDB state"
   let (delBegin, delEnd) = rangeKeys $ subspaceRange ss
-  runTransaction db $ clearRange delBegin delEnd
+  runTransactionWithConfig defaultConfig {timeout = 5000} db $ clearRange delBegin delEnd
   putStrLn "Cleanup successful"
 
 data Args f = Args
@@ -365,7 +370,8 @@ data Args f = Args
   , generatorWatchResults :: f Bool
   , streamThreadsPerPartition :: f Int
   , streamRun :: f Bool
-  , cleanupFirst :: f Bool }
+  , cleanupFirst :: f Bool
+  , useWatches :: f Bool }
   deriving (Generic)
 
 deriving instance (forall a . Show a => Show (f a)) => Show (Args f)
@@ -383,6 +389,7 @@ applyDefaults Args{..} = Args
   , streamThreadsPerPartition = dflt 1 streamThreadsPerPartition
   , streamRun = dflt True streamRun
   , cleanupFirst = dflt True cleanupFirst
+  , useWatches = dflt False useWatches
   }
 
   where dflt d x = Identity $ fromMaybe d x

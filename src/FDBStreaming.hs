@@ -7,6 +7,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE TupleSections #-}
 
 module FDBStreaming where
 
@@ -15,8 +16,10 @@ import           FDBStreaming.Message           ( Message(..) )
 import           FDBStreaming.Topic
 
 import           Control.Concurrent
-import           Control.Concurrent.Async       ( async
+import           Control.Concurrent.Async       ( Async
+                                                , async
                                                 , wait
+                                                , waitEither
                                                 )
 import           Control.Exception
 import           Control.Monad
@@ -48,6 +51,8 @@ import           System.Metrics.Counter         ( Counter )
 import           System.Metrics.Distribution    ( Distribution )
 import qualified System.Metrics.Counter        as Counter
 import qualified System.Metrics.Distribution   as Distribution
+import           Text.Printf
+import           UnliftIO.Exception             ( fromEitherIO )
 
 
 -- | We limit the number of retries so we can catch conflict errors and record
@@ -255,6 +260,17 @@ readBatchExactlyOnce cfg metrics rn s n = case outputTopic cfg s of
     pid <- liftIO $ randPartition outCfg
     readPartitionBatchExactlyOnce cfg metrics rn s pid n
 
+-- | Returns true if the given stream step can be run by runStream.
+-- TODO: split into separate types. This is ugly.
+runnable :: Stream a -> Bool
+runnable StreamExistingTopic{} = False
+runnable StreamProducer{} = True
+runnable StreamConsumer{} = True
+runnable StreamPipe{} = True
+runnable Stream1to1Join{} = True
+runnable StreamGroupBy{} = False
+runnable StreamAggregate{} = True
+
 getAggrTable :: FDBStreamConfig -> Stream (AT.AggrTable k v) -> AT.AggrTable k v
 getAggrTable sc (StreamAggregate sn _ _) = AT.AggrTable
   $ extend (streamConfigSS sc) [Bytes "tpcs", Bytes sn, Bytes "AggrTable"]
@@ -376,6 +392,12 @@ data FDBStreamConfig = FDBStreamConfig
   -- ^ subspace that will contain all state for the stream topology
   , streamMetricsStore :: Maybe Metrics.Store
   , threadsPerEdge :: Int
+  , useWatches :: Bool
+  -- ^ If true, use FDB watches to wait for new messages in each worker thread.
+  -- Otherwise, read continuously, sleeping for a short time if no new messages
+  -- are available. In exeperiments so far, it seems that setting this to false
+  -- significantly reduces the total load on FDB, increases throughput,
+  -- and reduces end-to-end latency (surprisingly).
   }
 
 inputTopics :: FDBStreamConfig -> Stream a -> [TopicConfig]
@@ -405,9 +427,19 @@ outputTopic _ StreamAggregate{}          = Nothing
 outputTopic sc s =
   Just $ makeTopicConfig (streamConfigDB sc) (streamConfigSS sc) (streamName s)
 
+waitLogging :: Async () -> IO ()
+waitLogging w = catches (wait w)
+  [ Handler (\(e :: SomeException) ->
+      printf "Caught %s while watching a topic partition"
+             (show e))]
+
 foreverLogErrors
-  :: Maybe (Map StreamName StreamEdgeMetrics) -> StreamName -> IO Int -> IO ()
-foreverLogErrors metrics sn x =
+  :: FDBStreamConfig
+  -> Maybe (Map StreamName StreamEdgeMetrics)
+  -> StreamName
+  -> IO (Int, Async ())
+  -> IO ()
+foreverLogErrors FDBStreamConfig{ useWatches } metrics sn x =
   forever
     $ handle
         (\(e :: SomeException) ->
@@ -442,31 +474,35 @@ foreverLogErrors metrics sn x =
         --NOTE: a small delay here (<10 milliseconds) helps us do more
         -- msgs/second
         threadDelay 150
-        t1           <- getTime Monotonic
-        numProcessed <- x
-        t2           <- getTime Monotonic
+        t1 <- getTime Monotonic
+        (numProcessed, w) <- x
+        t2 <- getTime Monotonic
         let timeMillis = (`div` 1000000) $ toNanoSecs $ diffTimeSpec t2 t1
         recordBatchLatency sn metrics timeMillis
-        -- TODO: maybe an expectedPeakRPS param for the config so we can compute
-        -- optimal sleep time?
-        when (numProcessed == 0) (threadDelay 1000000)
+        if numProcessed == 0 && not useWatches
+           then threadDelay 1000000
+           else waitLogging w
 
 runStream :: FDBStreamConfig -> Stream a -> IO ()
 runStream cfg@FDBStreamConfig { streamMetricsStore, threadsPerEdge } s = do
   metrics <- forM streamMetricsStore $ registerTopologyMetrics s
-  traverseStream s $ \step -> do
+  traverseStream s $ \step -> when (runnable step) $ do
     putStrLn $ "starting " ++ show (streamName step)
     let numPartitions = inputTopicNumPartitions cfg s
     forM_ [0 .. numPartitions - 1] $ \pid ->
       replicateM_ threadsPerEdge
         $ void
         $ forkIO
-        $ foreverLogErrors metrics (streamName step)
+        $ foreverLogErrors cfg metrics (streamName step)
         $ runStreamStep cfg metrics step pid
 
 
 magicBatchSizeNumber :: Num a => a
 magicBatchSizeNumber = 50
+
+mfutureToAsync :: Maybe (FutureIO ()) -> IO (Async ())
+mfutureToAsync Nothing = async $ return ()
+mfutureToAsync (Just f) = async $ fromEitherIO $ awaitIO f
 
 -- | Runs a single stream step. Reads from its input topic
 -- in chunks, runs the monadic action on each input, and writes the result to
@@ -482,24 +518,35 @@ magicBatchSizeNumber = 50
 -- downstream topics.
 -- Returns number of items processed.
 runStreamStep
-  :: FDBStreamConfig -> Maybe MetricsMap -> Stream a -> PartitionId -> IO Int
-runStreamStep _ _ (StreamExistingTopic _ _) _ = return 1
+  :: FDBStreamConfig
+  -> Maybe MetricsMap
+  -> Stream a
+  -> PartitionId
+  -> IO (Int, Async ())
+  -- ^ number messages processed and a watch for new messages.
+runStreamStep _ _ (StreamExistingTopic _ _) _ = error "can't run existing topic"
 runStreamStep c@FDBStreamConfig {..} _ s@(StreamProducer _ step) _ = do
   -- TODO: this keeps spinning even if the producer is done and will never
   -- produce again.
   let Just outCfg = outputTopic c s
   xs <- catMaybes <$> replicateM magicBatchSizeNumber step -- TODO: batch size config
   writeTopic outCfg (fmap toMessage xs)
-  return (length xs)
+  w <- async $ return ()
+  return (length xs, w)
 
 runStreamStep c@FDBStreamConfig {..} metrics (StreamConsumer sn up step) pid =
   do
   -- TODO: if parsing the message fails, should we still checkpoint?
-    xs <-
-      runTransactionWithConfig lowRetries streamConfigDB
-        $ readPartitionBatchExactlyOnce c metrics sn up pid magicBatchSizeNumber
+  -- TODO: blockUntilNew
+    (xs, w) <- runTransactionWithConfig lowRetries streamConfigDB $ do
+                 xs <- readPartitionBatchExactlyOnce c metrics sn up pid magicBatchSizeNumber
+                 let Just inCfg = outputTopic c up
+                 if null xs || not useWatches
+                   then return (xs, Nothing)
+                   else (xs,) . Just <$> watchPartition inCfg pid
     mapM_ step xs
-    return (length xs)
+    w' <- mfutureToAsync w
+    return (length xs, w')
 
 runStreamStep c@FDBStreamConfig {..} metrics s@(StreamPipe rn up step) pid = do
   let Just outCfg = outputTopic c s
@@ -514,7 +561,13 @@ runStreamStep c@FDBStreamConfig {..} metrics s@(StreamPipe rn up step) pid = do
     let outMsgs = fmap toMessage ys
     p' <- liftIO $ randPartition outCfg
     writeTopic' outCfg p' outMsgs
-    return (length inMsgs)
+    let Just inCfg = outputTopic c up
+    -- TODO: merge below into one fn
+    w <- if null inMsgs || not useWatches
+            then return Nothing
+            else Just <$> watchPartition inCfg pid
+    w' <- liftIO $ mfutureToAsync w
+    return (length inMsgs, w')
 
 runStreamStep c@FDBStreamConfig {..} metrics s@(Stream1to1Join rn (ls :: Stream
     a) (rs :: Stream b) pl pr combiner) pid
@@ -548,14 +601,13 @@ runStreamStep c@FDBStreamConfig {..} metrics s@(Stream1to1Join rn (ls :: Stream
             return Nothing
       p' <- liftIO $ randPartition outCfg
       writeTopic' outCfg p' (map toMessage toWrite)
-      return (length lMsgs)
-    FDB.runTransactionWithConfig lowRetries streamConfigDB $ do
-      rMsgs <- readPartitionBatchExactlyOnce c
-                                             metrics
-                                             rn
-                                             rs
-                                             pid
-                                             magicBatchSizeNumber
+      let Just lCfg = outputTopic c ls
+      w <- if null lMsgs || not useWatches
+              then return Nothing
+              else Just <$> watchPartition lCfg pid
+      return (length lMsgs, w)
+    (rlen, rw) <- FDB.runTransactionWithConfig lowRetries streamConfigDB $ do
+      rMsgs    <- readPartitionBatchExactlyOnce c metrics rn rs pid magicBatchSizeNumber
       joinFutures <- forM (fmap pr rMsgs) (get1to1JoinData c rn True)
       joinData <- Seq.zip rMsgs <$> mapM await joinFutures
       toWrite <- fmap (catMaybes . toList) $ forM joinData $ \(rmsg, d) -> do
@@ -571,9 +623,18 @@ runStreamStep c@FDBStreamConfig {..} metrics s@(Stream1to1Join rn (ls :: Stream
       -- return the list of stuff to write and then call swap before writing.
       p' <- liftIO $ randPartition outCfg
       writeTopic' outCfg p' (map toMessage toWrite)
-    wait l
+      let Just rCfg = outputTopic c rs
+      w <- if null rMsgs || not useWatches
+              then return Nothing
+              else Just <$> watchPartition rCfg pid
+      return (length rMsgs, w)
+    (llen, lw) <- wait l
+    lw' <- mfutureToAsync lw
+    rw' <- mfutureToAsync rw
+    w' <- async $ waitEither lw' rw'
+    return (llen + rlen, void w')
 
-runStreamStep _ _ StreamGroupBy{} _ = return 1 --TODO: don't run this
+runStreamStep _ _ StreamGroupBy{} _ = error "tried to run unrunnable step"
 
 runStreamStep c@FDBStreamConfig {..} metrics s@(StreamAggregate sn (StreamGroupBy _ up toKey) aggr) pid
   = do
@@ -586,7 +647,12 @@ runStreamStep c@FDBStreamConfig {..} metrics s@(StreamAggregate sn (StreamGroupB
                                             pid
                                             magicBatchSizeNumber
       forM_ msgs $ \msg -> AT.mappendTable table (toKey msg) (aggr msg)
-      return (length msgs)
+      let Just inCfg = outputTopic c up
+      w <- if null msgs || not useWatches
+              then return Nothing
+              else Just <$> watchPartition inCfg pid
+      w' <- liftIO $ mfutureToAsync w
+      return (length msgs, w')
 
 -- TODO: stronger types
 runStreamStep _ _ StreamAggregate{} _ =
