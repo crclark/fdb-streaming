@@ -40,7 +40,8 @@ library
       random,
       async,
       ekg-core,
-      clock, unliftio
+      clock,
+      unliftio
   default-language: Haskell2010
 
 executable fdb-streaming-writer

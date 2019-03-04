@@ -270,31 +270,32 @@ instance Message All where
   toMessage = Store.encode
   fromMessage = Store.decodeEx
 
-topology :: TopicConfig -> Stream (AT.AggrTable OrderID All)
-topology incoming = StreamAggregate "order_table" grouped snd
-  where
-    input = StreamExistingTopic "existing_orders" incoming
-    fraudChecks = StreamPipe "fraud_checks" input $ \order ->
-      return $ Just $ isFraudulent order
-    invChecks = StreamPipe "inv_checks" input $ \order ->
-      return $ Just $ inventoryCheck order
-    detailsPipe = StreamPipe "details" input (fmap Just . randOrderDetails)
-    fraudInvJoin = Stream1to1Join "f_i_join"
-                                  fraudChecks
-                                  invChecks
-                                  fraudOrderID
-                                  invOrderID
-                                  (\FraudResult{orderID, isFraud}
-                                    InStockResult{isInStock}
-                                    -> (orderID, not isFraud && isInStock))
-    finalJoin = Stream1to1Join "final_join"
-                               fraudInvJoin
-                               detailsPipe
-                               fst
-                               (\OrderDetails{orderID} -> orderID)
-                               (\(oid, isGood) OrderDetails{details}
-                                 -> (oid, All $ isGood && goodDetails details))
-    grouped = StreamGroupBy "groupby" finalJoin fst
+topology :: MonadStream m => TopicConfig -> m (AT.AggrTable OrderID All)
+topology incoming = do
+  input <- existing incoming
+  fraudChecks <- pipe "fraud_checks" input $ \order ->
+    return $ Just $ isFraudulent order
+  invChecks <- pipe "inv_checks" input $ \order ->
+    return $ Just $ inventoryCheck order
+  details <- pipe "details" input (fmap Just . randOrderDetails)
+  fraudInvJoin <- oneToOneJoin "f_i_join"
+                               fraudChecks
+                               invChecks
+                               fraudOrderID
+                               invOrderID
+                               (\FraudResult{orderID, isFraud}
+                                  InStockResult{isInStock}
+                                  -> (orderID, not isFraud && isInStock))
+  finalJoin <- oneToOneJoin "final_join"
+                            fraudInvJoin
+                            details
+                            fst
+                            (\OrderDetails{orderID} -> orderID)
+                            (\(oid, isGood) OrderDetails{details}
+                              -> (oid, All $ isGood && goodDetails details))
+  grouped <- groupBy (pure . fst) finalJoin
+  orderStatusTable <- aggregate "order_table" grouped snd
+  return orderStatusTable
 
 printStats :: Database -> Subspace -> IO ()
 printStats db ss = catches (do
@@ -337,7 +338,7 @@ mainLoop db ss Args{ generatorNumThreads
                              }
   let input = makeTopicConfig db ss "incoming_orders"
   let t = topology input
-  let table = getAggrTable conf t
+  let table = getAggrTable conf "order_table"
   stats <- newTVarIO $ LatencyStats 0 1
   replicateM_ (coerce generatorNumThreads)
     $ forkIO $ orderGeneratorLoop input
@@ -349,8 +350,7 @@ mainLoop db ss Args{ generatorNumThreads
                                   awaitedOrders
                                   (coerce generatorWatchResults)
   void $ forkIO $ latencyReportLoop stats
-  debugTraverseStream t
-  when (coerce streamRun) $ runStream conf t
+  when (coerce streamRun) $ void $ runStreamWorker conf t
   forever $ do
     printStats db ss
     threadDelay 1000000
