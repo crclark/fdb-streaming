@@ -23,7 +23,8 @@ library
       FDBStreaming,
       FDBStreaming.AggrTable,
       FDBStreaming.Message,
-      FDBStreaming.Topic
+      FDBStreaming.Topic,
+      FDBStreaming.Topic.Constants
   other-modules:
       Paths_fdb_streaming
   hs-source-dirs:

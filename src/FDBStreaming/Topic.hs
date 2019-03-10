@@ -43,6 +43,8 @@ import           FoundationDB.Versionstamp      ( Versionstamp
                                                 )
 import           System.Random                  ( randomRIO )
 
+import qualified FDBStreaming.Topic.Constants  as C
+
 zeroLE :: ByteString
 zeroLE = "\x00\x00\x00\x00\x00\x00\x00\x00"
 
@@ -88,11 +90,11 @@ makeTopicConfig topicConfigDB topicSS topicName = TopicConfig { .. }
 
   partitionCountKey i = FDB.pack topicCountSS [Int i]
 
-  msgsSS = FDB.extend topicSS [Bytes "tpcs", Bytes topicName, Bytes "msgs"]
+  msgsSS = FDB.extend topicSS [C.topics, Bytes topicName, C.messages]
 
   topicCountSS = FDB.extend
     topicSS
-    [Bytes "tpcs", Bytes topicName, Bytes "meta", Bytes "count"]
+    [C.topics, Bytes topicName, C.metaCount]
   numPartitions = 80 -- TODO: make configurable
 
 randPartition :: TopicConfig -> IO PartitionId
@@ -101,14 +103,14 @@ randPartition TopicConfig {..} =
 
 -- TODO: not efficient from either a Haskell or FDB perspective.
 listExistingTopics :: FDB.Database -> FDB.Subspace -> IO [TopicConfig]
-listExistingTopics db ss = runTransaction db $ go (FDB.pack ss [Bytes "tpcs"])
+listExistingTopics db ss = runTransaction db $ go (FDB.pack ss [C.topics])
  where
   go :: ByteString -> Transaction [TopicConfig]
   go k = do
     k' <- getKey (FirstGreaterThan k) >>= await
     case FDB.unpack ss k' of
-      Right (Bytes "tpcs" : Bytes topicName : _) -> do
-        let nextK = FDB.pack ss [Bytes "tpcs", Bytes topicName] <> "0xff"
+      Right (Int 0 : Bytes topicName : _) -> do
+        let nextK = FDB.pack ss [C.topics, Bytes topicName] <> "0xff"
         rest <- go nextK
         let conf = makeTopicConfig db ss topicName
         return (conf : rest)
@@ -150,10 +152,10 @@ getPartitionCount conf i = do
 
 readerSS :: TopicConfig -> ReaderName -> Subspace
 readerSS TopicConfig {..} rn =
-  extend topicSS [Bytes "tpcs", Bytes topicName, Bytes "rdrs", Bytes rn]
+  extend topicSS [C.topics, Bytes topicName, C.readers, Bytes rn]
 
 readerCheckpointKey :: TopicConfig -> PartitionId -> ReaderName -> ByteString
-readerCheckpointKey tc i rn = FDB.pack (readerSS tc rn) [Int i, Bytes "ckpt"]
+readerCheckpointKey tc i rn = FDB.pack (readerSS tc rn) [Int i, C.checkpoint]
 
 -- TODO: make idempotent to deal with CommitUnknownResult
 -- | Danger!! It's possible to write multiple messages with the same key
@@ -281,7 +283,7 @@ readNPastCheckpoint tc p rn n = do
         , rangeLimit   = Just (fromIntegral n)
         , rangeReverse = False
         }
-  fmap (trOutput tc p) <$> FDB.getEntireRange r
+  fmap (trOutput tc p) <$> withSnapshot (FDB.getEntireRange r)
 
 -- TODO: would be useful to have a version of this that returns a watch if
 -- there are no new messages.

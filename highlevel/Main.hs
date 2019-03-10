@@ -40,7 +40,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Random.MWC as BS
 import           Data.Coerce                    ( coerce )
-import           Data.Word                      ( Word16 )
+import           Data.Word                      ( Word16, Word8 )
 import           FoundationDB                  as FDB
 import           FoundationDB.Error
 import           FoundationDB.Layer.Subspace   as FDB
@@ -325,7 +325,9 @@ mainLoop db ss Args{ generatorNumThreads
                    , generatorWatchResults
                    , streamThreadsPerPartition
                    , streamRun
-                   , useWatches } = do
+                   , useWatches
+                   , printTopicStats
+                   , batchSize } = do
   metricsStore <- Metrics.newStore
   latencyDist <- Metrics.createDistribution "end_to_end_latency" metricsStore
   awaitedOrders <- Metrics.createGauge "waitingOrders" metricsStore
@@ -335,6 +337,7 @@ mainLoop db ss Args{ generatorNumThreads
                              , streamMetricsStore = Just metricsStore
                              , threadsPerEdge = coerce streamThreadsPerPartition
                              , useWatches = coerce useWatches
+                             , msgsPerBatch = coerce batchSize
                              }
   let input = makeTopicConfig db ss "incoming_orders"
   let t = topology input
@@ -352,7 +355,7 @@ mainLoop db ss Args{ generatorNumThreads
   void $ forkIO $ latencyReportLoop stats
   when (coerce streamRun) $ void $ runStreamWorker conf t
   forever $ do
-    printStats db ss
+    when (coerce printTopicStats) $ printStats db ss
     threadDelay 1000000
 
 cleanup :: Database -> Subspace -> IO ()
@@ -371,7 +374,9 @@ data Args f = Args
   , streamThreadsPerPartition :: f Int
   , streamRun :: f Bool
   , cleanupFirst :: f Bool
-  , useWatches :: f Bool }
+  , useWatches :: f Bool
+  , printTopicStats :: f Bool
+  , batchSize :: f Word8 }
   deriving (Generic)
 
 deriving instance (forall a . Show a => Show (f a)) => Show (Args f)
@@ -390,6 +395,8 @@ applyDefaults Args{..} = Args
   , streamRun = dflt True streamRun
   , cleanupFirst = dflt True cleanupFirst
   , useWatches = dflt False useWatches
+  , printTopicStats = dflt True printTopicStats
+  , batchSize = dflt 50 batchSize
   }
 
   where dflt d x = Identity $ fromMaybe d x
