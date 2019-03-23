@@ -273,11 +273,9 @@ instance Message All where
 topology :: MonadStream m => TopicConfig -> m (AT.AggrTable OrderID All)
 topology incoming = do
   input <- existing incoming
-  fraudChecks <- pipe "fraud_checks" input $ \order ->
-    return $ Just $ isFraudulent order
-  invChecks <- pipe "inv_checks" input $ \order ->
-    return $ Just $ inventoryCheck order
-  details <- pipe "details" input (fmap Just . randOrderDetails)
+  let fraudChecks = fmap isFraudulent input
+  let invChecks = fmap inventoryCheck input
+  let details = benignIO (fmap Just . randOrderDetails) input
   fraudInvJoin <- oneToOneJoin "f_i_join"
                                fraudChecks
                                invChecks

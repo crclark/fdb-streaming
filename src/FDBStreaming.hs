@@ -17,12 +17,12 @@ import qualified FDBStreaming.AggrTable        as AT
 import           FDBStreaming.Message           ( Message(..) )
 import           FDBStreaming.Topic
 import qualified FDBStreaming.Topic.Constants  as C
+import           FDBStreaming.Joins
 
 import           Control.Concurrent
 import           Control.Concurrent.Async       ( Async
                                                 , async
                                                 , wait
-                                                , waitEither
                                                 )
 import           Control.Exception
 import           Control.Monad
@@ -35,10 +35,10 @@ import           Control.Monad.Reader           ( MonadReader
 import           Data.ByteString                ( ByteString )
 import           Data.Foldable                  ( toList )
 
-import           Data.Maybe                     ( catMaybes )
 import           Data.Sequence                  ( Seq(..) )
 import qualified Data.Sequence                 as Seq
 import           Data.Text.Encoding             ( decodeUtf8 )
+import           Data.Witherable                ( catMaybes )
 import           FoundationDB                  as FDB
 import           FoundationDB.Error            as FDB
 import           FoundationDB.Layer.Subspace   as FDB
@@ -122,9 +122,27 @@ data GroupedBy k v = GroupedBy (Topic v) (v -> [k])
 -- TODO: transient "topic" that isn't persisted, but instead fused into later
 -- steps? Might be hard to find a way to do it without doubling all our code
 -- (and worse, our MonadStream interface).
-newtype Topic a = Topic { getTopicConfig :: TopicConfig }
+data Topic a = forall b . Message b => Topic
+  { getTopicConfig :: TopicConfig
+  , topicMapFilter :: b -> IO (Maybe a) }
 
--- Let's see if tagless final solves our constraint problems
+instance Functor Topic where
+  fmap g (Topic c f) = Topic c $ \b -> do
+    x <- f b
+    return (fmap g x)
+
+-- | Registers an IO transformation to perform on each message if/when the
+-- stream is consumed downstream. Return 'Nothing' to filter the stream. Side
+-- effects here should be benign and relatively cheap -- they could be run many
+-- times for the same input.
+benignIO :: forall a b . (Message a, Message b) => (a -> IO (Maybe b)) -> Topic a -> Topic b
+benignIO g (Topic cfg (f :: c -> IO (Maybe a))) =
+  Topic cfg $ \(x :: c) -> do
+    y <- f x
+    case y of
+      Nothing -> return Nothing
+      Just z -> g z
+
 class Monad m => MonadStream m where
   existing :: Message a => TopicConfig -> m (Topic a)
 
@@ -144,7 +162,10 @@ class Monad m => MonadStream m where
   -- fails. We could maintain a set of in-flight side effects, and remove them
   -- from the set once finished. In that case, we could try to recover by
   -- traversing the items in the set that are older than t.
-  consume :: Message a => StreamName -> Topic a -> (a -> IO ()) -> m ()
+  -- | Produce a side effect at least once for each message in the stream.
+  -- In practice, this will _usually_ be more than once in the current
+  -- implementation, if running multiple instances of the processor.
+  atLeastOnce :: Message a => StreamName -> Topic a -> (a -> IO ()) -> m ()
   pipe :: (Message a, Message b)
        => StreamName
        -> Topic a
@@ -187,21 +208,21 @@ class Monad m => MonadStream m where
 newtype StreamWorker a = StreamWorker { unStreamWorker :: ReaderT FDBStreamConfig IO a}
   deriving (Functor, Applicative, Monad, MonadReader FDBStreamConfig, MonadIO)
 
-makeTopic :: (MonadReader FDBStreamConfig m)
+makeTopic :: (Message a, MonadReader FDBStreamConfig m)
           => StreamName
           -> m (Topic a)
 makeTopic sn = do
   sc <- ask
+  let tc = makeTopicConfig (streamConfigDB sc) (streamConfigSS sc) sn
   return
-    $ Topic
-    $ makeTopicConfig (streamConfigDB sc) (streamConfigSS sc) sn
+    $ Topic tc (return . Just)
 
 runPartitionedForever :: (MonadReader FDBStreamConfig m, MonadIO m)
                       => StreamName
                       -> Topic a
                       -> (Maybe StreamEdgeMetrics -> PartitionId -> IO (Int, Async ()))
                       -> m ()
-runPartitionedForever sn (Topic cfg) run = do
+runPartitionedForever sn (Topic cfg _) run = do
   scfg <- ask
   metrics <- registerStepMetrics sn
   liftIO $ putStrLn $ "starting " ++ show sn
@@ -213,31 +234,52 @@ runPartitionedForever sn (Topic cfg) run = do
       $ run metrics pid
 
 instance MonadStream StreamWorker where
-  existing tc = return (Topic tc)
+  existing tc = return (Topic tc (return . Just))
 
   produce sn m = do
     t <- makeTopic sn
+    let tc = getTopicConfig t
     FDBStreamConfig{msgsPerBatch} <- ask
-    runPartitionedForever sn t (\_ _ -> runProduceStep msgsPerBatch t m)
+    runPartitionedForever sn t (\_ _ -> runProduceStep msgsPerBatch tc m)
     return t
 
-  consume sn inTopic step = do
+  atLeastOnce sn inTopic step = do
     cfg <- ask
     runPartitionedForever sn inTopic (runConsumeStep cfg inTopic sn step)
 
   pipe sn inTopic step = do
     cfg <- ask
     outTopic <- makeTopic sn
-    runPartitionedForever sn inTopic (runPipeStep cfg inTopic outTopic sn step)
+    let outCfg = getTopicConfig outTopic
+    runPartitionedForever sn inTopic (runPipeStep cfg inTopic outCfg sn step)
     return outTopic
 
   oneToOneJoin sn lt rt pl pr c = do
     cfg <- ask
     outTopic <- makeTopic sn
-    -- TODO: currently oneToOneJoin assumes both input topics have same number
-    -- of partitions. To fix, call runPartitionedForever twice, once with a
-    -- function for the left topic, once for a function for the right topic.
-    runPartitionedForever sn lt (runOneToOneJoinStep cfg sn lt rt outTopic pl pr c)
+    let outCfg = getTopicConfig outTopic
+    let lCheckpointName = sn <> "0"
+    let rCheckpointName = sn <> "1"
+    runPartitionedForever lCheckpointName
+                          lt
+                          (runOneToOneJoinStep cfg
+                                               sn
+                                               lCheckpointName
+                                               lt
+                                               0
+                                               outCfg
+                                               pl
+                                               c)
+    runPartitionedForever rCheckpointName
+                          rt
+                          (runOneToOneJoinStep cfg
+                                               sn
+                                               rCheckpointName
+                                               rt
+                                               1
+                                               outCfg
+                                               pr
+                                               (flip c))
     return outTopic
 
   groupBy k t = return (GroupedBy t k)
@@ -308,59 +350,17 @@ readPartitionBatchExactlyOnce
   -> PartitionId
   -> Word8
   -> Transaction (Seq a)
-readPartitionBatchExactlyOnce (Topic outCfg) metrics rn pid n = do
+readPartitionBatchExactlyOnce (Topic outCfg mapFilter) metrics rn pid n = do
   rawMsgs <- readNAndCheckpoint' outCfg pid rn n
   liftIO $ when (Seq.null rawMsgs) (incrEmptyBatchCount metrics)
   liftIO $ recordMsgsPerBatch metrics (Seq.length rawMsgs)
-  return $ fmap (fromMessage . snd) rawMsgs
+  let msgs = fmap (fromMessage . snd) rawMsgs
+  msgs' <- liftIO $ forM msgs mapFilter
+  return $ catMaybes msgs'
 
 getAggrTable :: FDBStreamConfig -> StreamName -> AT.AggrTable k v
 getAggrTable sc sn = AT.AggrTable
   $ extend (streamConfigSS sc) [C.topics, Bytes sn, C.aggrTable]
-
--- TODO: move join stuff to new namespace
-subspace1to1JoinForKey
-  :: Message k => FDBStreamConfig -> StreamName -> k -> Subspace
-subspace1to1JoinForKey sc sn k = extend
-  (streamConfigSS sc)
-  [C.topics, Bytes sn, C.oneToOneJoin, Bytes (toMessage k)]
-
-delete1to1JoinData
-  :: Message k => FDBStreamConfig -> StreamName -> k -> Transaction ()
-delete1to1JoinData c sn k = do
-  let ss     = subspace1to1JoinForKey c sn k
-  let (x, y) = rangeKeys $ subspaceRange ss
-  clearRange x y
-
-write1to1JoinData
-  :: (Message k, Message a, Message b)
-  => FDBStreamConfig
-  -> StreamName
-  -> k
-  -> Either a b
-  -> Transaction ()
-write1to1JoinData c sn k x = do
-  let ss = subspace1to1JoinForKey c sn k
-  case x of
-    Left  y -> set (pack ss [Bool True]) (toMessage y)
-    Right y -> set (pack ss [Bool False]) (toMessage y)
-
-get1to1JoinData
-  :: (Message k, Message a)
-  => FDBStreamConfig
-  -> StreamName
-  -> Bool
-                    -- ^ True for the left stream, False for the right
-                    -- TODO: replace this with an int and support n-way
-                    -- joins?
-  -> k
-  -> Transaction (Future (Maybe a))
-get1to1JoinData cfg sn isLeft k = do
-  let ss = subspace1to1JoinForKey cfg sn k
-  let key = pack ss [Bool isLeft]
-  --liftIO $ putStrLn $ "get1to1JoinData: k is " ++ show key
-  f <- get key
-  return (fmap (fmap fromMessage) f)
 
 -- TODO: other persistence backends
 -- TODO: should probably rename to TopologyConfig
@@ -393,19 +393,29 @@ foreverLogErrors
   -> IO (Int, Async ())
   -> IO ()
 foreverLogErrors FDBStreamConfig{ useWatches } metrics sn x =
-  forever
-    $ handle
+  forever $ flip catches
+    [ Handler
+      (\case
+       Error (MaxRetriesExceeded (CError TransactionTimedOut)) ->
+        threadDelay 25000
+       CError TransactionTimedOut ->
+        threadDelay 25000
+       e -> throw e
+      )
+    , Handler
+      (\case
+        Error (MaxRetriesExceeded (CError NotCommitted)) -> do
+          incrConflicts metrics
+          threadDelay 25000
+        e -> throw e
+      )
+
+    , Handler
         (\(e :: SomeException) -> do
           tid <- myThreadId
           printf "%s on thread %s caught %s\n" (show sn) (show tid) (show e)
         )
-    $ handle
-        (\case
-          Error (MaxRetriesExceeded (CError NotCommitted)) -> do
-            incrConflicts metrics
-            threadDelay 25000
-          e -> throw e
-        )
+    ]
     $ do
     -- Problem: busy looping, constantly reading for more data, is wasteful.
     -- Possible solution: create a watch after each iteration, and only loop
@@ -453,10 +463,10 @@ mfutureToAsync (Just f) = async $ fromEitherIO $ awaitIO f
 
 runProduceStep :: Message a
                => Word8
-               -> Topic a
+               -> TopicConfig
                -> (IO (Maybe a))
                -> IO (Int, Async ())
-runProduceStep batchSize (Topic outCfg) step = do
+runProduceStep batchSize outCfg step = do
   -- TODO: this keeps spinning even if the producer is done and will never
   -- produce again.
   xs <- catMaybes <$> replicateM (fromIntegral batchSize) step
@@ -472,7 +482,8 @@ runConsumeStep :: Message a
                -> Maybe StreamEdgeMetrics
                -> PartitionId
                -> IO (Int, Async ())
-runConsumeStep FDBStreamConfig{ streamConfigDB, useWatches, msgsPerBatch } t@(Topic inCfg) sn step metrics pid = do
+runConsumeStep FDBStreamConfig{ streamConfigDB, useWatches, msgsPerBatch }
+               t@(Topic inCfg _) sn step metrics pid = do
   (xs, w) <- runTransactionWithConfig lowRetries streamConfigDB $ do
     xs <- readPartitionBatchExactlyOnce t metrics sn pid msgsPerBatch
     if null xs || not useWatches
@@ -485,15 +496,15 @@ runConsumeStep FDBStreamConfig{ streamConfigDB, useWatches, msgsPerBatch } t@(To
 runPipeStep :: (Message a, Message b)
             => FDBStreamConfig
             -> Topic a
-            -> Topic b
+            -> TopicConfig
             -> StreamName
             -> (a -> IO (Maybe b))
             -> Maybe StreamEdgeMetrics
             -> PartitionId
             -> IO (Int, Async ())
 runPipeStep  FDBStreamConfig { streamConfigDB, useWatches, msgsPerBatch }
-             inTopic@(Topic inCfg)
-             (Topic outCfg)
+             inTopic@(Topic inCfg _)
+             outCfg
              sn
              step
              metrics
@@ -518,87 +529,65 @@ runPipeStep  FDBStreamConfig { streamConfigDB, useWatches, msgsPerBatch }
 runOneToOneJoinStep :: forall a b c d . (Message a, Message b, Message c, Message d)
                     => FDBStreamConfig
                     -> StreamName
+                    -> ByteString
+                    -- ^ unique name for checkpointing this operation. Can't
+                    -- be the same as the StreamName because self-joins would
+                    -- break.
                     -> Topic a
-                    -> Topic b
-                    -> Topic d
+                    -> Int
+                    -- ^ Index of the stream being consumed. 0 for left side of
+                    -- join, 1 for right. This will be refactored to support
+                    -- n-way joins in the future.
+                    -> TopicConfig
                     -> (a -> c)
-                    -> (b -> c)
                     -> (a -> b -> d)
                     -> Maybe StreamEdgeMetrics
                     -> PartitionId
                     -> IO (Int, Async ())
-runOneToOneJoinStep c@FDBStreamConfig{ streamConfigDB, useWatches, msgsPerBatch}
+runOneToOneJoinStep FDBStreamConfig{ streamConfigDB
+                                   , streamConfigSS
+                                   , useWatches
+                                   , msgsPerBatch}
                     sn
-                    lInTopic@(Topic lCfg)
-                    rInTopic@(Topic rCfg)
-                    (Topic outCfg)
+                    checkpointName
+                    lInTopic@(Topic lCfg _)
+                    streamJoinIx
+                    outCfg
                     pl
-                    pr
                     combiner
                     metrics
-                    pid = do
-  -- TODO: the below two transactions are virtually identical. Need to find a
-  -- way to eliminate the repetition.
-  -- What this does is read from one of the two join streams, and for each
+                    pid =
+  -- Read from one of the two join streams, and for each
   -- message read, compute the join key. Using the join key, look in the
   -- join table to see if the partner is already there. If so, write the tuple
   -- downstream. If not, write the one message we do have to the join table.
   -- TODO: think of a way to garbage collect items that never get joined.
-  l <- async $ FDB.runTransactionWithConfig lowRetries streamConfigDB $ do
+  FDB.runTransactionWithConfig lowRetries streamConfigDB $ do
     lMsgs <- readPartitionBatchExactlyOnce lInTopic
                                            metrics
-                                           sn
+                                           checkpointName
                                            pid
                                            msgsPerBatch
+    let otherIx = if streamJoinIx == 0 then 1 else 0
     joinFutures <- forM (fmap pl lMsgs)
-                        (withSnapshot . get1to1JoinData c sn False)
+                        (withSnapshot . get1to1JoinData streamConfigSS sn otherIx)
     joinData <- Seq.zip lMsgs <$> mapM await joinFutures
     toWrite <- fmap (catMaybes . toList) $ forM joinData $ \(lmsg, d) -> do
       let k = pl lmsg
       case d of
         Just (rmsg :: b) -> do
-          delete1to1JoinData c sn k
+          delete1to1JoinData streamConfigSS sn k
           return $ Just $ combiner lmsg rmsg
         Nothing -> do
-          write1to1JoinData c sn k (Left lmsg :: Either a b)
+          write1to1JoinData streamConfigSS sn k streamJoinIx (lmsg :: a)
           return Nothing
     p' <- liftIO $ randPartition outCfg
     writeTopic' outCfg p' (map toMessage toWrite)
     w <- if null lMsgs || not useWatches
             then return Nothing
             else Just <$> watchPartition lCfg pid
-    return (length lMsgs, w)
-  (rlen, rw) <- FDB.runTransactionWithConfig lowRetries streamConfigDB $ do
-    rMsgs    <- readPartitionBatchExactlyOnce rInTopic
-                                              metrics
-                                              sn
-                                              pid
-                                              msgsPerBatch
-    joinFutures <- forM (fmap pr rMsgs)
-                        (withSnapshot . get1to1JoinData c sn True)
-    joinData <- Seq.zip rMsgs <$> mapM await joinFutures
-    toWrite <- fmap (catMaybes . toList) $ forM joinData $ \(rmsg, d) -> do
-      let k = pr rmsg
-      case d of
-        Just (lmsg :: a) -> do
-          delete1to1JoinData c sn k
-          return $ Just $ combiner lmsg rmsg
-        Nothing -> do
-          write1to1JoinData c sn k (Right rmsg :: Either a b)
-          return Nothing
-    -- TODO: I think we could dry out the above by using a utility function to
-    -- return the list of stuff to write and then call swap before writing.
-    p' <- liftIO $ randPartition outCfg
-    writeTopic' outCfg p' (map toMessage toWrite)
-    w <- if null rMsgs || not useWatches
-            then return Nothing
-            else Just <$> watchPartition rCfg pid
-    return (length rMsgs, w)
-  (llen, lw) <- wait l
-  lw' <- mfutureToAsync lw
-  rw' <- mfutureToAsync rw
-  w' <- async $ waitEither lw' rw'
-  return (llen + rlen, void w')
+    w' <- liftIO $ mfutureToAsync w
+    return (length lMsgs, w')
 
 runAggregateStep :: forall v k aggr . (Message v, Message k, AT.TableValue aggr, AT.TableSemigroup aggr)
                  => FDBStreamConfig
@@ -610,7 +599,7 @@ runAggregateStep :: forall v k aggr . (Message v, Message k, AT.TableValue aggr,
                  -> IO (Int, Async ())
 runAggregateStep c@FDBStreamConfig { streamConfigDB, useWatches, msgsPerBatch }
                  sn
-                 (GroupedBy inTopic@(Topic inCfg) toKeys)
+                 (GroupedBy inTopic@(Topic inCfg _) toKeys)
                  toAggr
                  metrics
                  pid = do
@@ -625,6 +614,7 @@ runAggregateStep c@FDBStreamConfig { streamConfigDB, useWatches, msgsPerBatch }
       AT.mappendTable table k (toAggr msg)
     w <- if null msgs || not useWatches
             then return Nothing
+            -- TODO: wrap watchPartition so we don't have to destructure Topic
             else Just <$> watchPartition inCfg pid
     w' <- liftIO $ mfutureToAsync w
     return (length msgs, w')
