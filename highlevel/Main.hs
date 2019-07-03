@@ -54,7 +54,7 @@ import           Data.UUID                      ( UUID )
 import           Data.UUID.V4                  as UUID
                                                 ( nextRandom )
 import           GHC.Generics                   ( Generic )
-import           System.Random                  ( randomIO )
+import           System.Random                  ( randomIO, randomRIO )
 import           Data.Maybe                     ( fromMaybe )
 import           Data.Store                     ( Store )
 import qualified Data.Store                    as Store
@@ -208,7 +208,8 @@ placeAndAwaitOrders orderTopic table stats latencyDist awaitGauge batchSize shou
   orders <- replicateM batchSize randOrder
   catches ( do
     writeTopicNoRetry orderTopic (map toMessage orders)
-    when shouldWatch
+    r <- randomRIO (0,100)
+    when (shouldWatch && ((r :: Int) < 2))
       $ forM_ orders $ awaitOrder orderTopic table stats latencyDist awaitGauge
     )
     [ Handler (\case

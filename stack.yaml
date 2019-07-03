@@ -18,7 +18,7 @@
 #
 # resolver: ./custom-snapshot.yaml
 # resolver: https://example.com/snapshots/2018-01-01.yaml
-resolver: lts-13.0
+resolver: lts-13.14
 
 # User packages to be built.
 # Various formats can be used as shown in the example below.
@@ -45,7 +45,8 @@ packages:
 extra-deps:
   - ekg-0.4.0.15@sha256:f52d7c00654d72d2ab988255f30adba95a52484ac310bab9c136c64732e69f4b
   - ekg-json-0.1.0.6@sha256:4ff2e9cac213a5868ae8b4a7c72a16a9a76fac14d944ae819b3d838a9725569b
-
+  - quickcheck-state-machine-0.6.0@sha256:3e4f8df0f6b5d415e3c8840dc75034a63e37f56f5f8cfa1035ded16345235ac4
+  - pretty-show-1.9.5@sha256:92aa3f43d8459a9b543e102fbb0b7a6aae0074e18ca6a9970d9922a867114f53
 # Override default flag values for local packages and extra-deps
 # flags: {}
 

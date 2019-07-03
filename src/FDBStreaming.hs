@@ -62,7 +62,45 @@ import           UnliftIO.Exception             ( fromEitherIO )
 -- them in the EKG stats. Doing so is helpful for learning how to optimize
 -- throughput and latency.
 lowRetries :: TransactionConfig
-lowRetries = FDB.defaultConfig { maxRetries = 3, timeout = 1000 }
+lowRetries = FDB.defaultConfig { maxRetries = 0, timeout = 500 }
+
+--TODO: we get lots of spurious timeouts because a thread will start a transaction
+-- and then starve for CPU time. This is because we start one thread per partition,
+-- and we set the number of partitions very high. At least, I think that's what's
+-- happening. It's also possible that the contention on the single FDB client
+-- thread is too high. At any rate, it seems to get better as the number of threads
+-- decreases. What we need is a way to ensure that all steps are consuming all
+-- partitions, without just spawning a thread for each one, which causes contention
+-- on multiple levels:
+-- 1. too much contention on the client thread
+-- 2. too much contention on the CPU
+-- 3. too much contention on FDB, with half-starved threads starting transactions
+--    which they won't have enough CPU time to finish in a timely manner.
+-- 4. if we have multiple independent processes for redundancy or because there
+--    are more jobs than we have cores, we need to ensure that there aren't
+--    multiple threads wasting time trying to do the same work, which only one
+--    of them can successfully commit, anyway.
+--
+-- To solve this, we need a way for threads to reserve jobs for themselves.
+-- Ideally, we'd like to ensure (optional) mutual exclusion for these jobs, so that we can
+-- make further optimizations (like not doing an FDB round-trip for every batch
+-- when performing a fold). This isn't necessarily needed for all jobs, though,
+-- such as pipe ops, where we don't want to wait until the end to send one huge
+-- transaction to the DB.
+-- The problem is as follows:
+-- 1. We have set of jobs that need to be worked on forever.
+-- 2. We have a set of processes that need to be able to quickly grab an available
+-- job to work on it for a shortish period of time.
+-- 3. Jobs are (essentially) homogeneous
+-- 4. threads are homogeneous
+-- 5. threads can die, get delayed, etc., but jobs last forever.
+-- 6. We need fairness w.r.t. job processing -- there may be fewer threads than
+--    jobs, but we still want all jobs to periodically make progress.
+-- 7. In the case where there are more threads than jobs, it would be nice if
+-- the in-use threads were evenly distributed among all machines running them.
+
+-- 3 and 4 are important -- they imply that we don't have an NP-Hard job
+-- scheduling problem.
 
 data StreamEdgeMetrics = StreamEdgeMetrics
   { messagesProcessed :: Counter
@@ -397,16 +435,16 @@ foreverLogErrors FDBStreamConfig{ useWatches } metrics sn x =
     [ Handler
       (\case
        Error (MaxRetriesExceeded (CError TransactionTimedOut)) ->
-        threadDelay 25000
+        threadDelay 15000
        CError TransactionTimedOut ->
-        threadDelay 25000
+        threadDelay 15000
        e -> throw e
       )
     , Handler
       (\case
         Error (MaxRetriesExceeded (CError NotCommitted)) -> do
           incrConflicts metrics
-          threadDelay 25000
+          threadDelay 15000
         e -> throw e
       )
 
