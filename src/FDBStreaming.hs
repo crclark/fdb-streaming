@@ -102,6 +102,10 @@ lowRetries = FDB.defaultConfig { maxRetries = 0, timeout = 500 }
 -- 3 and 4 are important -- they imply that we don't have an NP-Hard job
 -- scheduling problem.
 
+-- The answer to these problems is in the FDBStreaming.TaskLease namespace.
+-- On top of it, we built the FDBStreaming.TaskRegistry system, which is
+-- responsible for keeping a map from TaskNames to actions to run for each task.
+
 data StreamEdgeMetrics = StreamEdgeMetrics
   { messagesProcessed :: Counter
   , emptyReads :: Counter
@@ -255,6 +259,8 @@ makeTopic sn = do
   return
     $ Topic tc (return . Just)
 
+-- | Runs a stream step on a topic. This handles launching a thread for each
+-- partition of a topic for a given stream step. The thread runs forever.
 runPartitionedForever :: (MonadReader FDBStreamConfig m, MonadIO m)
                       => StreamName
                       -> Topic a
@@ -268,7 +274,8 @@ runPartitionedForever sn (Topic cfg _) run = do
     replicateM_ (threadsPerEdge scfg)
       $ void
       $ forkIO
-      $ foreverLogErrors scfg metrics sn
+      $ forever
+      $ logErrors scfg metrics sn
       $ run metrics pid
 
 instance MonadStream StreamWorker where
@@ -424,14 +431,16 @@ waitLogging w = catches (wait w)
       printf "Caught %s while watching a topic partition"
              (show e))]
 
-foreverLogErrors
+-- | The core loop body for every stream job. Throttles the job based on any
+-- errors that occur, records timing metrics.
+logErrors
   :: FDBStreamConfig
   -> Maybe StreamEdgeMetrics
   -> StreamName
   -> IO (Int, Async ())
   -> IO ()
-foreverLogErrors FDBStreamConfig{ useWatches } metrics sn x =
-  forever $ flip catches
+logErrors FDBStreamConfig{ useWatches } metrics sn x =
+  flip catches
     [ Handler
       (\case
        Error (MaxRetriesExceeded (CError TransactionTimedOut)) ->
@@ -471,6 +480,8 @@ foreverLogErrors FDBStreamConfig{ useWatches } metrics sn x =
     -- tons of messages are coming in, presumably threads will be spending more
     -- time working than waiting, and they won't be woken up together for
     -- exactly the same write.
+    -- NOTE: in practice, watches weren't notifying readers fast enough,
+    -- and the pipeline fell behind.
     -- w <- x
     -- awaitTopicOrTimeout 500 w
         --NOTE: a small delay here (<10 milliseconds) helps us do more

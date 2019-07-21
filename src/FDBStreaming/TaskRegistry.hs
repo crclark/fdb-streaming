@@ -14,7 +14,7 @@ import qualified Data.Map as M
 import FDBStreaming.TaskLease
 
 -- | A registry to store continuously-recurring tasks. Processes can ask the
--- registry to be assigned to a task. The registry is responsible for acquiring
+-- registry for a task assignment. The registry is responsible for acquiring
 -- a distributed lease for the task, ensuring exclusive access to the task
 -- across all workers.
 
