@@ -109,12 +109,12 @@ data LeaseState =
 
 deriving instance ToExpr LeaseState
 
-isLocked :: LeaseState -> Bool
-isLocked (IsLocked _) = True
-isLocked _ = False
+isLockedState :: LeaseState -> Bool
+isLockedState (IsLocked _) = True
+isLockedState _ = False
 
 isAvailable :: LeaseState -> Bool
-isAvailable = not . isLocked
+isAvailable = not . isLockedState
 
 -- | Models a set of locks. Each is either locked (True) or not, and has a
 --   lockversion. NOTE: because TaskNames are just strings, we don't even need
@@ -173,17 +173,17 @@ postcondition :: Model Concrete -> Command Concrete -> Response Concrete -> Logi
 postcondition (Model refs) cmd resp = case (cmd, resp) of
   (TryAcquireFor _ ref, Acquired _) ->
     let (Just oldLockStatus) = lookup ref refs
-      in isLocked oldLockStatus .== False .// "was unlocked before acquisition"
+      in isLockedState oldLockStatus .== False .// "was unlocked before acquisition"
   (TryAcquireFor _ ref, AlreadyLocked) ->
     let (Just oldLockStatus) = lookup ref refs
-      in isLocked oldLockStatus .== True .// "AlreadyLocked consistent"
+      in isLockedState oldLockStatus .== True .// "AlreadyLocked consistent"
   (TryAcquireFor _ _, _) -> Bot .// "Unexpected output for TryAcquireFor"
   (Deliver _ ref, Success) ->
     let (Just oldLockStatus) = lookup ref refs
-      in isLocked oldLockStatus .== True .// "locked before delivery"
+      in isLockedState oldLockStatus .== True .// "locked before delivery"
   (Deliver _ ref, Expired) ->
     let (Just oldLockStatus) = lookup ref refs
-      in isLocked oldLockStatus .== True .// "models expired locks as IsLocked"
+      in isLockedState oldLockStatus .== True .// "models expired locks as IsLocked"
   (Deliver lease ref, LeaseDNE) ->
     case lookup ref refs of
       Just (IsLocked lease') -> lease' ./= lease
@@ -200,7 +200,7 @@ postcondition (Model refs) cmd resp = case (cmd, resp) of
       Nothing -> error $ "acquired lock that DNE in Model: " ++ show taskName
   (AcquireRandom _, AlreadyLocked) ->
     let allStates = map snd refs
-        allLocked = foldr (&&) True (map isLocked allStates)
+        allLocked = foldr (&&) True (map isLockedState allStates)
         in allLocked .== True .// "AcquireRandom fails only if all are locked"
   (_, _) -> Top
 

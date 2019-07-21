@@ -24,6 +24,7 @@ library
       FDBStreaming.AggrTable,
       FDBStreaming.Message,
       FDBStreaming.TaskLease,
+      FDBStreaming.TaskRegistry,
       FDBStreaming.Topic,
       FDBStreaming.Topic.Constants,
       FDBStreaming.Joins

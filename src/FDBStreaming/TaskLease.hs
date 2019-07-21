@@ -15,7 +15,22 @@
 -- This design is based on the <https://github.com/apple/foundationdb/blob/master/layers/taskbucket/__init__.py task bucket layer>
 -- in FoundationDB.
 
-module FDBStreaming.TaskLease where
+module FDBStreaming.TaskLease (
+  TaskSpace(..),
+  taskSpace,
+  TaskID(..),
+  TaskName(..),
+  AcquiredLease(..),
+  isLeaseValid,
+  ensureTask,
+  EnsureTaskResult(..),
+  tryAcquire,
+  acquireRandom,
+  release,
+  ReleaseResult(..),
+  getTaskID,
+  isLocked
+) where
 
 import           Control.Monad.IO.Class         ( liftIO )
 import           Data.Binary.Get                ( runGet
@@ -173,6 +188,11 @@ incrAcquiredLease l taskID = do
   let k = lockVersionKey l taskID
   FDB.atomicOp k (Op.add oneLE)
 
+isLeaseValid :: TaskSpace -> TaskID -> AcquiredLease -> Transaction Bool
+isLeaseValid l taskID lease = do
+  lease' <- getAcquiredLease l taskID
+  return (lease == lease')
+
 getTaskID :: TaskSpace -> TaskName -> Transaction (Maybe TaskID)
 getTaskID (TaskSpace ss) (TaskName nm) = do
   let k = FDB.pack ss [FDB.Bytes allTasks, FDB.Bytes nm]
@@ -229,6 +249,13 @@ acquire l taskName seconds =
       FDB.set tok ""
       incrAcquiredLease l taskID
       getAcquiredLease l taskID
+
+isLocked :: TaskSpace -> TaskID -> TaskName -> Transaction Bool
+isLocked l taskID taskName = do
+  let lkk = lockedKey l taskID taskName
+  FDB.get lkk >>= FDB.await >>= \case
+    Nothing -> return False
+    Just _  -> return True
 
 tryAcquire :: TaskSpace -> TaskName -> Int -> Transaction (Maybe AcquiredLease)
 tryAcquire l taskName seconds =
