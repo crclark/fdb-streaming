@@ -5,6 +5,7 @@
 {-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedLists #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE PolyKinds #-}
@@ -15,14 +16,23 @@
 module Spec.FDBStreaming.TaskLease where
 
 import Control.Concurrent
+import Control.Concurrent.Async (async, wait)
+import Control.Monad
 import Control.Monad.IO.Class (liftIO)
 import FDBStreaming.TaskLease
+import qualified FDBStreaming.TaskRegistry as TR
 import FoundationDB (runTransaction, Database, rangeKeys, clearRange)
 import FoundationDB.Layer.Subspace
 import FoundationDB.Layer.Tuple
 import Data.Functor.Classes (Eq1)
 import Data.Kind (Type)
+import Data.IORef
+import qualified Data.Map as Map
+import Data.Maybe (isJust, isNothing)
+import Data.Foldable (foldlM)
 import Safe (headMay)
+import Test.Hspec
+import Test.HUnit.Base
 import Test.QuickCheck (Property, (===))
 import Test.QuickCheck.Gen
 import Test.QuickCheck.Monadic (monadicIO)
@@ -99,7 +109,7 @@ semantics db (AcquireRandom n) = do
   result <- runTransaction db $ acquireRandom testTaskSpace n
   case result of
     Nothing -> return AlreadyLocked
-    Just (taskName, lease) -> return (AcquiredRandom taskName lease)
+    Just (taskName, lease, _) -> return (AcquiredRandom taskName lease)
 
 data LeaseState =
   IsLocked AcquiredLease
@@ -268,7 +278,88 @@ smProp :: Database -> Property
 smProp db = forAllCommands (sm db) Nothing $ \cmds -> monadicIO $ do
   liftIO $ cleanup db
   (hist, _model, res) <- runCommands (sm db) cmds
-  --NOTE: It's not incredibly documented, but checkCommandNames is printing
+  --NOTE: It's not incredibly well documented, but checkCommandNames is printing
   --a histogram of constructors, not actual command sequences.
   prettyCommands (sm db) hist (checkCommandNames cmds (res === Ok))
+
+leaseProps :: Subspace -> Database -> SpecWith ()
+leaseProps testSS db = do
+    let taskSpace = TaskSpace testSS
+    mutualExclusion taskSpace db
+    uniformRandomness taskSpace db
+    mutualExclusionRandom taskSpace db
+
+isNewlyCreated :: EnsureTaskResult -> Bool
+isNewlyCreated (NewlyCreated _) = True
+isNewlyCreated _ = False
+
+isAlreadyExists :: EnsureTaskResult -> Bool
+isAlreadyExists (AlreadyExists _) = True
+isAlreadyExists _ = False
+
+mutualExclusion :: TaskSpace -> Database -> SpecWith ()
+mutualExclusion taskSpace db = do
+  let taskName = "testTask"
+  it "Shouldn't be acquirable when already acquired" $ do
+    res <- runTransaction db $ ensureTask taskSpace taskName
+    res `shouldSatisfy` isNewlyCreated
+    res2 <- runTransaction db $ ensureTask taskSpace taskName
+    res2 `shouldSatisfy` isAlreadyExists
+    acq <- runTransaction db $ tryAcquire taskSpace taskName 5
+    assertBool "Failed to acquire a new lock" (isJust acq)
+    acq2 <- runTransaction db $ tryAcquire taskSpace taskName 5
+    assertBool "Acquired a lock that should be locked already" (isNothing acq2)
+    threadDelay 7000000
+    acq3 <- runTransaction db $ tryAcquire taskSpace taskName 5
+    assertBool "Failed to acquire a lock that should be expired" (isJust acq3)
+    assertBool "Acquired same lease for same lock twice" (acq /= acq3)
+
+mutualExclusionRandom :: TaskSpace -> Database -> SpecWith ()
+mutualExclusionRandom taskSpace db = do
+  let taskName = "testTask2"
+  it "With only one task, acquireRandom should be equivalent to acquire" $ do
+    res <- runTransaction db $ ensureTask taskSpace taskName
+    res `shouldSatisfy` isNewlyCreated
+    acq1 <- runTransaction db $ acquireRandom taskSpace 5
+    acq1 `shouldBe` Just (taskName, AcquiredLease 1, Available)
+    acq2 <- runTransaction db $ acquireRandom taskSpace 5
+    acq2 `shouldBe` Nothing
+    threadDelay 7000000
+    acq3 <- runTransaction db $ acquireRandom taskSpace 5
+    acq3 `shouldBe` Just (taskName, AcquiredLease 2, RandomExpired)
+    acq4 <- runTransaction db $ acquireRandom taskSpace 5
+    acq4 `shouldBe` Nothing
+
+
+uniformRandomness :: TaskSpace -> Database -> SpecWith ()
+uniformRandomness (TaskSpace testSS) db =
+  it "Should acquire each task once when they each get locked" $ do
+    let taskReg = TR.empty testSS 100
+    let tasks = [ "task1"
+                , "task2"
+                , "task3"
+                , "task4"
+                , "task5"
+                , "task6"
+                , "task7"
+                , "task8"
+                , "task9"
+                , "task10"
+                ]
+    taskRunCounts <- liftIO $ newIORef (Map.fromList (zip tasks (repeat 0)))
+    let task taskName _ _ = liftIO
+                            $ void
+                            $ atomicModifyIORef
+                                taskRunCounts
+                                (\counts -> (Map.adjust succ taskName counts, ()))
+    let addTask' tr taskName = TR.addTask tr taskName (task taskName)
+
+    taskReg' <- runTransaction db
+                $ foldlM addTask' taskReg tasks
+    asyncs <- replicateM 50 (async $ TR.runRandomTask db taskReg')
+    forM_ asyncs wait
+    finalCounts <- readIORef taskRunCounts
+    finalCounts `shouldBe` Map.fromList (zip tasks (repeat 1))
+    oneMore <- TR.runRandomTask db taskReg'
+    oneMore `shouldBe` False
 

@@ -1,8 +1,9 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 module FDBStreaming.TaskRegistry  where
 
+import           Control.Concurrent (myThreadId, threadDelay)
 import           FoundationDB (Transaction)
 import qualified FoundationDB as FDB
 import           FoundationDB.Layer.Subspace (Subspace)
@@ -29,6 +30,8 @@ import FDBStreaming.TaskLease
 data TaskRegistry =
   TaskRegistry {
     taskRegistrySpace :: TaskSpace
+    -- TODO: this should be in an IORef -- addTask is effectful anyway; it's
+    -- confusing that half of it is effectful and half isn't.
     , getTaskRegistry
         :: Map TaskName
                (TaskID, Transaction Bool -> Transaction ReleaseResult -> IO ())
@@ -42,8 +45,11 @@ empty
   -> Int
       -- ^ Duration for which leases should be acquired, in seconds.
   -> TaskRegistry
-empty ss dur =
-  TaskRegistry (taskSpace $ FDB.extend ss [FDB.Bytes "TS"]) mempty dur
+empty ss =
+  TaskRegistry (taskSpace $ FDB.extend ss [FDB.Bytes "TS"]) mempty
+
+numTasks :: TaskRegistry -> Int
+numTasks = M.size . getTaskRegistry
 
 addTask
   :: TaskRegistry
@@ -64,11 +70,32 @@ addTask (TaskRegistry ts tr dur) taskName f = do
   extractID (AlreadyExists t) = t
   extractID (NewlyCreated  t) = t
 
-runRandomTask :: FDB.Database -> TaskRegistry -> IO ()
+-- | Run a random task in the task registry. If no tasks are available, returns
+-- false.
+runRandomTask :: FDB.Database -> TaskRegistry -> IO Bool
 runRandomTask db (TaskRegistry ts tr dur) =
   FDB.runTransaction db (acquireRandom ts dur) >>= \case
-    Nothing                -> return ()
-    Just (taskName, lease) -> case M.lookup taskName tr of
-      Nothing -> return () --TODO: warn? this implies tasks outside registry
-      Just (taskID, f) ->
-        f (isLeaseValid ts taskID lease) (release ts taskName lease)
+    Nothing                -> do
+      tid <- myThreadId
+      putStrLn $ show tid ++ "couldn't find an unlocked task."
+      --threadDelay (dur * 1000000 `div` 2)
+      return False
+    Just (taskName, lease, howAcquired) -> case M.lookup taskName tr of
+      Nothing -> do
+        tid <- myThreadId
+        putStrLn $ show tid ++ " found an invalid task " ++ show taskName
+                   ++ " not present in " ++ show (M.keys tr)
+        return False --TODO: warn? this implies tasks outside registry
+      Just (taskID, f) -> do
+        tid <- myThreadId
+        putStrLn $ show tid
+                   ++ " starting on task "
+                   ++ show taskName
+                   ++ " with task ID "
+                   ++ show taskID
+                   ++ " acquired by "
+                   ++ show howAcquired
+        f ((&&) <$> isLeaseValid ts taskID lease
+                <*> isLocked ts taskName)
+          (release ts taskName lease)
+        return True

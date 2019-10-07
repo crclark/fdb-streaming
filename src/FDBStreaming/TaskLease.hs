@@ -16,6 +16,7 @@
 -- in FoundationDB.
 
 module FDBStreaming.TaskLease (
+  secondsSinceEpoch,
   TaskSpace(..),
   taskSpace,
   TaskID(..),
@@ -26,6 +27,7 @@ module FDBStreaming.TaskLease (
   EnsureTaskResult(..),
   tryAcquire,
   acquireRandom,
+  HowAcquired(..),
   release,
   ReleaseResult(..),
   getTaskID,
@@ -188,6 +190,8 @@ incrAcquiredLease l taskID = do
   let k = lockVersionKey l taskID
   FDB.atomicOp k (Op.add oneLE)
 
+-- | Returns True iff the given lease is still the most recent lease for the
+-- given task. Does not check whether the lease has expired.
 isLeaseValid :: TaskSpace -> TaskID -> AcquiredLease -> Transaction Bool
 isLeaseValid l taskID lease = do
   lease' <- getAcquiredLease l taskID
@@ -231,6 +235,17 @@ ensureTask l taskName =
       let alk = allTasksKey l taskID taskName
       FDB.set alk ""
 
+-- | Clear the old timeout key for a previously locked task, if it exists.
+clearOldTimeoutKey :: TaskSpace -> TaskID -> TaskName -> Transaction ()
+clearOldTimeoutKey l taskID taskName = do
+  let lkk = lockedKey l taskID taskName
+  oldTimesOutAtBytes <- FDB.get lkk >>= FDB.await
+  case fmap parseLockedValue oldTimesOutAtBytes of
+    Nothing -> return ()
+    Just oldTimesOutAt -> do
+      let toClear = timeoutsKey l oldTimesOutAt taskName
+      FDB.clear toClear
+
 -- | Forces the acquisition of a lock, even if it was already locked. The caller
 -- is responsible for ensuring that the lock is not already locked, if such
 -- behavior is desired.
@@ -241,6 +256,7 @@ acquire l taskName seconds =
     Just taskID -> do
       currTime <- liftIO secondsSinceEpoch
       let timesOutAt = currTime + seconds
+      clearOldTimeoutKey l taskID taskName
       let lkk = lockedKey l taskID taskName
       FDB.set lkk (FDB.encodeTupleElems [FDB.Int (fromIntegral timesOutAt)])
       let avk = availableKey l taskID taskName
@@ -250,22 +266,34 @@ acquire l taskName seconds =
       incrAcquiredLease l taskID
       getAcquiredLease l taskID
 
-isLocked :: TaskSpace -> TaskID -> TaskName -> Transaction Bool
-isLocked l taskID taskName = do
-  let lkk = lockedKey l taskID taskName
-  FDB.get lkk >>= FDB.await >>= \case
+-- | Returns the time at which the lock expires, in seconds since the epoch.
+-- The time may be in the past, in which case the lock has expired.
+-- Returns Nothing if the lock has never been acquired.
+getTimesOutAt :: TaskSpace -> TaskName -> Transaction (Maybe Int)
+getTimesOutAt l taskName =
+  getTaskID l taskName >>= \case
+    Nothing -> error "impossible happened: tried to acquire nonexistent lock"
+    Just taskID ->
+      FDB.get (lockedKey l taskID taskName) >>= FDB.await >>= \case
+        Nothing -> return Nothing
+        Just timesOutAtBytes -> return $ Just $ parseLockedValue timesOutAtBytes
+
+-- | Returns true if the lease has been acquired and the current acquired lease
+-- has not expired.
+isLocked :: TaskSpace -> TaskName -> Transaction Bool
+isLocked l taskName =
+  getTimesOutAt l taskName >>= \case
     Nothing -> return False
-    Just _  -> return True
+    Just timesOutAt -> do
+      currTime <- liftIO secondsSinceEpoch
+      return (currTime <= timesOutAt)
 
 tryAcquire :: TaskSpace -> TaskName -> Int -> Transaction (Maybe AcquiredLease)
-tryAcquire l taskName seconds =
-  getTaskID l taskName >>= \case
-    Nothing -> error "tryAcquire: task does not exist"
-    Just taskID -> do
-      let avk = availableKey l taskID taskName
-      FDB.get avk >>= FDB.await >>= \case
-        Nothing -> return Nothing
-        Just _ -> Just <$> acquire l taskName seconds
+tryAcquire l taskName seconds = do
+  currentlyLocked <- isLocked l taskName
+  if currentlyLocked
+    then return Nothing
+    else Just <$> acquire l taskName seconds
 
 data ReleaseResult =
   -- | The lease was successfully released.
@@ -316,7 +344,7 @@ expiredLocks ls@(TaskSpace ss) = do
 
 acquireRandomExpired :: TaskSpace
                      -> Int
-                     -> Transaction (Maybe (TaskName,AcquiredLease))
+                     -> Transaction (Maybe (TaskName, AcquiredLease, HowAcquired))
 acquireRandomExpired l seconds = do
   expired <- FDB.withSnapshot (expiredLocks l)
   let n = length expired
@@ -325,13 +353,17 @@ acquireRandomExpired l seconds = do
             i <- liftIO $ randomRIO (0, n - 1)
             let nm = Seq.index expired i
             tv <- acquire l nm seconds
-            return $ Just (nm, tv)
+            return $ Just (nm, tv, RandomExpired)
     else return Nothing
+
+--TODO: remove when done debugging
+data HowAcquired = RandomExpired | Available
+  deriving (Show, Eq, Ord)
 
 -- | Attempt to acquire a random task. Returns the task name and lock version.
 acquireRandom :: TaskSpace
               -> Int
-              -> Transaction (Maybe (TaskName, AcquiredLease))
+              -> Transaction (Maybe (TaskName, AcquiredLease, HowAcquired))
 acquireRandom l@(TaskSpace ss) seconds = do
   --TODO: fdb task bucket uses UUIDs so it doesn't need to spend latency on this
   -- get.
@@ -354,7 +386,7 @@ acquireRandom l@(TaskSpace ss) seconds = do
     acquireAvailable k = case FDB.unpack availableSS k of
       Right [FDB.Int _tid, FDB.Bytes nm] -> do
          tv <- acquire l (TaskName nm) seconds
-         return $ Just (TaskName nm, tv)
+         return $ Just (TaskName nm, tv, Available)
       _ -> error $ "unexpected key format when acquiring lock: " ++ show k
 
     availableSS = FDB.extend ss [FDB.Bytes available]

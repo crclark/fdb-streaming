@@ -33,7 +33,6 @@ import           Control.Concurrent.STM         ( TVar
 import           Control.Exception              ( catches
                                                 , Handler(..)
                                                 , SomeException
-                                                , throw
                                                 )
 import           Data.List                      ( sortOn )
 import Data.ByteString (ByteString)
@@ -67,6 +66,7 @@ import           System.Metrics.Distribution (Distribution)
 import qualified System.Metrics.Distribution as Distribution
 import           System.Metrics.Gauge (Gauge)
 import qualified System.Metrics.Gauge as Gauge
+import           System.Random (randomRIO)
 import           System.Remote.Monitoring (forkServer, serverMetricStore)
 import System.Remote.Monitoring.Statsd (defaultStatsdOptions, forkStatsd)
 import           Text.Printf                    ( printf )
@@ -171,6 +171,10 @@ unixDiffTimeToMilliseconds :: UnixDiffTime -> Double
 unixDiffTimeToMilliseconds (UnixDiffTime (CTime secs) usecs) =
   1000.0 * (fromIntegral secs) + (fromIntegral usecs / 1000.0)
 
+withProbability :: Int -> IO () -> IO ()
+withProbability p f = do
+  r <- randomRIO (1,100)
+  when (r <= p) f
 
 awaitOrder
   :: TopicConfig
@@ -180,7 +184,7 @@ awaitOrder
   -> Gauge
   -> Order
   -> IO ()
-awaitOrder orderTopic table stats latencyDist awaitGauge order@Order{orderID} = do
+awaitOrder orderTopic table stats latencyDist awaitGauge order@Order{orderID} = withProbability 1 $ catches (do
   Gauge.inc awaitGauge
   _ <- AT.getBlocking (topicConfigDB orderTopic) table orderID
   endTime <- getUnixTime
@@ -190,6 +194,12 @@ awaitOrder orderTopic table stats latencyDist awaitGauge order@Order{orderID} = 
   let diffMillis = unixDiffTimeToMilliseconds diff
   Distribution.add latencyDist diffMillis
   Gauge.dec awaitGauge
+  )
+  [ Handler (\(e :: Error) ->
+              putStrLn $ "Caught " ++ show e ++ " while awaiting table data")
+  , Handler (\(e :: SomeException) ->
+                putStrLn $ "Caught " ++ show e ++ " while awaiting table data!")
+  ]
 
 -- | Creates a random order, pushes it onto the given topic, awaits its
 -- arrival in the given AggrTable, and updates the given latency statistics
@@ -204,21 +214,19 @@ placeAndAwaitOrders :: TopicConfig
                     -> Bool
                     -- ^ whether to watch orders to measure end_to_end_latency
                     -> IO ()
-placeAndAwaitOrders orderTopic table stats latencyDist awaitGauge batchSize shouldWatch = do
+placeAndAwaitOrders orderTopic table stats latencyDist awaitGauge batchSize shouldWatch = catches ( do
   orders <- replicateM batchSize randOrder
-  catches ( do
-    writeTopicNoRetry orderTopic (map toMessage orders)
-    r <- randomRIO (0,100)
-    when (shouldWatch && ((r :: Int) < 2))
-      $ forM_ orders $ awaitOrder orderTopic table stats latencyDist awaitGauge
-    )
-    [ Handler (\case
-                 Error (MaxRetriesExceeded (CError NotCommitted)) ->
-                   putStrLn "Caught NotCommitted when writing to topic!"
-                 e -> throw e)
-    , Handler (\(e :: SomeException) ->
-                  putStrLn $ "Caught " ++ show e ++ " while writing to topic!")
-    ]
+  writeTopicNoRetry orderTopic (map toMessage orders)
+  when shouldWatch
+    $ forM_ orders $ awaitOrder orderTopic table stats latencyDist awaitGauge
+  )
+  [ Handler (\case
+               Error (MaxRetriesExceeded (CError NotCommitted)) ->
+                 putStrLn "Caught NotCommitted when writing to topic!"
+               e -> putStrLn $ "caught fdb error " ++ show e ++ " while writing to topic")
+  , Handler (\(e :: SomeException) ->
+                putStrLn $ "Caught " ++ show e ++ " while writing to topic!")
+  ]
 
 writeTopicNoRetry :: Traversable t => TopicConfig -> t ByteString -> IO ()
 writeTopicNoRetry tc@TopicConfig {..} bss = do
@@ -326,7 +334,9 @@ mainLoop db ss Args{ generatorNumThreads
                    , streamRun
                    , useWatches
                    , printTopicStats
-                   , batchSize } = do
+                   , batchSize
+                   , useLeases
+                   , numLeaseThreads } = do
   metricsStore <- Metrics.newStore
   latencyDist <- Metrics.createDistribution "end_to_end_latency" metricsStore
   awaitedOrders <- Metrics.createGauge "waitingOrders" metricsStore
@@ -337,9 +347,9 @@ mainLoop db ss Args{ generatorNumThreads
                              , threadsPerEdge = coerce streamThreadsPerPartition
                              , useWatches = coerce useWatches
                              , msgsPerBatch = coerce batchSize
+                             , leaseDuration = 10
                              }
   let input = makeTopicConfig db ss "incoming_orders"
-  let t = topology input
   let table = getAggrTable conf "order_table"
   stats <- newTVarIO $ LatencyStats 0 1
   replicateM_ (coerce generatorNumThreads)
@@ -352,10 +362,14 @@ mainLoop db ss Args{ generatorNumThreads
                                   awaitedOrders
                                   (coerce generatorWatchResults)
   void $ forkIO $ latencyReportLoop stats
-  when (coerce streamRun) $ void $ runStreamWorker conf t
-  forever $ do
+  forkIO $ forever $ do
     when (coerce printTopicStats) $ printStats db ss
     threadDelay 1000000
+  when (coerce streamRun)
+    $ if coerce useLeases
+         then runLeaseStreamWorker (coerce numLeaseThreads) conf (topology input)
+         else runStreamWorker conf (topology input)
+
 
 cleanup :: Database -> Subspace -> IO ()
 cleanup db ss = do
@@ -375,7 +389,10 @@ data Args f = Args
   , cleanupFirst :: f Bool
   , useWatches :: f Bool
   , printTopicStats :: f Bool
-  , batchSize :: f Word8 }
+  , batchSize :: f Word8
+  , useLeases :: f Bool
+  , numLeaseThreads :: f Int
+  }
   deriving (Generic)
 
 deriving instance (forall a . Show a => Show (f a)) => Show (Args f)
@@ -396,6 +413,8 @@ applyDefaults Args{..} = Args
   , useWatches = dflt False useWatches
   , printTopicStats = dflt True printTopicStats
   , batchSize = dflt 50 batchSize
+  , useLeases = dflt False useLeases
+  , numLeaseThreads = dflt 12 numLeaseThreads
   }
 
   where dflt d x = Identity $ fromMaybe d x

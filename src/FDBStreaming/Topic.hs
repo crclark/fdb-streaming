@@ -95,7 +95,7 @@ makeTopicConfig topicConfigDB topicSS topicName = TopicConfig { .. }
   topicCountSS = FDB.extend
     topicSS
     [C.topics, Bytes topicName, C.metaCount]
-  numPartitions = 20 -- TODO: make configurable
+  numPartitions = 2 -- TODO: make configurable
 
 randPartition :: TopicConfig -> IO PartitionId
 randPartition TopicConfig {..} =

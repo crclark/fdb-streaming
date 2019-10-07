@@ -133,11 +133,13 @@ test-suite fdb-streaming-test
       Spec.FDBStreaming.TaskLease
   hs-source-dirs:
       test
-  ghc-options: -threaded -rtsopts -with-rtsopts=-N -Wall
+  ghc-options: -threaded -rtsopts -with-rtsopts=-N -Wall -g
   build-depends:
       base >=4.7 && <5
+    , async
     , fdb-streaming
     , hspec
+    , HUnit
     , foundationdb-haskell
     , containers
     , quickcheck-state-machine >= 0.6.0
