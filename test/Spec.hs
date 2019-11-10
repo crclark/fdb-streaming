@@ -28,10 +28,10 @@ main = withFoundationDB defaultOptions $
     let tc = TopicConfig db testSS
     let tn = "test"
     let testSS = subspace [Bytes "fdbstreaming-test"]
-    describe "read write" $ do
-      it "placeholder" $ do
+    describe "read write" $
+      it "placeholder" $
         1 `shouldBe` 1
-    describe "leases" $ do
+    describe "leases" $
       -- TODO: still some lingering bugs with the state machine tester, where
       -- it tries to generate sequences of commands that are impossible to
       -- carry out (like locking a task before creating it).

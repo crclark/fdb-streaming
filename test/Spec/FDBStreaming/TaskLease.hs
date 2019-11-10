@@ -13,25 +13,26 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
-module Spec.FDBStreaming.TaskLease where
+module Spec.FDBStreaming.TaskLease (
+  leaseProps
+) where
 
-import Control.Concurrent
+import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async, wait)
-import Control.Monad
+import Control.Monad (void, replicateM, forM_)
 import Control.Monad.IO.Class (liftIO)
-import FDBStreaming.TaskLease
+import FDBStreaming.TaskLease (TaskName, TaskSpace(TaskSpace), AcquiredLease, EnsureTaskResult(AlreadyExists, NewlyCreated), TaskSpace, ReleaseResult(InvalidLease, ReleaseSuccess, AlreadyExpired), TaskID(TaskID), tryAcquire, release, ensureTask, acquireRandom, AcquiredLease(AcquiredLease), HowAcquired(Available, RandomExpired))
 import qualified FDBStreaming.TaskRegistry as TR
 import FoundationDB (runTransaction, Database, rangeKeys, clearRange)
-import FoundationDB.Layer.Subspace
-import FoundationDB.Layer.Tuple
+import FoundationDB.Layer.Subspace (Subspace, subspaceRange)
 import Data.Functor.Classes (Eq1)
 import Data.Kind (Type)
-import Data.IORef
+import Data.IORef (newIORef, atomicModifyIORef, readIORef)
 import qualified Data.Map as Map
 import Data.Maybe (isJust, isNothing)
 import Data.Foldable (foldlM)
 import Safe (headMay)
-import Test.Hspec
+import Test.Hspec (SpecWith, it, shouldSatisfy, shouldBe)
 import Test.HUnit.Base
 import Test.QuickCheck (Property, (===))
 import Test.QuickCheck.Gen
@@ -45,14 +46,17 @@ import qualified Test.StateMachine.Types.Rank2 as Rank2
 update :: Eq a => a -> b -> [(a, b)] -> [(a, b)]
 update ref i m = (ref, i) : filter ((/= ref) . fst) m
 
+{-
 testSS :: Subspace
 testSS = subspace [Bytes "fdbstreaming-test"]
 
+
 testTaskSpace :: TaskSpace
 testTaskSpace = taskSpace (extend testSS [Bytes "leases-state-machine"])
+-}
 
-cleanup :: Database -> IO ()
-cleanup db = do
+cleanup :: Database -> Subspace -> IO ()
+cleanup db testSS = do
   let (begin, end) = rangeKeys $ subspaceRange testSS
   runTransaction db $ clearRange begin end
 
@@ -85,27 +89,27 @@ data Response (r :: Type -> Type)
   | TaskEnsured EnsureTaskResult
   deriving (Show, Eq, Ord, Generic1, Rank2.Foldable)
 
-semantics :: Database -> Command Concrete -> IO (Response Concrete)
-semantics db (TryAcquireFor n ref) =
+semantics :: Database -> TaskSpace -> Command Concrete -> IO (Response Concrete)
+semantics db testTaskSpace (TryAcquireFor n ref) =
   runTransaction db $ tryAcquire testTaskSpace ref n >>= \case
     Nothing    -> return AlreadyLocked
     Just lease -> return (Acquired lease)
 
-semantics db (Deliver lease ref) =
+semantics db testTaskSpace (Deliver lease ref) =
   runTransaction db $ release testTaskSpace ref lease >>= \case
     ReleaseSuccess -> return Success
     AlreadyExpired -> return Expired
     InvalidLease   -> return LeaseDNE
 
-semantics _ (PassTime n) = do
+semantics _ _ (PassTime n) = do
   threadDelay (n * 1000_000)
   return Success
 
-semantics db (EnsureTask taskName) = do
+semantics db testTaskSpace (EnsureTask taskName) = do
   result <- runTransaction db $ ensureTask testTaskSpace taskName
   return $ TaskEnsured result
 
-semantics db (AcquireRandom n) = do
+semantics db testTaskSpace (AcquireRandom n) = do
   result <- runTransaction db $ acquireRandom testTaskSpace n
   case result of
     Nothing -> return AlreadyLocked
@@ -210,7 +214,7 @@ postcondition (Model refs) cmd resp = case (cmd, resp) of
       Nothing -> error $ "acquired lock that DNE in Model: " ++ show taskName
   (AcquireRandom _, AlreadyLocked) ->
     let allStates = map snd refs
-        allLocked = foldr (&&) True (map isLockedState allStates)
+        allLocked = all isLockedState allStates
         in allLocked .== True .// "AcquireRandom fails only if all are locked"
   (_, _) -> Top
 
@@ -270,24 +274,26 @@ mock (Model refs) cmd = case cmd of
     (Just (taskName, NeverLocked)) -> return (AcquiredRandom taskName 0)
     (Just (_,IsLocked _)) -> error "impossible case in mock"
 
-sm :: Database -> StateMachine Model Command IO Response
-sm db = StateMachine initModel transition precondition postcondition
-          Nothing generator Nothing shrinker (semantics db) mock
+sm :: Database -> TaskSpace -> StateMachine Model Command IO Response
+sm db testTaskSpace =
+  StateMachine initModel transition precondition postcondition
+    Nothing generator Nothing shrinker (semantics db testTaskSpace) mock
 
-smProp :: Database -> Property
-smProp db = forAllCommands (sm db) Nothing $ \cmds -> monadicIO $ do
-  liftIO $ cleanup db
-  (hist, _model, res) <- runCommands (sm db) cmds
-  --NOTE: It's not incredibly well documented, but checkCommandNames is printing
-  --a histogram of constructors, not actual command sequences.
-  prettyCommands (sm db) hist (checkCommandNames cmds (res === Ok))
+smProp :: Database -> TaskSpace -> Property
+smProp db testTaskSpace@(TaskSpace testSS) =
+  forAllCommands (sm db testTaskSpace) Nothing $ \cmds -> monadicIO $ do
+    liftIO $ cleanup db testSS
+    (hist, _model, res) <- runCommands (sm db testTaskSpace) cmds
+    --NOTE: It's not incredibly well documented, but checkCommandNames is printing
+    --a histogram of constructors, not actual command sequences.
+    prettyCommands (sm db testTaskSpace) hist (checkCommandNames cmds (res === Ok))
 
 leaseProps :: Subspace -> Database -> SpecWith ()
 leaseProps testSS db = do
-    let taskSpace = TaskSpace testSS
-    mutualExclusion taskSpace db
-    uniformRandomness taskSpace db
-    mutualExclusionRandom taskSpace db
+    let testTaskSpace = TaskSpace testSS
+    mutualExclusion testTaskSpace db
+    uniformRandomness testTaskSpace db
+    mutualExclusionRandom testTaskSpace db
 
 isNewlyCreated :: EnsureTaskResult -> Bool
 isNewlyCreated (NewlyCreated _) = True
@@ -298,36 +304,36 @@ isAlreadyExists (AlreadyExists _) = True
 isAlreadyExists _ = False
 
 mutualExclusion :: TaskSpace -> Database -> SpecWith ()
-mutualExclusion taskSpace db = do
+mutualExclusion testTaskSpace db = do
   let taskName = "testTask"
   it "Shouldn't be acquirable when already acquired" $ do
-    res <- runTransaction db $ ensureTask taskSpace taskName
+    res <- runTransaction db $ ensureTask testTaskSpace taskName
     res `shouldSatisfy` isNewlyCreated
-    res2 <- runTransaction db $ ensureTask taskSpace taskName
+    res2 <- runTransaction db $ ensureTask testTaskSpace taskName
     res2 `shouldSatisfy` isAlreadyExists
-    acq <- runTransaction db $ tryAcquire taskSpace taskName 5
+    acq <- runTransaction db $ tryAcquire testTaskSpace taskName 5
     assertBool "Failed to acquire a new lock" (isJust acq)
-    acq2 <- runTransaction db $ tryAcquire taskSpace taskName 5
+    acq2 <- runTransaction db $ tryAcquire testTaskSpace taskName 5
     assertBool "Acquired a lock that should be locked already" (isNothing acq2)
     threadDelay 7000000
-    acq3 <- runTransaction db $ tryAcquire taskSpace taskName 5
+    acq3 <- runTransaction db $ tryAcquire testTaskSpace taskName 5
     assertBool "Failed to acquire a lock that should be expired" (isJust acq3)
     assertBool "Acquired same lease for same lock twice" (acq /= acq3)
 
 mutualExclusionRandom :: TaskSpace -> Database -> SpecWith ()
-mutualExclusionRandom taskSpace db = do
+mutualExclusionRandom testTaskSpace db = do
   let taskName = "testTask2"
   it "With only one task, acquireRandom should be equivalent to acquire" $ do
-    res <- runTransaction db $ ensureTask taskSpace taskName
+    res <- runTransaction db $ ensureTask testTaskSpace taskName
     res `shouldSatisfy` isNewlyCreated
-    acq1 <- runTransaction db $ acquireRandom taskSpace 5
+    acq1 <- runTransaction db $ acquireRandom testTaskSpace 5
     acq1 `shouldBe` Just (taskName, AcquiredLease 1, Available)
-    acq2 <- runTransaction db $ acquireRandom taskSpace 5
+    acq2 <- runTransaction db $ acquireRandom testTaskSpace 5
     acq2 `shouldBe` Nothing
     threadDelay 7000000
-    acq3 <- runTransaction db $ acquireRandom taskSpace 5
+    acq3 <- runTransaction db $ acquireRandom testTaskSpace 5
     acq3 `shouldBe` Just (taskName, AcquiredLease 2, RandomExpired)
-    acq4 <- runTransaction db $ acquireRandom taskSpace 5
+    acq4 <- runTransaction db $ acquireRandom testTaskSpace 5
     acq4 `shouldBe` Nothing
 
 
@@ -346,12 +352,12 @@ uniformRandomness (TaskSpace testSS) db =
                 , "task9"
                 , "task10"
                 ]
-    taskRunCounts <- liftIO $ newIORef (Map.fromList (zip tasks (repeat 0)))
+    taskRunCounts <- liftIO $ newIORef (Map.fromList (zip tasks (repeat (0 :: Int))))
     let task taskName _ _ = liftIO
                             $ void
                             $ atomicModifyIORef
                                 taskRunCounts
-                                (\counts -> (Map.adjust succ taskName counts, ()))
+                                (\n -> (Map.adjust succ taskName n, ()))
     let addTask' tr taskName = TR.addTask tr taskName (task taskName)
 
     taskReg' <- runTransaction db

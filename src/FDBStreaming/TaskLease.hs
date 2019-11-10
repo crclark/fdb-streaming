@@ -40,7 +40,7 @@ import           Data.Binary.Get                ( runGet
                                                 )
 import           Data.ByteString                ( ByteString )
 import           Data.ByteString.Lazy           ( fromStrict )
-import           Data.Sequence                  ( Seq(..))
+import           Data.Sequence                  ( Seq )
 import qualified Data.Sequence                  as Seq
 import           Data.String                    ( IsString )
 import           Data.Word                      ( Word64 )

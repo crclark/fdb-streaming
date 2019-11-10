@@ -423,5 +423,7 @@ main :: IO ()
 main = withFoundationDB defaultOptions $ \db -> do
   args@Args {subspaceName, cleanupFirst} <- applyDefaults <$> getRecord "stream test"
   let ss = FDB.subspace [FDB.Bytes (runIdentity subspaceName)]
+  --TODO: cleanup can time out in some circumstances, which crashes the program
+  --since there's no exception handler on this call.
   when (runIdentity cleanupFirst) $ cleanup db ss
   mainLoop db ss args

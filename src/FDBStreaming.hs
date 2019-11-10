@@ -9,30 +9,39 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE BlockArguments #-}
 
-module FDBStreaming where
+module FDBStreaming (
+  existing,
+  produce,
+  atLeastOnce,
+  pipe,
+  oneToOneJoin,
+  groupBy,
+  aggregate,
+  benignIO,
+  runLeaseStreamWorker
+) where
 
 import qualified FDBStreaming.AggrTable        as AT
-import           FDBStreaming.Message           ( Message(..) )
-import           FDBStreaming.TaskLease        (TaskName(..), secondsSinceEpoch)
-import           FDBStreaming.TaskRegistry     as TaskRegistry
-import           FDBStreaming.Topic
+import           FDBStreaming.Message           ( Message(fromMessage, toMessage) )
+import           FDBStreaming.TaskLease        (TaskName(TaskName), secondsSinceEpoch)
+import           FDBStreaming.TaskRegistry     as TaskRegistry (empty
+                                                               , TaskRegistry
+                                                               , taskRegistryLeaseDuration
+                                                               , addTask
+                                                               , runRandomTask)
+import           FDBStreaming.Topic (TopicConfig(numPartitions), PartitionId, ReaderName, makeTopicConfig, readNAndCheckpoint', randPartition, writeTopic', watchPartition)
 import qualified FDBStreaming.Topic.Constants  as C
-import           FDBStreaming.Joins
+import           FDBStreaming.Joins (get1to1JoinData, delete1to1JoinData, write1to1JoinData)
 
-import           Control.Concurrent
+import           Control.Concurrent ( myThreadId, threadDelay)
 import           Control.Concurrent.Async       ( Async
                                                 , async
                                                 , wait
                                                 , waitAny
                                                 )
-import           Control.Exception
-import           Control.Monad
-import           Control.Monad.IO.Class
-import           Control.Monad.Reader           ( MonadReader
-                                                , ReaderT
-                                                , ask
-                                                , runReaderT
-                                                )
+import           Control.Exception (SomeException, catches, catch, Handler(Handler), throw)
+import           Control.Monad (forM, forM_, forever, when, void, replicateM)
+import           Control.Monad.IO.Class (MonadIO, liftIO)
 import qualified Control.Monad.State.Strict as State
 import           Control.Monad.State.Strict     ( MonadState
                                                 , StateT
@@ -43,14 +52,14 @@ import           Data.ByteString                ( ByteString )
 import qualified Data.ByteString.Char8 as BS8
 import           Data.Foldable                  ( toList )
 
-import           Data.Sequence                  ( Seq(..) )
+import           Data.Sequence                  ( Seq() )
 import qualified Data.Sequence                 as Seq
 import           Data.Text.Encoding             ( decodeUtf8 )
 import           Data.Witherable                ( catMaybes )
-import           FoundationDB                  as FDB
-import           FoundationDB.Error            as FDB
-import           FoundationDB.Layer.Subspace   as FDB
-import           FoundationDB.Layer.Tuple      as FDB
+import           FoundationDB                  as FDB ( Transaction, Database, FutureIO, runTransaction, awaitIO, withSnapshot, await)
+import           FoundationDB.Error            as FDB (FDBHsError(MaxRetriesExceeded), Error(Error,CError), CError(TransactionTimedOut, NotCommitted))
+import qualified FoundationDB.Layer.Subspace   as FDB
+import qualified FoundationDB.Layer.Tuple      as FDB
 import           Data.Word                      ( Word8 )
 import           System.Clock                   ( Clock(Monotonic)
                                                 , diffTimeSpec
@@ -62,60 +71,11 @@ import           System.Metrics.Counter         ( Counter )
 import           System.Metrics.Distribution    ( Distribution )
 import qualified System.Metrics.Counter        as Counter
 import qualified System.Metrics.Distribution   as Distribution
-import           Text.Printf
+import           Text.Printf                    (printf)
 import           UnliftIO.Exception             ( fromEitherIO )
 
-
--- | We limit the number of retries so we can catch conflict errors and record
--- them in the EKG stats. Doing so is helpful for learning how to optimize
--- throughput and latency.
-lowRetries :: TransactionConfig
-lowRetries = FDB.defaultConfig { maxRetries = 0, timeout = 500 }
-
---TODO: we get lots of spurious timeouts because a thread will start a transaction
--- and then starve for CPU time. This is because we start one thread per partition,
--- and we set the number of partitions very high. At least, I think that's what's
--- happening. It's also possible that the contention on the single FDB client
--- thread is too high. At any rate, it seems to get better as the number of threads
--- decreases. What we need is a way to ensure that all steps are consuming all
--- partitions, without just spawning a thread for each one, which causes contention
--- on multiple levels:
--- 1. too much contention on the client thread
--- 2. too much contention on the CPU
--- 3. too much contention on FDB, with half-starved threads starting transactions
---    which they won't have enough CPU time to finish in a timely manner.
--- 4. if we have multiple independent processes for redundancy or because there
---    are more jobs than we have cores, we need to ensure that there aren't
---    multiple threads wasting time trying to do the same work, which only one
---    of them can successfully commit, anyway.
---
--- To solve this, we need a way for threads to reserve jobs for themselves.
--- Ideally, we'd like to ensure (optional) mutual exclusion for these jobs, so that we can
--- make further optimizations (like not doing an FDB round-trip for every batch
--- when performing a fold). This isn't necessarily needed for all jobs, though,
--- such as pipe ops, where we don't want to wait until the end to send one huge
--- transaction to the DB.
--- The problem is as follows:
--- 1. We have set of jobs that need to be worked on forever.
--- 2. We have a set of processes that need to be able to quickly grab an available
--- job to work on it for a shortish period of time.
--- 3. Jobs are (essentially) homogeneous
--- 4. threads are homogeneous
--- 5. threads can die, get delayed, etc., but jobs last forever.
--- 6. We need fairness w.r.t. job processing -- there may be fewer threads than
---    jobs, but we still want all jobs to periodically make progress.
--- 7. In the case where there are more threads than jobs, it would be nice if
--- the in-use threads were evenly distributed among all machines running them.
-
--- 3 and 4 are important -- they imply that we don't have an NP-Hard job
--- scheduling problem.
-
--- The answer to these problems is in the FDBStreaming.TaskLease namespace.
--- On top of it, we built the FDBStreaming.TaskRegistry system, which is
--- responsible for keeping a map from TaskNames to actions to run for each task.
-
 data StreamEdgeMetrics = StreamEdgeMetrics
-  { messagesProcessed :: Counter
+  { _messagesProcessed :: Counter
   , emptyReads :: Counter
   , batchLatency :: Distribution
   , messagesPerBatch :: Distribution
@@ -174,7 +134,7 @@ data GroupedBy k v = GroupedBy (Topic v) (v -> [k])
 -- (and worse, our MonadStream interface).
 data Topic a = forall b . Message b => Topic
   { getTopicConfig :: TopicConfig
-  , topicMapFilter :: b -> IO (Maybe a) }
+  , _topicMapFilter :: b -> IO (Maybe a) }
 
 instance Functor Topic where
   fmap g (Topic c f) = Topic c (fmap (fmap g) . f)
@@ -183,7 +143,7 @@ instance Functor Topic where
 -- stream is consumed downstream. Return 'Nothing' to filter the stream. Side
 -- effects here should be benign and relatively cheap -- they could be run many
 -- times for the same input.
-benignIO :: forall a b . (Message a, Message b) => (a -> IO (Maybe b)) -> Topic a -> Topic b
+benignIO :: (a -> IO (Maybe b)) -> Topic a -> Topic b
 benignIO g (Topic cfg (f :: c -> IO (Maybe a))) =
   Topic cfg $ \(x :: c) -> do
     y <- f x
@@ -192,6 +152,7 @@ benignIO g (Topic cfg (f :: c -> IO (Maybe a))) =
       Just z -> g z
 
 class Monad m => MonadStream m where
+  -- | Read messages from an existing Topic.
   existing :: Message a => TopicConfig -> m (Topic a)
   existing tc = return (Topic tc (return . Just))
 
@@ -214,6 +175,8 @@ class Monad m => MonadStream m where
   -- | Produce a side effect at least once for each message in the stream.
   -- In practice, this will _usually_ be more than once in the current
   -- implementation, if running multiple instances of the processor.
+  -- NOTE: if using the new lease-based processor, this will usually just be
+  -- once.
   atLeastOnce :: Message a => StreamName -> Topic a -> (a -> IO ()) -> m ()
   pipe :: (Message a, Message b)
        => StreamName
@@ -247,21 +210,14 @@ class Monad m => MonadStream m where
   -- TODO: maybe consolidate TableValue and TableSemigroup
   -- TODO: if we're exporting helpers anyway, maybe no need for classes
   -- at all.
-  aggregate :: (Message v, Message k, AT.TableValue aggr, AT.TableSemigroup aggr)
+  aggregate :: (Message v, Message k, AT.TableSemigroup aggr)
             => StreamName
             -> GroupedBy k v
             -> (v -> aggr)
             -> m (AT.AggrTable k aggr)
 
--- TODO: better name
-newtype StreamWorker a = StreamWorker { unStreamWorker :: ReaderT FDBStreamConfig IO a}
-  deriving (Functor, Applicative, Monad, MonadReader FDBStreamConfig, MonadIO)
-
 class HasStreamConfig m where
   getStreamConfig :: m FDBStreamConfig
-
-instance HasStreamConfig StreamWorker where
-  getStreamConfig = ask
 
 makeTopic :: (Message a, HasStreamConfig m, Monad m)
           => StreamName
@@ -275,25 +231,6 @@ makeTopic sn = do
 forEachPartition :: Monad m => Topic a -> (PartitionId -> m ()) -> m ()
 forEachPartition (Topic cfg _) = forM_ [0 .. numPartitions cfg - 1]
 
--- | Runs a stream step on a topic. This handles launching a thread for each
--- partition of a topic for a given stream step. The thread runs forever.
-runPartitionedForever :: (HasStreamConfig m, MonadIO m)
-                      => StreamName
-                      -> Topic a
-                      -> (Maybe StreamEdgeMetrics -> PartitionId -> FDB.Transaction (Int, Async (), Maybe b))
-                      -> m ()
-runPartitionedForever sn topic run = do
-  scfg <- getStreamConfig
-  metrics <- registerStepMetrics sn
-  liftIO $ putStrLn $ "starting " ++ show sn
-  liftIO $ forEachPartition topic $ \pid ->
-    replicateM_ (threadsPerEdge scfg)
-      $ forkIO
-      $ forever
-      $ logErrors scfg metrics sn
-      $ FDB.runTransactionWithConfig lowRetries (streamConfigDB scfg)
-      $ run metrics pid
-
 -- This mess is caused by the ball of mud that is logErrors. For
 -- LeaseBasedStreamWorker, we need to pass through an extra value indicating
 -- whether the lease is still valid, so the crazy IO action passed to logErrrors
@@ -302,77 +239,6 @@ runPartitionedForever sn topic run = do
 -- TODO: refactor logErrors into smaller pieces so we can avoid this mess.
 withNothing :: (a,b) -> (a,b, Maybe c)
 withNothing (x,y) = (x,y, Nothing)
-
-instance MonadStream StreamWorker where
-
-  produce sn m = do
-    t <- makeTopic sn
-    let tc = getTopicConfig t
-    FDBStreamConfig{msgsPerBatch} <- getStreamConfig
-    runPartitionedForever sn t (\_ _ -> withNothing <$> produceStep msgsPerBatch tc m)
-    return t
-
-  atLeastOnce sn inTopic step = do
-    cfg <- getStreamConfig
-    runPartitionedForever sn inTopic (\sm pid -> withNothing <$> consumeStep cfg inTopic sn step sm pid)
-
-  pipe sn inTopic step = do
-    cfg <- getStreamConfig
-    outTopic <- makeTopic sn
-    let outCfg = getTopicConfig outTopic
-    runPartitionedForever sn inTopic (\sm pid -> withNothing <$> pipeStep cfg inTopic outCfg sn step sm pid)
-    return outTopic
-
-  oneToOneJoin sn lt rt pl pr c = do
-    cfg <- getStreamConfig
-    outTopic <- makeTopic sn
-    let outCfg = getTopicConfig outTopic
-    let lCheckpointName = sn <> "0"
-    let rCheckpointName = sn <> "1"
-    runPartitionedForever lCheckpointName
-                          lt
-                          (\sm pid -> withNothing
-                                      <$> oneToOneJoinStep cfg
-                                                           sn
-                                                           lCheckpointName
-                                                           lt
-                                                           0
-                                                           outCfg
-                                                           pl
-                                                           c
-                                                           sm
-                                                           pid)
-    runPartitionedForever rCheckpointName
-                          rt
-                          (\sm pid -> withNothing
-                                      <$> oneToOneJoinStep cfg
-                                                           sn
-                                                           rCheckpointName
-                                                           rt
-                                                           1
-                                                           outCfg
-                                                           pr
-                                                           (flip c)
-                                                           sm
-                                                           pid)
-    return outTopic
-
-  groupBy k t = return (GroupedBy t k)
-
-  aggregate sn groupedBy@(GroupedBy inTopic _) toAggr = do
-    cfg <- ask
-    let table = getAggrTable cfg sn
-    runPartitionedForever sn inTopic (\sm pid -> withNothing <$> aggregateStep cfg sn groupedBy toAggr sm pid)
-    return table
-
--- | TODO: block on all threads that this spawned using waitAny
--- (like LeaseBasedStreamWorker below). This allows us to die if any worker
--- thread does (because we should always catch all possible errors in the
--- worker threads).
-runStreamWorker :: FDBStreamConfig -> StreamWorker a -> IO ()
-runStreamWorker cfg f = do
-  flip runReaderT cfg $ unStreamWorker f
-  threadDelay maxBound
 
 -- | An implementation of the streaming system that uses a distributed lease to
 -- ensure mutual exclusion for each worker process. This reduces DB conflicts
@@ -392,14 +258,14 @@ taskRegistry = snd <$> State.get
 -- Both transactions are run in one larger transaction, to ensure correctness.
 -- Unfortunately, the performance overhead of this was too great at the time
 -- of this writing, and the pipeline eventually falls behind.
-doWhileValid :: Database
+_doWhileValid :: Database
                        -> FDBStreamConfig
                        -> Maybe StreamEdgeMetrics
                        -> StreamName
                        -> Transaction Bool
                        -> Transaction (Int, Async ())
                        -> IO ()
-doWhileValid db streamCfg metrics sn stillValid action = do
+_doWhileValid db streamCfg metrics sn stillValid action = do
   wasValidMaybe <- logErrors streamCfg metrics sn $ runTransaction db $
     stillValid >>= \case
       True -> do
@@ -412,9 +278,9 @@ doWhileValid db streamCfg metrics sn stillValid action = do
         return (0, f, Just False)
   case wasValidMaybe of
     Just wasValid -> when wasValid
-                     $ doWhileValid db streamCfg metrics sn stillValid action
+                     $ _doWhileValid db streamCfg metrics sn stillValid action
     -- Nothing means an exception was thrown; try again.
-    Nothing -> doWhileValid db streamCfg metrics sn stillValid action
+    Nothing -> _doWhileValid db streamCfg metrics sn stillValid action
 
 -- | Like doWhileValid, but doesn't transactionally check that the lease is
 -- still good -- just uses the system clock to approximately run as long as we
@@ -429,6 +295,9 @@ doForSeconds n f = do
               when (currTime <= startTime + n) (f >> go)
   go
 
+
+mkTaskName :: StreamName -> PartitionId -> TaskName
+mkTaskName sn pid = TaskName $ BS8.pack (show sn ++ "_" ++ show pid)
 
 instance MonadStream LeaseBasedStreamWorker where
 
@@ -451,16 +320,16 @@ instance MonadStream LeaseBasedStreamWorker where
 
   atLeastOnce sn inTopic step = do
     cfg@FDBStreamConfig{streamConfigDB} <- getStreamConfig
-    taskReg <- taskRegistry
+    leaseDuration <- taskRegistryLeaseDuration <$> taskRegistry
     metrics <- registerStepMetrics sn
-    let job pid stillValid _release = doForSeconds (taskRegistryLeaseDuration taskReg)
-                                       $ void
-                                       $ logErrors cfg metrics sn
-                                       $ runTransaction streamConfigDB
-                                       $ withNothing
-                                       <$> consumeStep cfg inTopic sn step metrics pid
+    let job pid _stillValid _release = doForSeconds leaseDuration
+                                        $ void
+                                        $ logErrors cfg metrics sn
+                                        $ runTransaction streamConfigDB
+                                        $ withNothing
+                                        <$> consumeStep cfg inTopic sn step metrics pid
     forEachPartition inTopic $ \pid -> do
-      let taskName = TaskName $ BS8.pack (show sn ++ "_" ++ show pid)
+      let taskName = mkTaskName sn pid
       taskReg <- taskRegistry
       taskReg' <- liftIO
                   $ runTransaction streamConfigDB
@@ -469,18 +338,18 @@ instance MonadStream LeaseBasedStreamWorker where
 
   pipe sn inTopic step = do
     cfg@FDBStreamConfig{streamConfigDB} <- getStreamConfig
-    taskReg <- taskRegistry
+    leaseDuration <- taskRegistryLeaseDuration <$> taskRegistry
     outTopic <- makeTopic sn
     metrics <- registerStepMetrics sn
     let outCfg = getTopicConfig outTopic
-    let job pid stillValid _release = doForSeconds (taskRegistryLeaseDuration taskReg)
-                                       $ void
-                                       $ logErrors cfg metrics sn
-                                       $ runTransaction streamConfigDB
-                                       $ withNothing
-                                       <$> pipeStep cfg inTopic outCfg sn step metrics pid
+    let job pid _stillValid _release = doForSeconds leaseDuration
+                                        $ void
+                                        $ logErrors cfg metrics sn
+                                        $ runTransaction streamConfigDB
+                                        $ withNothing
+                                        <$> pipeStep cfg inTopic outCfg sn step metrics pid
     forEachPartition inTopic $ \pid -> do
-      let taskName = TaskName $ BS8.pack (show sn ++ "_" ++ show pid)
+      let taskName = mkTaskName sn pid
       taskReg <- taskRegistry
       taskReg' <- liftIO
                   $ runTransaction streamConfigDB
@@ -490,21 +359,21 @@ instance MonadStream LeaseBasedStreamWorker where
 
   oneToOneJoin sn lt rt pl pr c = do
     cfg@FDBStreamConfig{streamConfigDB} <- getStreamConfig
-    taskReg <- taskRegistry
+    leaseDuration <- taskRegistryLeaseDuration <$> taskRegistry
     outTopic <- makeTopic sn
     let outCfg = getTopicConfig outTopic
     metrics <- registerStepMetrics sn
     let lname = sn <> "0"
     let rname = sn <> "1"
-    let ljob pid stillValid _release =
-          doForSeconds (taskRegistryLeaseDuration taskReg)
+    let ljob pid _stillValid _release =
+          doForSeconds leaseDuration
           $ void
           $ logErrors cfg metrics sn
           $ runTransaction streamConfigDB
           $ withNothing
           <$> oneToOneJoinStep cfg sn lname lt 0 outCfg pl c metrics pid
-    let rjob pid stillValid _release =
-          doForSeconds (taskRegistryLeaseDuration taskReg)
+    let rjob pid _stillValid _release =
+          doForSeconds leaseDuration
           $ void
           $ logErrors cfg metrics sn
           $ runTransaction streamConfigDB
@@ -530,15 +399,15 @@ instance MonadStream LeaseBasedStreamWorker where
 
   aggregate sn groupedBy@(GroupedBy inTopic _) toAggr = do
     cfg@FDBStreamConfig{streamConfigDB} <- getStreamConfig
-    taskReg <- taskRegistry
+    leaseDuration <- taskRegistryLeaseDuration <$> taskRegistry
     let table = getAggrTable cfg sn
     metrics <- registerStepMetrics sn
-    let job pid stillValid _release = doForSeconds (taskRegistryLeaseDuration taskReg)
-                                      $ void
-                                      $ logErrors cfg metrics sn
-                                      $ runTransaction streamConfigDB
-                                      $ withNothing
-                                      <$> aggregateStep cfg sn groupedBy toAggr metrics pid
+    let job pid _stillValid _release = doForSeconds leaseDuration
+                                       $ void
+                                       $ logErrors cfg metrics sn
+                                       $ runTransaction streamConfigDB
+                                       $ withNothing
+                                       <$> aggregateStep cfg sn groupedBy toAggr metrics pid
     forEachPartition inTopic $ \pid -> do
       taskReg <- taskRegistry
       let taskName = TaskName $ BS8.pack (show sn ++ "_" ++ show pid)
@@ -558,12 +427,14 @@ registerAllLeases cfg =
 
 runLeaseStreamWorker :: Int -> FDBStreamConfig -> LeaseBasedStreamWorker a -> IO ()
 runLeaseStreamWorker numThreads cfg topology = do
-  (pureResult, taskReg) <- registerAllLeases cfg topology
-  threads <- replicateM numThreads $ async $ forever $ do
+  -- TODO: need a way for user to get the pure result of their topology. Need
+  -- a pure runner or something.
+  (_pureResult, taskReg) <- registerAllLeases cfg topology
+  threads <- replicateM numThreads $ async $ forever $
     runRandomTask (streamConfigDB cfg) taskReg >>= \case
       False -> threadDelay (taskRegistryLeaseDuration taskReg * 1000000 `div` 2)
       True -> return ()
-  waitAny threads
+  _ <- waitAny threads
   return ()
 
 -- TODO: need to think about grouping and windowing. Windowing appears to be a
@@ -616,8 +487,7 @@ runLeaseStreamWorker numThreads cfg topology = do
 -- value of 'ReaderName' is guaranteed to never receive the same messages again
 -- in subsequent calls to this function.
 readPartitionBatchExactlyOnce
-  :: Message a
-  => Topic a
+  :: Topic a
   -> Maybe StreamEdgeMetrics
   -> ReaderName
   -> PartitionId
@@ -633,7 +503,7 @@ readPartitionBatchExactlyOnce (Topic outCfg mapFilter) metrics rn pid n = do
 
 getAggrTable :: FDBStreamConfig -> StreamName -> AT.AggrTable k v
 getAggrTable sc sn = AT.AggrTable
-  $ extend (streamConfigSS sc) [C.topics, Bytes sn, C.aggrTable]
+  $ FDB.extend (streamConfigSS sc) [C.topics, FDB.Bytes sn, C.aggrTable]
 
 -- TODO: other persistence backends
 -- TODO: should probably rename to TopologyConfig
@@ -642,7 +512,6 @@ data FDBStreamConfig = FDBStreamConfig
   , streamConfigSS :: FDB.Subspace
   -- ^ subspace that will contain all state for the stream topology
   , streamMetricsStore :: Maybe Metrics.Store
-  , threadsPerEdge :: Int
   , useWatches :: Bool
   -- ^ If true, use FDB watches to wait for new messages in each worker thread.
   -- Otherwise, read continuously, sleeping for a short time if no new messages
@@ -764,8 +633,7 @@ produceStep batchSize outCfg step = do
   w <- liftIO $ async $ return ()
   return (length xs, w)
 
-consumeStep :: Message a
-            => FDBStreamConfig
+consumeStep :: FDBStreamConfig
             -> Topic a
             -> StreamName
             -> (a -> IO ())
@@ -786,7 +654,7 @@ consumeStep FDBStreamConfig{ useWatches, msgsPerBatch }
         w' <- liftIO $ mfutureToAsync $ Just w
         return (length xs, w')
 
-pipeStep :: (Message a, Message b)
+pipeStep :: Message b
          => FDBStreamConfig
          -> Topic a
          -> TopicConfig
@@ -879,7 +747,7 @@ oneToOneJoinStep FDBStreamConfig{ streamConfigSS
     w' <- liftIO $ mfutureToAsync w
     return (length lMsgs, w')
 
-aggregateStep :: forall v k aggr . (Message v, Message k, AT.TableValue aggr, AT.TableSemigroup aggr)
+aggregateStep :: forall v k aggr . (Message k, AT.TableSemigroup aggr)
               => FDBStreamConfig
               -> StreamName
               -> GroupedBy k v

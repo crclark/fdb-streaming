@@ -1,9 +1,17 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE LambdaCase #-}
 
-module FDBStreaming.AggrTable where
+module FDBStreaming.AggrTable (
+  AggrTable(..),
+  TableValue(..),
+  getBlocking,
+  TableSemigroup(..),
+  setVia,
+  getVia,
+  mappendAtomicVia
+) where
 
-import FDBStreaming.Message (Message(..))
+import FDBStreaming.Message (Message(toMessage))
 
 import Data.Binary.Get (runGet,
                         getWord8,
@@ -24,13 +32,13 @@ import Data.Binary.Put (runPut,
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (fromStrict, toStrict)
 import Data.Int (Int8, Int16, Int32, Int64)
-import Data.Monoid (Sum(..), All(..))
+import Data.Monoid (Sum(Sum, getSum), All(All, getAll))
 import Data.Word (Word8, Word16, Word32, Word64)
 
 import qualified FoundationDB as FDB
 import qualified FoundationDB.Options as Op
 import qualified FoundationDB.Layer.Subspace as SS
-import FoundationDB.Layer.Tuple
+import qualified FoundationDB.Layer.Tuple as FDB
 
 newtype AggrTable k v = AggrTable {
   aggrTableSS :: SS.Subspace
@@ -52,7 +60,7 @@ getBlocking :: (TableValue v, Message k)
 getBlocking db at k = do
   result <- FDB.runTransaction db $ get at k >>= FDB.await >>= \case
     Nothing -> do
-      let kbs = SS.pack (aggrTableSS at) [Bytes (toMessage k)]
+      let kbs = SS.pack (aggrTableSS at) [FDB.Bytes (toMessage k)]
       Left <$> FDB.watch kbs
     Just v -> return (Right v)
   case result of
@@ -69,7 +77,7 @@ class (Semigroup v, TableValue v) => TableSemigroup v where
 setVia :: Message k
        => (v -> ByteString) -> AggrTable k v -> k -> v -> FDB.Transaction ()
 setVia f t k v = do
-  let kbs = SS.pack (aggrTableSS t) [Bytes (toMessage k)]
+  let kbs = SS.pack (aggrTableSS t) [FDB.Bytes (toMessage k)]
   let vbs = f v
   FDB.set kbs vbs
 
@@ -79,7 +87,7 @@ getVia :: Message k
        -> k
        -> FDB.Transaction (FDB.Future (Maybe v))
 getVia f t k = do
-  let kbs = SS.pack (aggrTableSS t) [Bytes (toMessage k)]
+  let kbs = SS.pack (aggrTableSS t) [FDB.Bytes (toMessage k)]
   fmap (fmap f) <$> FDB.get kbs
 
 mappendAtomicVia :: Message k
@@ -90,7 +98,7 @@ mappendAtomicVia :: Message k
                  -> v
                  -> FDB.Transaction ()
 mappendAtomicVia f op t k v = do
-  let kbs = SS.pack (aggrTableSS t) [Bytes (toMessage k)]
+  let kbs = SS.pack (aggrTableSS t) [FDB.Bytes (toMessage k)]
   let vbs = f v
   FDB.atomicOp kbs (op vbs)
 
