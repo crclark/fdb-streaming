@@ -4,14 +4,32 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 
-module FDBStreaming.Topic where
+module FDBStreaming.Topic (
+  TopicName,
+  ReaderName,
+  PartitionId,
+  TopicConfig(..),
+  makeTopicConfig,
+  randPartition,
+  watchPartition,
+  readNAndCheckpoint,
+  readNAndCheckpoint',
+  writeTopic,
+  writeTopic',
+  getPartitionCount,
+  getTopicCount,
+  listExistingTopics,
+  watchTopic,
+  watchTopic',
+  awaitTopicOrTimeout
+) where
 
 import           Control.Concurrent             ( threadDelay )
 import           Control.Concurrent.Async       ( async
                                                 , race
                                                 , waitAny
                                                 )
-import           Control.Monad
+import           Control.Monad (void, guard, forM)
 import           Data.Binary.Get                ( runGet
                                                 , getWord64le
                                                 )
@@ -21,15 +39,16 @@ import           Data.ByteString                ( ByteString )
 import           Data.ByteString.Lazy           ( fromStrict, toStrict )
 import           Data.Foldable                  ( foldlM )
 import           Data.Maybe                     ( fromMaybe )
-import           Data.Sequence                  ( Seq(..) )
+import           Data.Sequence                  ( Seq((:|>)) )
 import           Data.Word                      ( Word8
                                                 , Word16
                                                 , Word64
                                                 )
-import           FoundationDB                  as FDB
+import qualified FoundationDB as FDB
+import           FoundationDB                  as FDB (Transaction, Database, atomicOp, FutureIO, Range(Range), runTransaction, getKey, KeySelector(FirstGreaterThan, FirstGreaterOrEq), await, watch, awaitIO, withSnapshot)
 import qualified FoundationDB.Options          as Op
-import           FoundationDB.Layer.Subspace   as FDB
-import           FoundationDB.Layer.Tuple      as FDB
+import  qualified FoundationDB.Layer.Subspace   as FDB
+import qualified  FoundationDB.Layer.Tuple      as FDB
 -- TODO: move prefixRangeEnd out of Advanced usage section.
 import           FoundationDB.Transaction       ( prefixRangeEnd )
 import           FoundationDB.Versionstamp      ( Versionstamp
@@ -37,20 +56,17 @@ import           FoundationDB.Versionstamp      ( Versionstamp
                                                   , IncompleteVersionstamp
                                                   )
                                                 , encodeVersionstamp
-                                                , TransactionVersionstamp(..)
-                                                , VersionstampCompleteness(..)
+                                                , TransactionVersionstamp(TransactionVersionstamp)
+                                                , VersionstampCompleteness(Complete)
                                                 , decodeVersionstamp
                                                 )
 import           System.Random                  ( randomRIO )
 
 import qualified FDBStreaming.Topic.Constants  as C
 
+-- | Integer zero, little endian
 zeroLE :: ByteString
 zeroLE = "\x00\x00\x00\x00\x00\x00\x00\x00"
-
--- | integer one, little endian encoded
-oneLE :: ByteString
-oneLE = "\x01\x00\x00\x00\x00\x00\x00\x00"
 
 type TopicName = ByteString
 
@@ -86,20 +102,19 @@ makeTopicConfig topicConfigDB topicSS topicName = TopicConfig { .. }
  where
   topicCountKey = FDB.pack topicCountSS []
 
-  partitionMsgsSS i = FDB.extend msgsSS [Int i]
+  partitionMsgsSS i = FDB.extend msgsSS [FDB.Int i]
 
-  partitionCountKey i = FDB.pack topicCountSS [Int i]
+  partitionCountKey i = FDB.pack topicCountSS [FDB.Int i]
 
-  msgsSS = FDB.extend topicSS [C.topics, Bytes topicName, C.messages]
+  msgsSS = FDB.extend topicSS [C.topics, FDB.Bytes topicName, C.messages]
 
   topicCountSS = FDB.extend
     topicSS
-    [C.topics, Bytes topicName, C.metaCount]
+    [C.topics, FDB.Bytes topicName, C.metaCount]
   numPartitions = 2 -- TODO: make configurable
 
 randPartition :: TopicConfig -> IO PartitionId
-randPartition TopicConfig {..} =
-  fromIntegral <$> randomRIO (0, numPartitions - 1)
+randPartition TopicConfig {..} = randomRIO (0, numPartitions - 1)
 
 -- TODO: not efficient from either a Haskell or FDB perspective.
 listExistingTopics :: FDB.Database -> FDB.Subspace -> IO [TopicConfig]
@@ -109,17 +124,12 @@ listExistingTopics db ss = runTransaction db $ go (FDB.pack ss [C.topics])
   go k = do
     k' <- getKey (FirstGreaterThan k) >>= await
     case FDB.unpack ss k' of
-      Right (Int 0 : Bytes topicName : _) -> do
-        let nextK = FDB.pack ss [C.topics, Bytes topicName] <> "0xff"
+      Right (FDB.Int 0 : FDB.Bytes topicName : _) -> do
+        let nextK = FDB.pack ss [C.topics, FDB.Bytes topicName] <> "0xff"
         rest <- go nextK
         let conf = makeTopicConfig db ss topicName
         return (conf : rest)
       _ -> return []
-
-incrTopicCount :: TopicConfig -> Transaction ()
-incrTopicCount conf = do
-  let k = topicCountKey conf
-  FDB.atomicOp k (Op.add oneLE)
 
 incrTopicCountBy :: TopicConfig -> Word64 -> Transaction ()
 incrTopicCountBy conf n = do
@@ -133,11 +143,6 @@ getTopicCount conf = do
   bs <- fromMaybe zeroLE <$> (FDB.get k >>= await)
   return $ (runGet getWord64le . fromStrict) bs
 
-incrPartitionCount :: TopicConfig -> PartitionId -> Transaction ()
-incrPartitionCount conf i = do
-  let k = partitionCountKey conf i
-  FDB.atomicOp k (Op.add oneLE)
-
 incrPartitionCountBy :: TopicConfig -> PartitionId -> Word64 -> Transaction ()
 incrPartitionCountBy conf pid n = do
   let k = partitionCountKey conf pid
@@ -150,12 +155,12 @@ getPartitionCount conf i = do
   bs <- fromMaybe zeroLE <$> (FDB.get k >>= await)
   return $ (runGet getWord64le . fromStrict) bs
 
-readerSS :: TopicConfig -> ReaderName -> Subspace
+readerSS :: TopicConfig -> ReaderName -> FDB.Subspace
 readerSS TopicConfig {..} rn =
-  extend topicSS [C.topics, Bytes topicName, C.readers, Bytes rn]
+  FDB.extend topicSS [C.topics, FDB.Bytes topicName, C.readers, FDB.Bytes rn]
 
 readerCheckpointKey :: TopicConfig -> PartitionId -> ReaderName -> ByteString
-readerCheckpointKey tc i rn = FDB.pack (readerSS tc rn) [Int i, C.checkpoint]
+readerCheckpointKey tc i rn = FDB.pack (readerSS tc rn) [FDB.Int i, C.checkpoint]
 
 -- TODO: make idempotent to deal with CommitUnknownResult
 -- | Danger!! It's possible to write multiple messages with the same key
@@ -197,7 +202,7 @@ trOutput
   -> (ByteString, ByteString)
   -> (Versionstamp 'Complete, ByteString)
 trOutput TopicConfig {..} p (k, v) = case FDB.unpack (partitionMsgsSS p) k of
-  Right [CompleteVS vs] -> (vs, v)
+  Right [FDB.CompleteVS vs] -> (vs, v)
   Right t -> error $ "unexpected tuple: " ++ show t
   Left err -> error $ "failed to decode " ++ show k ++ " because " ++ show err
 
@@ -261,7 +266,7 @@ getCheckpoint'
   -> Transaction (Versionstamp 'Complete)
 getCheckpoint' tc p rn = do
   let cpk = readerCheckpointKey tc p rn
-  bs <- get cpk >>= await
+  bs <- FDB.get cpk >>= await
   case decodeVersionstamp <$> bs of
     Just Nothing -> error $ "Failed to decode checkpoint: " ++ show bs
     Just (Just vs) -> return vs
@@ -275,7 +280,7 @@ readNPastCheckpoint
   -> Transaction (Seq (Versionstamp 'Complete, ByteString))
 readNPastCheckpoint tc p rn n = do
   cpvs <- getCheckpoint' tc p rn
-  let begin = FDB.pack (partitionMsgsSS tc p) [CompleteVS cpvs]
+  let begin = FDB.pack (partitionMsgsSS tc p) [FDB.CompleteVS cpvs]
   let end   = prefixRangeEnd $ FDB.subspaceKey (partitionMsgsSS tc p)
   let r = Range
         { rangeBegin   = FirstGreaterThan begin

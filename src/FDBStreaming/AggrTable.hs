@@ -44,7 +44,6 @@ newtype AggrTable k v = AggrTable {
   aggrTableSS :: SS.Subspace
 }
 
--- TODO: get is partial
 -- TODO: requires the user to decide how to structure keys in FDB. That's weird.
 class TableValue v where
   set :: Message k => AggrTable k v -> k -> v -> FDB.Transaction ()
