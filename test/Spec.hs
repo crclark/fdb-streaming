@@ -2,22 +2,23 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 import Control.Exception (finally)
-import Data.Word
 import Test.Hspec
 import FoundationDB
 import FoundationDB.Layer.Subspace
 import FoundationDB.Layer.Tuple
 import FoundationDB.Versionstamp
-import qualified Data.Sequence as Seq
-import GHC.Exts (IsList(toList))
 
 import Spec.FDBStreaming.TaskLease
 
 import FDBStreaming.Topic
 
-txnVersion :: Versionstamp a -> TransactionVersionstamp
-txnVersion (CompleteVersionstamp x _) = x
-txnVersion _ = error "no version"
+testSS :: Subspace
+testSS = subspace [Bytes "fdbstreaming-test"]
+
+cleanup :: Database -> IO ()
+cleanup db = do
+  let (begin, end) = rangeKeys $ subspaceRange testSS
+  runTransactionWithConfig defaultConfig {timeout=5000} db $ clearRange begin end
 
 main :: IO ()
 main = withFoundationDB defaultOptions $
@@ -25,12 +26,6 @@ main = withFoundationDB defaultOptions $
          $ hspec
          $ before_ (cleanup db)
          $ do
-    let tc = TopicConfig db testSS
-    let tn = "test"
-    let testSS = subspace [Bytes "fdbstreaming-test"]
-    describe "read write" $
-      it "placeholder" $
-        1 `shouldBe` 1
     describe "leases" $
       -- TODO: still some lingering bugs with the state machine tester, where
       -- it tries to generate sequences of commands that are impossible to
