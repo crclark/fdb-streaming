@@ -330,12 +330,10 @@ mainLoop db ss Args{ generatorNumThreads
                    , generatorMsgsPerSecond
                    , generatorBatchSize
                    , generatorWatchResults
-                   , streamThreadsPerPartition
                    , streamRun
                    , useWatches
                    , printTopicStats
                    , batchSize
-                   , useLeases
                    , numLeaseThreads } = do
   metricsStore <- Metrics.newStore
   latencyDist <- Metrics.createDistribution "end_to_end_latency" metricsStore
@@ -344,7 +342,6 @@ mainLoop db ss Args{ generatorNumThreads
   let conf = FDBStreamConfig { streamConfigDB = db
                              , streamConfigSS = ss
                              , streamMetricsStore = Just metricsStore
-                             , threadsPerEdge = coerce streamThreadsPerPartition
                              , useWatches = coerce useWatches
                              , msgsPerBatch = coerce batchSize
                              , leaseDuration = 10
@@ -366,9 +363,7 @@ mainLoop db ss Args{ generatorNumThreads
     when (coerce printTopicStats) $ printStats db ss
     threadDelay 1000000
   when (coerce streamRun)
-    $ if coerce useLeases
-         then runLeaseStreamWorker (coerce numLeaseThreads) conf (topology input)
-         else runStreamWorker conf (topology input)
+    $ runLeaseStreamWorker (coerce numLeaseThreads) conf (topology input)
 
 
 cleanup :: Database -> Subspace -> IO ()
@@ -384,13 +379,11 @@ data Args f = Args
   , generatorMsgsPerSecond :: f Int
   , generatorBatchSize :: f Int
   , generatorWatchResults :: f Bool
-  , streamThreadsPerPartition :: f Int
   , streamRun :: f Bool
   , cleanupFirst :: f Bool
   , useWatches :: f Bool
   , printTopicStats :: f Bool
   , batchSize :: f Word8
-  , useLeases :: f Bool
   , numLeaseThreads :: f Int
   }
   deriving (Generic)
@@ -407,13 +400,11 @@ applyDefaults Args{..} = Args
   , generatorMsgsPerSecond = dflt 1000 generatorMsgsPerSecond
   , generatorBatchSize = dflt 200 generatorBatchSize
   , generatorWatchResults = dflt True generatorWatchResults
-  , streamThreadsPerPartition = dflt 1 streamThreadsPerPartition
   , streamRun = dflt True streamRun
   , cleanupFirst = dflt True cleanupFirst
   , useWatches = dflt False useWatches
   , printTopicStats = dflt True printTopicStats
   , batchSize = dflt 50 batchSize
-  , useLeases = dflt False useLeases
   , numLeaseThreads = dflt 12 numLeaseThreads
   }
 
@@ -423,5 +414,7 @@ main :: IO ()
 main = withFoundationDB defaultOptions $ \db -> do
   args@Args {subspaceName, cleanupFirst} <- applyDefaults <$> getRecord "stream test"
   let ss = FDB.subspace [FDB.Bytes (runIdentity subspaceName)]
+  --TODO: cleanup can time out in some circumstances, which crashes the program
+  --since there's no exception handler on this call.
   when (runIdentity cleanupFirst) $ cleanup db ss
   mainLoop db ss args

@@ -1,4 +1,4 @@
-module FDBStreaming.Message where
+module FDBStreaming.Message (Message(..)) where
 
 
 import           Data.ByteString                ( ByteString )

@@ -1,9 +1,15 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
-module FDBStreaming.TaskRegistry  where
+module FDBStreaming.TaskRegistry (
+  TaskRegistry(..),
+  empty,
+  numTasks,
+  addTask,
+  runRandomTask
+) where
 
-import           Control.Concurrent (myThreadId, threadDelay)
+import           Control.Concurrent (myThreadId)
 import           FoundationDB (Transaction)
 import qualified FoundationDB as FDB
 import           FoundationDB.Layer.Subspace (Subspace)
@@ -12,7 +18,7 @@ import qualified FoundationDB.Layer.Tuple as FDB
 import           Data.Map (Map)
 import qualified Data.Map as M
 
-import FDBStreaming.TaskLease
+import FDBStreaming.TaskLease (TaskSpace, TaskName, TaskID, ReleaseResult, EnsureTaskResult(AlreadyExists, NewlyCreated), taskSpace, ensureTask, acquireRandom, isLeaseValid, isLocked, release)
 
 -- | A registry to store continuously-recurring tasks. Processes can ask the
 -- registry for a task assignment. The registry is responsible for acquiring
