@@ -79,6 +79,7 @@ newtype Timestamp = Timestamp { unTimestamp :: UnixTime }
 newtype OrderID = OrderID { unOrderID :: UUID }
   deriving (Show, Eq, Ord, Generic)
   deriving Store via (Identity UUID)
+  deriving AT.TableKey via UUID
 
 instance Message OrderID where
   toMessage = Store.encode

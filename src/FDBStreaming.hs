@@ -257,7 +257,7 @@ class Monad m => MonadStream m where
   -- TODO: if we're exporting helpers anyway, maybe no need for classes
   -- at all.
   aggregate ::
-    (Message v, Message k, AT.TableSemigroup aggr) =>
+    (Message v, AT.TableKey k, AT.TableSemigroup aggr) =>
     StreamName ->
     GroupedBy k v ->
     (v -> aggr) ->
@@ -839,7 +839,7 @@ oneToOneJoinStep
 
 aggregateStep ::
   forall v k aggr.
-  (Message k, AT.TableSemigroup aggr) =>
+  (AT.TableKey k, AT.TableSemigroup aggr) =>
   FDBStreamConfig ->
   StreamName ->
   GroupedBy k v ->

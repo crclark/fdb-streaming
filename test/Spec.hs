@@ -9,6 +9,7 @@ import FoundationDB.Layer.Tuple
 import FoundationDB.Versionstamp
 
 import Spec.FDBStreaming.TaskLease
+import Spec.FDBStreaming.AggrTable (tableProps)
 
 import FDBStreaming.Topic
 
@@ -32,3 +33,5 @@ main = withFoundationDB defaultOptions $
       -- carry out (like locking a task before creating it).
       --it "works" (smProp db)
       leaseProps testSS db
+    describe "aggregation tables" $
+      tableProps testSS db
