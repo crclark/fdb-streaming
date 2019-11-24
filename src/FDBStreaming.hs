@@ -8,6 +8,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE RecordWildCards #-}
 
 module FDBStreaming
   ( MonadStream,
@@ -562,9 +563,11 @@ readPartitionBatchExactlyOnce (Topic outCfg mapFilter) metrics rn pid n = do
   return $ catMaybes msgs'
 
 getAggrTable :: FDBStreamConfig -> StreamName -> AT.AggrTable k v
-getAggrTable sc sn =
-  AT.AggrTable $
-    FDB.extend (streamConfigSS sc) [C.topics, FDB.Bytes sn, C.aggrTable]
+getAggrTable sc sn = AT.AggrTable {..}
+  where
+    aggrTableSS =
+      FDB.extend (streamConfigSS sc) [C.topics, FDB.Bytes sn, C.aggrTable]
+    aggrTableNumPartitions = 2
 
 -- TODO: other persistence backends
 -- TODO: should probably rename to TopologyConfig
@@ -863,7 +866,7 @@ aggregateStep
         pid
         msgsPerBatch
     forM_ msgs $ \msg -> forM_ (toKeys msg) $ \k ->
-      AT.mappendTable table k (toAggr msg)
+      AT.mappendTable table pid k (toAggr msg)
     w <-
       if null msgs || not useWatches
         then return Nothing

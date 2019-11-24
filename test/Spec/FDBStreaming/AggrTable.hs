@@ -26,11 +26,11 @@ import Test.QuickCheck.Instances.UUID ()
 import Data.ByteString (ByteString)
 import Data.Text (Text)
 import Data.UUID (UUID)
+import qualified Data.Map.Strict as Map
 import Data.Monoid (Sum, All, Any)
 import Data.Semigroup (Min(Min), Max(Max))
 import Data.Word
 import Data.Int
-import qualified Data.Sequence as Seq
 
 deriving via Double instance Arbitrary (Max Double)
 
@@ -81,11 +81,17 @@ propMappendTable :: forall v. (Eq v, TableSemigroup v)
                  -> v
                  -> Property
 propMappendTable ss db tableName v1 v2 = monadicIO $ do
-  let table = AggrTable (extend ss [FDB.Bytes tableName]) :: AggrTable Bool v
-  run $ runTransaction db $ AT.set table True v1
-  run $ runTransaction db $ mappendTable table True v2
-  (Just v3) <- run $ runTransaction db $ AT.get table True >>= FDB.await
+  let table = AggrTable (extend ss [FDB.Bytes tableName]) 2 :: AggrTable Bool v
+  let k = True
+  run $ runTransaction db $ AT.set table 0 k v1
+  run $ runTransaction db $ mappendTable table 0 k v2
+  (Just v3) <- run $ runTransaction db $ AT.get table 0 k >>= FDB.await
   Monadic.assert (v3 == v1 <> v2)
+  -- Test that we combine across partitions correctly when reading. TODO:
+  -- refactor into separate test.
+  run $ runTransaction db $ mappendTable table 1 k v1
+  (Just v4) <- run $ runTransaction db $ AT.getRow table k
+  Monadic.assert (v4 == v1 <> v2 <> v1)
 
 mappendTableProps :: Subspace -> Database -> SpecWith ()
 mappendTableProps testSS db = describe "mappendTable" $ do
@@ -108,11 +114,17 @@ propTableRange :: forall v . (TableSemigroup v, RangeAccessibleTable v, Eq v)
                -> v
                -> Property
 propTableRange ss db tableName v = monadicIO $ do
-  let table = AggrTable (extend ss [FDB.Bytes tableName]) :: AggrTable Integer v
-  forM_ [0..10] $ \i -> run $ runTransaction db $ AT.set table i v
-  result <- run $ runTransaction db $ AT.getTableRange table 0 10
-  let expected = Seq.fromList [(i,v) | i <- [0..10]]
+  let table = AggrTable (extend ss [FDB.Bytes tableName]) 2 :: AggrTable Integer v
+  forM_ [0..10] $ \i -> run $ runTransaction db $ AT.set table 0 i v
+  result <- run $ runTransaction db $ AT.getTableRange table 0 0 10
+  let expected = Map.fromList [(i,v) | i <- [0..10]]
   Monadic.assert (result == expected)
+  -- Test that we combine across partitions correctly when reading. TODO:
+  -- refactor into separate test.
+  forM_ [0..10] $ \i -> run $ runTransaction db $ AT.mappendTable table 1 i v
+  result2 <- run $ runTransaction db $ AT.getRowRange table 0 10
+  let expected2 = Map.fromList [(i, v <> v) | i <- [0..10]]
+  Monadic.assert (result2 == expected2)
 
 tableRangeProps :: Subspace -> Database -> SpecWith ()
 tableRangeProps testSS db = describe "getTableRange" $ do
