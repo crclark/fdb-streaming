@@ -34,18 +34,32 @@ packages:
     hackage: pretty-show-1.9.5@sha256:92aa3f43d8459a9b543e102fbb0b7a6aae0074e18ca6a9970d9922a867114f53
 - completed:
     cabal-file:
+      size: 2399
+      sha256: 501ed999e587c14877d4cb8b69fdef65fb9e4eec8d11b33459d9c8978275efe5
+    name: monoid-statistics
+    version: 1.1.0
+    git: git@github.com:Shimuuar/monoid-statistics.git
+    pantry-tree:
+      size: 775
+      sha256: 521e2334d1074d57e360ebe04cf47a961ed8055dd8bf38a2d3a6d9b3ca10790c
+    commit: d82f384cc127e8bbabb774407d225ef07f341076
+  original:
+    git: git@github.com:Shimuuar/monoid-statistics.git
+    commit: d82f384cc127e8bbabb774407d225ef07f341076
+- completed:
+    cabal-file:
       size: 5394
       sha256: 8b6ded6ab6eef858b1e45c34ea35410d3df4a4a8adb4607397ddc0dca0eb7cc9
     name: foundationdb-haskell
     version: 0.1.0.0
     git: https://github.com/crclark/foundationdb-haskell.git
     pantry-tree:
-      size: 2439
-      sha256: 1e56ae285f8edb690ab2e85c6c563cba9e2fec34852576d590008702b2f2ac29
-    commit: 21db40accf8428bf36b47fefbdb7dc63ba839f83
+      size: 2495
+      sha256: 0de6905f1ab1f3a7ef376e0f57abac3257c1cd29ddcd38e116e6320fb2f108df
+    commit: f42a244849af25b43a2544fc9e7c07a6d61340c6
   original:
     git: https://github.com/crclark/foundationdb-haskell.git
-    commit: 21db40accf8428bf36b47fefbdb7dc63ba839f83
+    commit: f42a244849af25b43a2544fc9e7c07a6d61340c6
 snapshots:
 - completed:
     size: 497078

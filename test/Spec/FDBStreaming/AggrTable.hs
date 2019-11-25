@@ -1,8 +1,15 @@
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE DerivingVia #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# OPTIONS_GHC -fno-warn-incomplete-uni-patterns #-}
 {-# OPTIONS_GHC -fno-warn-missing-import-lists #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
@@ -10,7 +17,9 @@
 
 module Spec.FDBStreaming.AggrTable (tableProps) where
 
-import Control.Monad (forM_)
+import FDBStreaming.Message (Message (fromMessage, toMessage))
+
+import Control.Monad (forM_, when)
 import FDBStreaming.AggrTable as AT
 import FoundationDB (Database, runTransaction)
 import qualified FoundationDB as FDB
@@ -24,13 +33,20 @@ import Test.QuickCheck.Instances.ByteString ()
 import Test.QuickCheck.Instances.Text ()
 import Test.QuickCheck.Instances.UUID ()
 import Data.ByteString (ByteString)
+import Data.Data (Data)
+import GHC.Generics (Generic)
 import Data.Text (Text)
 import Data.UUID (UUID)
+import qualified Data.Map.Strict as Map
+import Data.Maybe (catMaybes, fromMaybe)
 import Data.Monoid (Sum, All, Any)
+import Statistics.Monoid (MeanKBN, CalcMean, StatMonoid(..))
+import           Data.Store                     ( Store )
+import qualified Data.Store                    as Store
 import Data.Semigroup (Min(Min), Max(Max))
 import Data.Word
 import Data.Int
-import qualified Data.Sequence as Seq
+import Numeric.Sum (KBNSum(..))
 
 deriving via Double instance Arbitrary (Max Double)
 
@@ -81,11 +97,17 @@ propMappendTable :: forall v. (Eq v, TableSemigroup v)
                  -> v
                  -> Property
 propMappendTable ss db tableName v1 v2 = monadicIO $ do
-  let table = AggrTable (extend ss [FDB.Bytes tableName]) :: AggrTable Bool v
-  run $ runTransaction db $ AT.set table True v1
-  run $ runTransaction db $ mappendTable table True v2
-  (Just v3) <- run $ runTransaction db $ AT.get table True >>= FDB.await
+  let table = AggrTable (extend ss [FDB.Bytes tableName]) 2 :: AggrTable Bool v
+  let k = True
+  run $ runTransaction db $ AT.set table 0 k v1
+  run $ runTransaction db $ mappendBatch table 0 [(k, v2)]
+  (Just v3) <- run $ runTransaction db $ AT.get table 0 k >>= FDB.await
   Monadic.assert (v3 == v1 <> v2)
+  -- Test that we combine across partitions correctly when reading. TODO:
+  -- refactor into separate test.
+  run $ runTransaction db $ mappendBatch table 1 [(k, v1)]
+  (Just v4) <- run $ runTransaction db $ AT.getRow table k
+  Monadic.assert (v4 == v1 <> v2 <> v1)
 
 mappendTableProps :: Subspace -> Database -> SpecWith ()
 mappendTableProps testSS db = describe "mappendTable" $ do
@@ -108,11 +130,17 @@ propTableRange :: forall v . (TableSemigroup v, RangeAccessibleTable v, Eq v)
                -> v
                -> Property
 propTableRange ss db tableName v = monadicIO $ do
-  let table = AggrTable (extend ss [FDB.Bytes tableName]) :: AggrTable Integer v
-  forM_ [0..10] $ \i -> run $ runTransaction db $ AT.set table i v
-  result <- run $ runTransaction db $ AT.getTableRange table 0 10
-  let expected = Seq.fromList [(i,v) | i <- [0..10]]
+  let table = AggrTable (extend ss [FDB.Bytes tableName]) 2 :: AggrTable Integer v
+  forM_ [0..10] $ \i -> run $ runTransaction db $ AT.set table 0 i v
+  result <- run $ runTransaction db $ AT.getTableRange table 0 0 10
+  let expected = Map.fromList [(i,v) | i <- [0..10]]
   Monadic.assert (result == expected)
+  -- Test that we combine across partitions correctly when reading. TODO:
+  -- refactor into separate test.
+  forM_ [0..10] $ \i -> run $ runTransaction db $ AT.mappendBatch table 1 [(i,v)]
+  result2 <- run $ runTransaction db $ AT.getRowRange table 0 10
+  let expected2 = Map.fromList [(i, v <> v) | i <- [0..10]]
+  Monadic.assert (result2 == expected2)
 
 tableRangeProps :: Subspace -> Database -> SpecWith ()
 tableRangeProps testSS db = describe "getTableRange" $ do
@@ -123,8 +151,50 @@ tableRangeProps testSS db = describe "getTableRange" $ do
   it "Works for (Max Double)" $ binaryProperty (propTableRange testSS db :: ByteString -> Max Double -> Property)
   it "Works for (Min Int64)" $ binaryProperty (propTableRange testSS db :: ByteString -> Min Int64 -> Property)
 
+newtype Mean = Mean { unMean :: MeanKBN }
+  deriving (Eq, Data, Show, Generic)
+  deriving Semigroup via MeanKBN
+  deriving Monoid via MeanKBN
+  deriving CalcMean via MeanKBN
+
+deriving instance Generic KBNSum
+deriving instance Store KBNSum
+deriving instance Store MeanKBN
+deriving instance Store Mean
+
+instance Real a => StatMonoid Mean a where
+  addValue (Mean m) a = Mean (addValue m a)
+  singletonMonoid a = Mean (singletonMonoid a)
+
+instance Message Mean where
+  toMessage = Store.encode
+  fromMessage = Store.decodeEx
+
+instance TableSemigroup Mean where
+  mappendBatch = mappendMessageBatch
+  set = setMessage
+  get = getMessage
+
+propNonAtomicSemigroup :: Real v => Subspace -> Database -> ByteString -> [v] -> Property
+propNonAtomicSemigroup ss db tableName vs = monadicIO $ do
+  let table = AggrTable (extend ss [FDB.Bytes tableName]) 2 :: AggrTable () Mean
+  let kvs = map (\v -> ((), singletonMonoid v)) vs
+  run $ runTransaction db $ mappendBatch table 0 kvs
+  run $ runTransaction db $ mappendBatch table 1 kvs
+  let expectedResult = foldMap singletonMonoid (vs <> vs)
+  result <- fromMaybe mempty <$> (run $ runTransaction db $ AT.getRow table ())
+  when (expectedResult /= result) $ do
+    run $ putStrLn $ "expected: " ++ show expectedResult
+    run $ putStrLn $ "got: " ++ show result
+  Monadic.assert (expectedResult == (result :: Mean))
+
+nonAtomicSemigroupProps :: Subspace -> Database -> SpecWith ()
+nonAtomicSemigroupProps testSS db = describe "non-atomic table helper functions" $ do
+  it "Works for Kahan Mean" $ binaryProperty (propNonAtomicSemigroup testSS db :: ByteString -> [Integer] -> Property)
+
 tableProps :: Subspace -> Database -> SpecWith ()
 tableProps testSS db = do
+  nonAtomicSemigroupProps testSS db
   ordTableKeyProps
   mappendTableProps testSS db
   tableRangeProps testSS db

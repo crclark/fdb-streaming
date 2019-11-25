@@ -8,6 +8,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE RecordWildCards #-}
 
 module FDBStreaming
   ( MonadStream,
@@ -257,7 +258,7 @@ class Monad m => MonadStream m where
   -- TODO: if we're exporting helpers anyway, maybe no need for classes
   -- at all.
   aggregate ::
-    (Message v, AT.TableKey k, AT.TableSemigroup aggr) =>
+    (Message v, Ord k, AT.TableKey k, AT.TableSemigroup aggr) =>
     StreamName ->
     GroupedBy k v ->
     (v -> aggr) ->
@@ -562,9 +563,11 @@ readPartitionBatchExactlyOnce (Topic outCfg mapFilter) metrics rn pid n = do
   return $ catMaybes msgs'
 
 getAggrTable :: FDBStreamConfig -> StreamName -> AT.AggrTable k v
-getAggrTable sc sn =
-  AT.AggrTable $
-    FDB.extend (streamConfigSS sc) [C.topics, FDB.Bytes sn, C.aggrTable]
+getAggrTable sc sn = AT.AggrTable {..}
+  where
+    aggrTableSS =
+      FDB.extend (streamConfigSS sc) [C.topics, FDB.Bytes sn, C.aggrTable]
+    aggrTableNumPartitions = 2
 
 -- TODO: other persistence backends
 -- TODO: should probably rename to TopologyConfig
@@ -839,7 +842,7 @@ oneToOneJoinStep
 
 aggregateStep ::
   forall v k aggr.
-  (AT.TableKey k, AT.TableSemigroup aggr) =>
+  (Ord k, AT.TableKey k, AT.TableSemigroup aggr) =>
   FDBStreamConfig ->
   StreamName ->
   GroupedBy k v ->
@@ -862,8 +865,8 @@ aggregateStep
         sn
         pid
         msgsPerBatch
-    forM_ msgs $ \msg -> forM_ (toKeys msg) $ \k ->
-      AT.mappendTable table k (toAggr msg)
+    let kvs = [(k,toAggr v) | v <- toList msgs, k <- toKeys v]
+    AT.mappendBatch table pid kvs
     w <-
       if null msgs || not useWatches
         then return Nothing
