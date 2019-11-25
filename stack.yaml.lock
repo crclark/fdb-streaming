@@ -34,6 +34,20 @@ packages:
     hackage: pretty-show-1.9.5@sha256:92aa3f43d8459a9b543e102fbb0b7a6aae0074e18ca6a9970d9922a867114f53
 - completed:
     cabal-file:
+      size: 2399
+      sha256: 501ed999e587c14877d4cb8b69fdef65fb9e4eec8d11b33459d9c8978275efe5
+    name: monoid-statistics
+    version: 1.1.0
+    git: git@github.com:Shimuuar/monoid-statistics.git
+    pantry-tree:
+      size: 775
+      sha256: 521e2334d1074d57e360ebe04cf47a961ed8055dd8bf38a2d3a6d9b3ca10790c
+    commit: d82f384cc127e8bbabb774407d225ef07f341076
+  original:
+    git: git@github.com:Shimuuar/monoid-statistics.git
+    commit: d82f384cc127e8bbabb774407d225ef07f341076
+- completed:
+    cabal-file:
       size: 5394
       sha256: 8b6ded6ab6eef858b1e45c34ea35410d3df4a4a8adb4607397ddc0dca0eb7cc9
     name: foundationdb-haskell

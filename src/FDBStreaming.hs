@@ -258,7 +258,7 @@ class Monad m => MonadStream m where
   -- TODO: if we're exporting helpers anyway, maybe no need for classes
   -- at all.
   aggregate ::
-    (Message v, AT.TableKey k, AT.TableSemigroup aggr) =>
+    (Message v, Ord k, AT.TableKey k, AT.TableSemigroup aggr) =>
     StreamName ->
     GroupedBy k v ->
     (v -> aggr) ->
@@ -842,7 +842,7 @@ oneToOneJoinStep
 
 aggregateStep ::
   forall v k aggr.
-  (AT.TableKey k, AT.TableSemigroup aggr) =>
+  (Ord k, AT.TableKey k, AT.TableSemigroup aggr) =>
   FDBStreamConfig ->
   StreamName ->
   GroupedBy k v ->
@@ -865,8 +865,8 @@ aggregateStep
         sn
         pid
         msgsPerBatch
-    forM_ msgs $ \msg -> forM_ (toKeys msg) $ \k ->
-      AT.mappendTable table pid k (toAggr msg)
+    let kvs = [(k,toAggr v) | v <- toList msgs, k <- toKeys v]
+    AT.mappendBatch table pid kvs
     w <-
       if null msgs || not useWatches
         then return Nothing

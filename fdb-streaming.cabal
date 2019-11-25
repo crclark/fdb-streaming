@@ -157,4 +157,7 @@ test-suite fdb-streaming-test
     , bytestring
     , uuid
     , text
+    , math-functions
+    , monoid-statistics
+    , store
   default-language: Haskell2010
