@@ -3,7 +3,6 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module FDBStreaming.AggrTable (
@@ -106,6 +105,7 @@ class TableKey a => OrdTableKey a
 --      in @table@ at @k@.
 --    * If no value exists in @table@ at @k@, then @mappendTable table k x@ has
 --      the same effect as @set table k x@.
+--    * Must be a commutative semigroup.
 class (Semigroup v) => TableSemigroup v where
   -- | mappends the given key,value pairs to the existing values at each k in
   -- the table. If k has not been set,
