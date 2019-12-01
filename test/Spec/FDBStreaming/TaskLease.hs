@@ -113,7 +113,7 @@ semantics db testTaskSpace (EnsureTask taskName) = do
   result <- runTransaction db $ ensureTask testTaskSpace taskName
   return $ TaskEnsured result
 semantics db testTaskSpace (AcquireRandom n) = do
-  result <- runTransaction db $ acquireRandomUnbiased testTaskSpace n
+  result <- runTransaction db $ acquireRandomUnbiased testTaskSpace (const n)
   case result of
     Nothing -> return AlreadyLocked
     Just (taskName, lease, _) -> return (AcquiredRandom taskName lease)
@@ -341,20 +341,20 @@ mutualExclusionRandom testTaskSpace db = do
   it "With only one task, acquireRandomUnbiased should be equivalent to acquire" $ do
     res <- runTransaction db $ ensureTask testTaskSpace taskName
     res `shouldSatisfy` isNewlyCreated
-    acq1 <- runTransaction db $ acquireRandomUnbiased testTaskSpace 5
+    acq1 <- runTransaction db $ acquireRandomUnbiased testTaskSpace (const 5)
     acq1 `shouldBe` Just (taskName, AcquiredLease 1, Available)
-    acq2 <- runTransaction db $ acquireRandomUnbiased testTaskSpace 5
+    acq2 <- runTransaction db $ acquireRandomUnbiased testTaskSpace (const 5)
     acq2 `shouldBe` Nothing
     threadDelay 7000000
-    acq3 <- runTransaction db $ acquireRandomUnbiased testTaskSpace 5
+    acq3 <- runTransaction db $ acquireRandomUnbiased testTaskSpace (const 5)
     acq3 `shouldBe` Just (taskName, AcquiredLease 2, RandomExpired)
-    acq4 <- runTransaction db $ acquireRandomUnbiased testTaskSpace 5
+    acq4 <- runTransaction db $ acquireRandomUnbiased testTaskSpace (const 5)
     acq4 `shouldBe` Nothing
 
 uniformRandomness :: TaskSpace -> Database -> SpecWith ()
 uniformRandomness (TaskSpace testSS) db =
   it "Should acquire each task once when they each get locked" $ do
-    taskReg <- TR.empty testSS 100
+    taskReg <- TR.empty testSS
     let tasks =
           [ "task1",
             "task2",
@@ -374,7 +374,7 @@ uniformRandomness (TaskSpace testSS) db =
             $ atomicModifyIORef
               taskRunCounts
               (\n -> (Map.adjust succ taskName n, ()))
-    let addTask' tr taskName = TR.addTask tr taskName (task taskName)
+    let addTask' tr taskName = TR.addTask tr taskName 100 (task taskName)
     runTransaction db $ forM_ tasks $ addTask' taskReg
     asyncs <- replicateM 50 (async $ TR.runRandomTask db taskReg)
     forM_ asyncs wait

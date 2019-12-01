@@ -42,22 +42,19 @@ data TaskRegistry =
     , getTaskRegistry
         :: IORef (Map TaskName
                       ( TaskID
+                      , Int
                       , Transaction Bool -> Transaction ReleaseResult -> IO ()))
-    , taskRegistryLeaseDuration :: Int
     }
 
 empty
   :: Subspace
       -- ^ Base subspace to contain task lease data. This will be extended
       -- with the string "TS"
-  -> Int
-      -- ^ Duration for which leases should be acquired, in seconds.
   -> IO TaskRegistry
-empty ss dur =
+empty ss =
   TaskRegistry
   <$> pure (taskSpace $ FDB.extend ss [FDB.Bytes "TS"])
   <*> newIORef mempty
-  <*> pure dur
 
 numTasks :: TaskRegistry -> IO Int
 numTasks tr = M.size <$> readIORef (getTaskRegistry tr)
@@ -67,15 +64,17 @@ addTask
   -> TaskName
         -- ^ A unique string name for this task. If the given name already
         -- exists, it will be overwritten.
+  -> Int
+  -- ^ How long to lock the task when it runs.
   -> (Transaction Bool -> Transaction ReleaseResult -> IO ())
         -- ^ An action that is run once per lease acquisition. It is passed two
         -- transactions: one that returns true if the acquired lease is still
         -- valid, and another that releases the lease. The latter can be used to
         -- atomically finish a longer-running computation.
   -> Transaction ()
-addTask (TaskRegistry ts tr _dur) taskName f = do
+addTask (TaskRegistry ts tr) taskName dur f = do
   taskID <- extractID <$> ensureTask ts taskName
-  liftIO $ atomicModifyIORef' tr ((, ()) . M.insert taskName (taskID, f))
+  liftIO $ atomicModifyIORef' tr ((, ()) . M.insert taskName (taskID, dur, f))
  where
   extractID (AlreadyExists t) = t
   extractID (NewlyCreated  t) = t
@@ -83,9 +82,12 @@ addTask (TaskRegistry ts tr _dur) taskName f = do
 -- | Run a random task in the task registry. If no tasks are available, returns
 -- false.
 runRandomTask :: FDB.Database -> TaskRegistry -> IO Bool
-runRandomTask db (TaskRegistry ts tr dur) = do
+runRandomTask db (TaskRegistry ts tr) = do
   tr' <- readIORef tr
-  FDB.runTransaction db (acquireRandomUnbiased ts dur) >>= \case
+  let toDur taskName = case M.lookup taskName tr' of
+                         Nothing -> 5 -- code below will warn
+                         Just (_, dur, _) -> dur
+  FDB.runTransaction db (acquireRandomUnbiased ts toDur) >>= \case
     Nothing                -> do
       tid <- myThreadId
       putStrLn $ show tid ++ "couldn't find an unlocked task."
@@ -96,7 +98,7 @@ runRandomTask db (TaskRegistry ts tr dur) = do
         putStrLn $ show tid ++ " found an invalid task " ++ show taskName
                    ++ " not present in " ++ show (M.keys tr')
         return False --TODO: warn? this implies tasks outside registry
-      Just (taskID, f) -> do
+      Just (taskID, _dur, f) -> do
         tid <- myThreadId
         putStrLn $ show tid
                    ++ " starting on task "

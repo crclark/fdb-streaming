@@ -418,9 +418,10 @@ acquireRandom l@(TaskSpace ss) seconds = do
 -- in most cases, acquireRandom does O(1) work. For the number of tasks we are
 -- typically using, however, this shouldn't be an issue.
 acquireRandomUnbiased :: TaskSpace
-                      -> Int
+                      -> (TaskName -> Int)
+                      -- ^ How long to lock the task, depending on its name.
                       -> Transaction (Maybe (TaskName, AcquiredLease, HowAcquired))
-acquireRandomUnbiased ts seconds = do
+acquireRandomUnbiased ts taskSeconds = do
   -- TODO: many more tests to ensure that these snapshot reads are safe and
   -- that no two workers can acquire the same lease.
   expireds <- FDB.withSnapshot $ expiredLocks ts
@@ -431,7 +432,7 @@ acquireRandomUnbiased ts seconds = do
     then do
       rand <- liftIO $ randomRIO (0, n - 1)
       let taskName = fromMaybe (error "impossible") (tasks Seq.!? rand)
-      tv <- acquire ts taskName seconds
+      tv <- acquire ts taskName (taskSeconds taskName)
       let how = if rand < length expireds then RandomExpired else Available
       return $ Just (taskName, tv, how)
     else return Nothing
