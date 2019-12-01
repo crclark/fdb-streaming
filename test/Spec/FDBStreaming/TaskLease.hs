@@ -24,7 +24,6 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async, wait)
 import Control.Monad (forM_, replicateM, void)
 import Control.Monad.IO.Class (liftIO)
-import Data.Foldable (foldlM)
 import Data.IORef (atomicModifyIORef, newIORef, readIORef)
 import Data.Kind (Type)
 import qualified Data.Map as Map
@@ -355,7 +354,7 @@ mutualExclusionRandom testTaskSpace db = do
 uniformRandomness :: TaskSpace -> Database -> SpecWith ()
 uniformRandomness (TaskSpace testSS) db =
   it "Should acquire each task once when they each get locked" $ do
-    let taskReg = TR.empty testSS 100
+    taskReg <- TR.empty testSS 100
     let tasks =
           [ "task1",
             "task2",
@@ -376,12 +375,10 @@ uniformRandomness (TaskSpace testSS) db =
               taskRunCounts
               (\n -> (Map.adjust succ taskName n, ()))
     let addTask' tr taskName = TR.addTask tr taskName (task taskName)
-    taskReg' <-
-      runTransaction db $
-        foldlM addTask' taskReg tasks
-    asyncs <- replicateM 50 (async $ TR.runRandomTask db taskReg')
+    runTransaction db $ forM_ tasks $ addTask' taskReg
+    asyncs <- replicateM 50 (async $ TR.runRandomTask db taskReg)
     forM_ asyncs wait
     finalCounts <- readIORef taskRunCounts
     finalCounts `shouldBe` Map.fromList (zip tasks (repeat 1))
-    oneMore <- TR.runRandomTask db taskReg'
+    oneMore <- TR.runRandomTask db taskReg
     oneMore `shouldBe` False

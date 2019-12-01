@@ -1,5 +1,6 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TupleSections #-}
 
 module FDBStreaming.TaskRegistry (
   TaskRegistry(..),
@@ -10,6 +11,8 @@ module FDBStreaming.TaskRegistry (
 ) where
 
 import           Control.Concurrent (myThreadId)
+import           Control.Monad.IO.Class ( liftIO )
+import           Data.IORef (IORef, newIORef, atomicModifyIORef', readIORef)
 import           FoundationDB (Transaction)
 import qualified FoundationDB as FDB
 import           FoundationDB.Layer.Subspace (Subspace)
@@ -36,11 +39,10 @@ import FDBStreaming.TaskLease (TaskSpace, TaskName, TaskID, ReleaseResult, Ensur
 data TaskRegistry =
   TaskRegistry {
     taskRegistrySpace :: TaskSpace
-    -- TODO: this should be in an IORef -- addTask is effectful anyway; it's
-    -- confusing that half of it is effectful and half isn't.
     , getTaskRegistry
-        :: Map TaskName
-               (TaskID, Transaction Bool -> Transaction ReleaseResult -> IO ())
+        :: IORef (Map TaskName
+                      ( TaskID
+                      , Transaction Bool -> Transaction ReleaseResult -> IO ()))
     , taskRegistryLeaseDuration :: Int
     }
 
@@ -50,12 +52,15 @@ empty
       -- with the string "TS"
   -> Int
       -- ^ Duration for which leases should be acquired, in seconds.
-  -> TaskRegistry
-empty ss =
-  TaskRegistry (taskSpace $ FDB.extend ss [FDB.Bytes "TS"]) mempty
+  -> IO TaskRegistry
+empty ss dur =
+  TaskRegistry
+  <$> pure (taskSpace $ FDB.extend ss [FDB.Bytes "TS"])
+  <*> newIORef mempty
+  <*> pure dur
 
-numTasks :: TaskRegistry -> Int
-numTasks = M.size . getTaskRegistry
+numTasks :: TaskRegistry -> IO Int
+numTasks tr = M.size <$> readIORef (getTaskRegistry tr)
 
 addTask
   :: TaskRegistry
@@ -67,11 +72,10 @@ addTask
         -- transactions: one that returns true if the acquired lease is still
         -- valid, and another that releases the lease. The latter can be used to
         -- atomically finish a longer-running computation.
-  -> Transaction TaskRegistry
-addTask (TaskRegistry ts tr dur) taskName f = do
+  -> Transaction ()
+addTask (TaskRegistry ts tr _dur) taskName f = do
   taskID <- extractID <$> ensureTask ts taskName
-  let tr' = M.insert taskName (taskID, f) tr
-  return $ TaskRegistry ts tr' dur
+  liftIO $ atomicModifyIORef' tr ((, ()) . M.insert taskName (taskID, f))
  where
   extractID (AlreadyExists t) = t
   extractID (NewlyCreated  t) = t
@@ -79,18 +83,18 @@ addTask (TaskRegistry ts tr dur) taskName f = do
 -- | Run a random task in the task registry. If no tasks are available, returns
 -- false.
 runRandomTask :: FDB.Database -> TaskRegistry -> IO Bool
-runRandomTask db (TaskRegistry ts tr dur) =
+runRandomTask db (TaskRegistry ts tr dur) = do
+  tr' <- readIORef tr
   FDB.runTransaction db (acquireRandomUnbiased ts dur) >>= \case
     Nothing                -> do
       tid <- myThreadId
       putStrLn $ show tid ++ "couldn't find an unlocked task."
-      --threadDelay (dur * 1000000 `div` 2)
       return False
-    Just (taskName, lease, howAcquired) -> case M.lookup taskName tr of
+    Just (taskName, lease, howAcquired) -> case M.lookup taskName tr' of
       Nothing -> do
         tid <- myThreadId
         putStrLn $ show tid ++ " found an invalid task " ++ show taskName
-                   ++ " not present in " ++ show (M.keys tr)
+                   ++ " not present in " ++ show (M.keys tr')
         return False --TODO: warn? this implies tasks outside registry
       Just (taskID, f) -> do
         tid <- myThreadId

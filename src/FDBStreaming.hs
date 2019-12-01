@@ -38,7 +38,7 @@ import Control.Exception
 import Control.Monad (forM, forM_, forever, replicateM, void, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import qualified Control.Monad.State.Strict as State
-import Control.Monad.State.Strict (MonadState, StateT, gets, put)
+import Control.Monad.State.Strict (MonadState, StateT, gets)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BS8
 import Data.Foldable (toList)
@@ -357,11 +357,9 @@ instance MonadStream LeaseBasedStreamWorker where
             $ runTransaction streamConfigDB
             $ withNothing
               <$> produceStep msgsPerBatch tc m
-    taskReg' <-
-      liftIO
-        $ runTransaction streamConfigDB
-        $ addTask taskReg (TaskName sn) job
-    put (cfg, taskReg')
+    liftIO
+      $ runTransaction streamConfigDB
+      $ addTask taskReg (TaskName sn) job
     return t
 
   atLeastOnce sn inTopic step = do
@@ -378,11 +376,9 @@ instance MonadStream LeaseBasedStreamWorker where
     forEachPartition inTopic $ \pid -> do
       let taskName = mkTaskName sn pid
       taskReg <- taskRegistry
-      taskReg' <-
-        liftIO
-          $ runTransaction streamConfigDB
-          $ addTask taskReg taskName (job pid)
-      put (cfg, taskReg')
+      liftIO
+        $ runTransaction streamConfigDB
+        $ addTask taskReg taskName (job pid)
 
   pipe sn inTopic step = do
     cfg@FDBStreamConfig {streamConfigDB} <- getStreamConfig
@@ -400,11 +396,9 @@ instance MonadStream LeaseBasedStreamWorker where
     forEachPartition inTopic $ \pid -> do
       let taskName = mkTaskName sn pid
       taskReg <- taskRegistry
-      taskReg' <-
-        liftIO
-          $ runTransaction streamConfigDB
-          $ addTask taskReg taskName (job pid)
-      put (cfg, taskReg')
+      liftIO
+        $ runTransaction streamConfigDB
+        $ addTask taskReg taskName (job pid)
     return outTopic
 
   oneToOneJoin sn lt rt pl pr c = do
@@ -432,19 +426,15 @@ instance MonadStream LeaseBasedStreamWorker where
     forEachPartition lt $ \pid -> do
       let lTaskName = TaskName $ BS8.pack (show lname ++ "_" ++ show pid)
       taskReg <- taskRegistry
-      taskReg' <-
-        liftIO
-          $ runTransaction streamConfigDB
-          $ addTask taskReg lTaskName (ljob pid)
-      put (cfg, taskReg')
+      liftIO
+        $ runTransaction streamConfigDB
+        $ addTask taskReg lTaskName (ljob pid)
     forEachPartition rt $ \pid -> do
       let rTaskName = TaskName $ BS8.pack (show rname ++ "_" ++ show pid)
       taskReg <- taskRegistry
-      taskReg' <-
-        liftIO
-          $ runTransaction streamConfigDB
-          $ addTask taskReg rTaskName (rjob pid)
-      put (cfg, taskReg')
+      liftIO
+        $ runTransaction streamConfigDB
+        $ addTask taskReg rTaskName (rjob pid)
     return outTopic
 
   groupBy k t = return (GroupedBy t k)
@@ -464,20 +454,19 @@ instance MonadStream LeaseBasedStreamWorker where
     forEachPartition inTopic $ \pid -> do
       taskReg <- taskRegistry
       let taskName = TaskName $ BS8.pack (show sn ++ "_" ++ show pid)
-      taskReg' <-
-        liftIO
-          $ runTransaction streamConfigDB
-          $ addTask taskReg taskName (job pid)
-      put (cfg, taskReg')
+      liftIO
+        $ runTransaction streamConfigDB
+        $ addTask taskReg taskName (job pid)
     return table
 
 -- TODO: what if we have recently removed steps from our topology? Old leases
 -- will be registered forever. Need to remove old ones.
 registerAllLeases :: FDBStreamConfig -> LeaseBasedStreamWorker a -> IO (a, TaskRegistry)
-registerAllLeases cfg =
+registerAllLeases cfg wkr = do
+  tr <- TaskRegistry.empty (taskRegSS cfg) (leaseDuration cfg)
   fmap (fmap snd)
-    . flip State.runStateT (cfg, TaskRegistry.empty (taskRegSS cfg) (leaseDuration cfg))
-    . unLeaseBasedStreamWorker
+    $ flip State.runStateT (cfg, tr)
+    $ unLeaseBasedStreamWorker wkr
 
 runLeaseStreamWorker :: Int -> FDBStreamConfig -> LeaseBasedStreamWorker a -> IO ()
 runLeaseStreamWorker numThreads cfg topology = do
