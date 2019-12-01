@@ -197,11 +197,8 @@ class Monad m => MonadStream m where
   -- TODO: produce isn't idempotent in cases of CommitUnknownResult
   produce :: Message a => StreamName -> IO (Maybe a) -> m (Topic a)
 
-  -- TODO: better operation for externally-visible side effects. In practice, if
-  -- number of threads per partition is > 1, we will potentially have a lot of
-  -- repeated side effects per message. If we're e.g. sending emails or
-  -- something similarly externally visible, that's not good. Perhaps we can
-  -- introduce a atMostOnceSideEffect type for these sorts of things, that
+  -- TODO: better operation for externally-visible side effects. Perhaps we can
+  -- introduce an atMostOnceSideEffect type for these sorts of things, that
   -- checkpoints and THEN performs side effects. The problem is if the thread
   -- dies after the checkpoint but before the side effect, or if the side effect
   -- fails. We could maintain a set of in-flight side effects, and remove them
@@ -209,10 +206,6 @@ class Monad m => MonadStream m where
   -- traversing the items in the set that are older than t.
 
   -- | Produce a side effect at least once for each message in the stream.
-  -- In practice, this will _usually_ be more than once in the current
-  -- implementation, if running multiple instances of the processor.
-  -- NOTE: if using the new lease-based processor, this will usually just be
-  -- once.
   atLeastOnce :: Message a => StreamName -> Topic a -> (a -> IO ()) -> m ()
 
   pipe ::

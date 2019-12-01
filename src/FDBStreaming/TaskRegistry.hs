@@ -18,7 +18,7 @@ import qualified FoundationDB.Layer.Tuple as FDB
 import           Data.Map (Map)
 import qualified Data.Map as M
 
-import FDBStreaming.TaskLease (TaskSpace, TaskName, TaskID, ReleaseResult, EnsureTaskResult(AlreadyExists, NewlyCreated), taskSpace, ensureTask, acquireRandom, isLeaseValid, isLocked, release)
+import FDBStreaming.TaskLease (TaskSpace, TaskName, TaskID, ReleaseResult, EnsureTaskResult(AlreadyExists, NewlyCreated), taskSpace, ensureTask, acquireRandomUnbiased, isLeaseValid, isLocked, release)
 
 -- | A registry to store continuously-recurring tasks. Processes can ask the
 -- registry for a task assignment. The registry is responsible for acquiring
@@ -60,7 +60,7 @@ numTasks = M.size . getTaskRegistry
 addTask
   :: TaskRegistry
   -> TaskName
-        -- ^ A unique string name for this task.If the given name already
+        -- ^ A unique string name for this task. If the given name already
         -- exists, it will be overwritten.
   -> (Transaction Bool -> Transaction ReleaseResult -> IO ())
         -- ^ An action that is run once per lease acquisition. It is passed two
@@ -80,7 +80,7 @@ addTask (TaskRegistry ts tr dur) taskName f = do
 -- false.
 runRandomTask :: FDB.Database -> TaskRegistry -> IO Bool
 runRandomTask db (TaskRegistry ts tr dur) =
-  FDB.runTransaction db (acquireRandom ts dur) >>= \case
+  FDB.runTransaction db (acquireRandomUnbiased ts dur) >>= \case
     Nothing                -> do
       tid <- myThreadId
       putStrLn $ show tid ++ "couldn't find an unlocked task."
