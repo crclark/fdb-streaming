@@ -38,7 +38,7 @@ import Control.Exception
 import Control.Monad (forM, forM_, forever, replicateM, void, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import qualified Control.Monad.State.Strict as State
-import Control.Monad.State.Strict (MonadState, StateT, gets, put)
+import Control.Monad.State.Strict (MonadState, StateT, gets)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BS8
 import Data.Foldable (toList)
@@ -60,7 +60,6 @@ import FDBStreaming.TaskRegistry as TaskRegistry
     addTask,
     empty,
     runRandomTask,
-    taskRegistryLeaseDuration,
   )
 import FDBStreaming.Topic
   ( PartitionId,
@@ -197,11 +196,8 @@ class Monad m => MonadStream m where
   -- TODO: produce isn't idempotent in cases of CommitUnknownResult
   produce :: Message a => StreamName -> IO (Maybe a) -> m (Topic a)
 
-  -- TODO: better operation for externally-visible side effects. In practice, if
-  -- number of threads per partition is > 1, we will potentially have a lot of
-  -- repeated side effects per message. If we're e.g. sending emails or
-  -- something similarly externally visible, that's not good. Perhaps we can
-  -- introduce a atMostOnceSideEffect type for these sorts of things, that
+  -- TODO: better operation for externally-visible side effects. Perhaps we can
+  -- introduce an atMostOnceSideEffect type for these sorts of things, that
   -- checkpoints and THEN performs side effects. The problem is if the thread
   -- dies after the checkpoint but before the side effect, or if the side effect
   -- fails. We could maintain a set of in-flight side effects, and remove them
@@ -209,10 +205,6 @@ class Monad m => MonadStream m where
   -- traversing the items in the set that are older than t.
 
   -- | Produce a side effect at least once for each message in the stream.
-  -- In practice, this will _usually_ be more than once in the current
-  -- implementation, if running multiple instances of the processor.
-  -- NOTE: if using the new lease-based processor, this will usually just be
-  -- once.
   atLeastOnce :: Message a => StreamName -> Topic a -> (a -> IO ()) -> m ()
 
   pipe ::
@@ -358,25 +350,22 @@ instance MonadStream LeaseBasedStreamWorker where
     (cfg@FDBStreamConfig {msgsPerBatch, streamConfigDB}, taskReg) <- State.get
     metrics <- registerStepMetrics sn
     let job _stillValid _release =
-          doForSeconds (taskRegistryLeaseDuration taskReg)
+          doForSeconds (leaseDuration cfg)
             $ void
             $ logErrors cfg metrics sn
             $ runTransaction streamConfigDB
             $ withNothing
               <$> produceStep msgsPerBatch tc m
-    taskReg' <-
-      liftIO
-        $ runTransaction streamConfigDB
-        $ addTask taskReg (TaskName sn) job
-    put (cfg, taskReg')
+    liftIO
+      $ runTransaction streamConfigDB
+      $ addTask taskReg (TaskName sn) (leaseDuration cfg) job
     return t
 
   atLeastOnce sn inTopic step = do
     cfg@FDBStreamConfig {streamConfigDB} <- getStreamConfig
-    leaseDuration <- taskRegistryLeaseDuration <$> taskRegistry
     metrics <- registerStepMetrics sn
     let job pid _stillValid _release =
-          doForSeconds leaseDuration
+          doForSeconds (leaseDuration cfg)
             $ void
             $ logErrors cfg metrics sn
             $ runTransaction streamConfigDB
@@ -385,20 +374,17 @@ instance MonadStream LeaseBasedStreamWorker where
     forEachPartition inTopic $ \pid -> do
       let taskName = mkTaskName sn pid
       taskReg <- taskRegistry
-      taskReg' <-
-        liftIO
-          $ runTransaction streamConfigDB
-          $ addTask taskReg taskName (job pid)
-      put (cfg, taskReg')
+      liftIO
+        $ runTransaction streamConfigDB
+        $ addTask taskReg taskName (leaseDuration cfg) (job pid)
 
   pipe sn inTopic step = do
     cfg@FDBStreamConfig {streamConfigDB} <- getStreamConfig
-    leaseDuration <- taskRegistryLeaseDuration <$> taskRegistry
     outTopic <- makeTopic sn
     metrics <- registerStepMetrics sn
     let outCfg = getTopicConfig outTopic
     let job pid _stillValid _release =
-          doForSeconds leaseDuration
+          doForSeconds (leaseDuration cfg)
             $ void
             $ logErrors cfg metrics sn
             $ runTransaction streamConfigDB
@@ -407,30 +393,27 @@ instance MonadStream LeaseBasedStreamWorker where
     forEachPartition inTopic $ \pid -> do
       let taskName = mkTaskName sn pid
       taskReg <- taskRegistry
-      taskReg' <-
-        liftIO
-          $ runTransaction streamConfigDB
-          $ addTask taskReg taskName (job pid)
-      put (cfg, taskReg')
+      liftIO
+        $ runTransaction streamConfigDB
+        $ addTask taskReg taskName (leaseDuration cfg) (job pid)
     return outTopic
 
   oneToOneJoin sn lt rt pl pr c = do
     cfg@FDBStreamConfig {streamConfigDB} <- getStreamConfig
-    leaseDuration <- taskRegistryLeaseDuration <$> taskRegistry
     outTopic <- makeTopic sn
     let outCfg = getTopicConfig outTopic
     metrics <- registerStepMetrics sn
     let lname = sn <> "0"
     let rname = sn <> "1"
     let ljob pid _stillValid _release =
-          doForSeconds leaseDuration
+          doForSeconds (leaseDuration cfg)
             $ void
             $ logErrors cfg metrics sn
             $ runTransaction streamConfigDB
             $ withNothing
               <$> oneToOneJoinStep cfg sn lname lt 0 outCfg pl c metrics pid
     let rjob pid _stillValid _release =
-          doForSeconds leaseDuration
+          doForSeconds (leaseDuration cfg)
             $ void
             $ logErrors cfg metrics sn
             $ runTransaction streamConfigDB
@@ -439,30 +422,25 @@ instance MonadStream LeaseBasedStreamWorker where
     forEachPartition lt $ \pid -> do
       let lTaskName = TaskName $ BS8.pack (show lname ++ "_" ++ show pid)
       taskReg <- taskRegistry
-      taskReg' <-
-        liftIO
-          $ runTransaction streamConfigDB
-          $ addTask taskReg lTaskName (ljob pid)
-      put (cfg, taskReg')
+      liftIO
+        $ runTransaction streamConfigDB
+        $ addTask taskReg lTaskName (leaseDuration cfg) (ljob pid)
     forEachPartition rt $ \pid -> do
       let rTaskName = TaskName $ BS8.pack (show rname ++ "_" ++ show pid)
       taskReg <- taskRegistry
-      taskReg' <-
-        liftIO
-          $ runTransaction streamConfigDB
-          $ addTask taskReg rTaskName (rjob pid)
-      put (cfg, taskReg')
+      liftIO
+        $ runTransaction streamConfigDB
+        $ addTask taskReg rTaskName (leaseDuration cfg) (rjob pid)
     return outTopic
 
   groupBy k t = return (GroupedBy t k)
 
   aggregate sn groupedBy@(GroupedBy inTopic _) toAggr = do
     cfg@FDBStreamConfig {streamConfigDB} <- getStreamConfig
-    leaseDuration <- taskRegistryLeaseDuration <$> taskRegistry
     let table = getAggrTable cfg sn
     metrics <- registerStepMetrics sn
     let job pid _stillValid _release =
-          doForSeconds leaseDuration
+          doForSeconds (leaseDuration cfg)
             $ void
             $ logErrors cfg metrics sn
             $ runTransaction streamConfigDB
@@ -471,20 +449,19 @@ instance MonadStream LeaseBasedStreamWorker where
     forEachPartition inTopic $ \pid -> do
       taskReg <- taskRegistry
       let taskName = TaskName $ BS8.pack (show sn ++ "_" ++ show pid)
-      taskReg' <-
-        liftIO
-          $ runTransaction streamConfigDB
-          $ addTask taskReg taskName (job pid)
-      put (cfg, taskReg')
+      liftIO
+        $ runTransaction streamConfigDB
+        $ addTask taskReg taskName (leaseDuration cfg) (job pid)
     return table
 
 -- TODO: what if we have recently removed steps from our topology? Old leases
 -- will be registered forever. Need to remove old ones.
 registerAllLeases :: FDBStreamConfig -> LeaseBasedStreamWorker a -> IO (a, TaskRegistry)
-registerAllLeases cfg =
+registerAllLeases cfg wkr = do
+  tr <- TaskRegistry.empty (taskRegSS cfg)
   fmap (fmap snd)
-    . flip State.runStateT (cfg, TaskRegistry.empty (taskRegSS cfg) (leaseDuration cfg))
-    . unLeaseBasedStreamWorker
+    $ flip State.runStateT (cfg, tr)
+    $ unLeaseBasedStreamWorker wkr
 
 runLeaseStreamWorker :: Int -> FDBStreamConfig -> LeaseBasedStreamWorker a -> IO ()
 runLeaseStreamWorker numThreads cfg topology = do
@@ -493,7 +470,7 @@ runLeaseStreamWorker numThreads cfg topology = do
   (_pureResult, taskReg) <- registerAllLeases cfg topology
   threads <- replicateM numThreads $ async $ forever $
     runRandomTask (streamConfigDB cfg) taskReg >>= \case
-      False -> threadDelay (taskRegistryLeaseDuration taskReg * 1000000 `div` 2)
+      False -> threadDelay (leaseDuration cfg * 1000000 `div` 2)
       True -> return ()
   _ <- waitAny threads
   return ()

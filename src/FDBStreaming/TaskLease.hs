@@ -10,7 +10,7 @@
 -- been reassigned to another worker (as it would in the case where the worker
 -- failed to commit its results before its lease on the lock timed out).
 -- All workers must have NTP configured correctly. A worker with a bad clock
--- could cause lock a task for longer than expected, or steal a lock before it
+-- could lock a task for longer than expected, or steal a lock before it
 -- has actually timed out.
 -- This design is based on the <https://github.com/apple/foundationdb/blob/master/layers/taskbucket/__init__.py task bucket layer>
 -- in FoundationDB.
@@ -27,6 +27,7 @@ module FDBStreaming.TaskLease (
   EnsureTaskResult(..),
   tryAcquire,
   acquireRandom,
+  acquireRandomUnbiased,
   HowAcquired(..),
   release,
   ReleaseResult(..),
@@ -40,6 +41,7 @@ import           Data.Binary.Get                ( runGet
                                                 )
 import           Data.ByteString                ( ByteString )
 import           Data.ByteString.Lazy           ( fromStrict )
+import           Data.Maybe                     ( fromMaybe )
 import           Data.Sequence                  ( Seq )
 import qualified Data.Sequence                  as Seq
 import           Data.String                    ( IsString )
@@ -121,6 +123,13 @@ availableKey (TaskSpace ss) (TaskID tid) (TaskName nm) =
               , FDB.Int (fromIntegral tid)
               , FDB.Bytes nm
               ]
+
+parseAvailableKey :: TaskSpace -> ByteString -> (TaskID, TaskName)
+parseAvailableKey (TaskSpace ss) bs = case FDB.unpack avSS bs of
+  Right [FDB.Int tid, FDB.Bytes nm] -> (TaskID (fromIntegral tid), TaskName nm)
+  xs -> error $ "parseAvailableKey failed! " ++ show xs
+
+  where avSS = FDB.extend ss [FDB.Bytes available]
 
 lockedKey :: TaskSpace -> TaskID -> TaskName -> ByteString
 lockedKey (TaskSpace ss) (TaskID tid) _ =
@@ -342,6 +351,13 @@ expiredLocks ls@(TaskSpace ss) = do
   res <- FDB.getEntireRange range
   return (fmap (\(k,_) -> snd (parseTimeoutsKey ls k)) res)
 
+availableLocks :: TaskSpace -> Transaction (Seq TaskName)
+availableLocks ts@(TaskSpace ss) = do
+  let availableSS = FDB.extend ss [FDB.Bytes available]
+  let range = FDB.subspaceRange availableSS
+  res <- FDB.getEntireRange range
+  return $ fmap (\(k,_) -> snd (parseAvailableKey ts k)) res
+
 acquireRandomExpired :: TaskSpace
                      -> Int
                      -> Transaction (Maybe (TaskName, AcquiredLease, HowAcquired))
@@ -361,6 +377,10 @@ data HowAcquired = RandomExpired | Available
   deriving (Show, Eq, Ord)
 
 -- | Attempt to acquire a random task. Returns the task name and lock version.
+-- This is faster than 'acquireRandomExpired' but can cause starvation of
+-- expired tasks when there are fewer workers than tasks, if some workers
+-- use deliver and others do not.
+{-# DEPRECATED acquireRandom "Expired tasks can starve when number of workers is less than number of tasks. Use acquireRandomUnbiased instead." #-}
 acquireRandom :: TaskSpace
               -> Int
               -> Transaction (Maybe (TaskName, AcquiredLease, HowAcquired))
@@ -390,3 +410,29 @@ acquireRandom l@(TaskSpace ss) seconds = do
       _ -> error $ "unexpected key format when acquiring lock: " ++ show k
 
     availableSS = FDB.extend ss [FDB.Bytes available]
+
+-- | Acquire a random available or expired lease. Unlike the deprecated
+-- 'acquireRandom', this is not biased towards available leases and is thus
+-- completely fair -- all tasks will progress. However, this has higher overhead
+-- -- it does two range reads to get all available and expired leases, while
+-- in most cases, acquireRandom does O(1) work. For the number of tasks we are
+-- typically using, however, this shouldn't be an issue.
+acquireRandomUnbiased :: TaskSpace
+                      -> (TaskName -> Int)
+                      -- ^ How long to lock the task, depending on its name.
+                      -> Transaction (Maybe (TaskName, AcquiredLease, HowAcquired))
+acquireRandomUnbiased ts taskSeconds = do
+  -- TODO: many more tests to ensure that these snapshot reads are safe and
+  -- that no two workers can acquire the same lease.
+  expireds <- FDB.withSnapshot $ expiredLocks ts
+  availables <- FDB.withSnapshot $ availableLocks ts
+  let tasks = expireds <> availables
+  let n = length tasks
+  if n > 0
+    then do
+      rand <- liftIO $ randomRIO (0, n - 1)
+      let taskName = fromMaybe (error "impossible") (tasks Seq.!? rand)
+      tv <- acquire ts taskName (taskSeconds taskName)
+      let how = if rand < length expireds then RandomExpired else Available
+      return $ Just (taskName, tv, how)
+    else return Nothing

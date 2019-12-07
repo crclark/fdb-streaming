@@ -24,7 +24,6 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async, wait)
 import Control.Monad (forM_, replicateM, void)
 import Control.Monad.IO.Class (liftIO)
-import Data.Foldable (foldlM)
 import Data.IORef (atomicModifyIORef, newIORef, readIORef)
 import Data.Kind (Type)
 import qualified Data.Map as Map
@@ -40,7 +39,7 @@ import FDBStreaming.TaskLease
     TaskName,
     TaskSpace (TaskSpace),
     TaskSpace,
-    acquireRandom,
+    acquireRandomUnbiased,
     ensureTask,
     release,
     tryAcquire,
@@ -114,7 +113,7 @@ semantics db testTaskSpace (EnsureTask taskName) = do
   result <- runTransaction db $ ensureTask testTaskSpace taskName
   return $ TaskEnsured result
 semantics db testTaskSpace (AcquireRandom n) = do
-  result <- runTransaction db $ acquireRandom testTaskSpace n
+  result <- runTransaction db $ acquireRandomUnbiased testTaskSpace (const n)
   case result of
     Nothing -> return AlreadyLocked
     Just (taskName, lease, _) -> return (AcquiredRandom taskName lease)
@@ -339,23 +338,23 @@ mutualExclusion testTaskSpace db = do
 mutualExclusionRandom :: TaskSpace -> Database -> SpecWith ()
 mutualExclusionRandom testTaskSpace db = do
   let taskName = "testTask2"
-  it "With only one task, acquireRandom should be equivalent to acquire" $ do
+  it "With only one task, acquireRandomUnbiased should be equivalent to acquire" $ do
     res <- runTransaction db $ ensureTask testTaskSpace taskName
     res `shouldSatisfy` isNewlyCreated
-    acq1 <- runTransaction db $ acquireRandom testTaskSpace 5
+    acq1 <- runTransaction db $ acquireRandomUnbiased testTaskSpace (const 5)
     acq1 `shouldBe` Just (taskName, AcquiredLease 1, Available)
-    acq2 <- runTransaction db $ acquireRandom testTaskSpace 5
+    acq2 <- runTransaction db $ acquireRandomUnbiased testTaskSpace (const 5)
     acq2 `shouldBe` Nothing
     threadDelay 7000000
-    acq3 <- runTransaction db $ acquireRandom testTaskSpace 5
+    acq3 <- runTransaction db $ acquireRandomUnbiased testTaskSpace (const 5)
     acq3 `shouldBe` Just (taskName, AcquiredLease 2, RandomExpired)
-    acq4 <- runTransaction db $ acquireRandom testTaskSpace 5
+    acq4 <- runTransaction db $ acquireRandomUnbiased testTaskSpace (const 5)
     acq4 `shouldBe` Nothing
 
 uniformRandomness :: TaskSpace -> Database -> SpecWith ()
 uniformRandomness (TaskSpace testSS) db =
   it "Should acquire each task once when they each get locked" $ do
-    let taskReg = TR.empty testSS 100
+    taskReg <- TR.empty testSS
     let tasks =
           [ "task1",
             "task2",
@@ -375,13 +374,11 @@ uniformRandomness (TaskSpace testSS) db =
             $ atomicModifyIORef
               taskRunCounts
               (\n -> (Map.adjust succ taskName n, ()))
-    let addTask' tr taskName = TR.addTask tr taskName (task taskName)
-    taskReg' <-
-      runTransaction db $
-        foldlM addTask' taskReg tasks
-    asyncs <- replicateM 50 (async $ TR.runRandomTask db taskReg')
+    let addTask' tr taskName = TR.addTask tr taskName 100 (task taskName)
+    runTransaction db $ forM_ tasks $ addTask' taskReg
+    asyncs <- replicateM 50 (async $ TR.runRandomTask db taskReg)
     forM_ asyncs wait
     finalCounts <- readIORef taskRunCounts
     finalCounts `shouldBe` Map.fromList (zip tasks (repeat 1))
-    oneMore <- TR.runRandomTask db taskReg'
+    oneMore <- TR.runRandomTask db taskReg
     oneMore `shouldBe` False

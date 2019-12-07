@@ -7,7 +7,6 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE TupleSections #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# OPTIONS_GHC -fno-warn-incomplete-uni-patterns #-}
@@ -38,7 +37,7 @@ import GHC.Generics (Generic)
 import Data.Text (Text)
 import Data.UUID (UUID)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, fromMaybe)
+import Data.Maybe (fromMaybe)
 import Data.Monoid (Sum, All, Any)
 import Statistics.Monoid (MeanKBN, CalcMean, StatMonoid(..))
 import           Data.Store                     ( Store )
