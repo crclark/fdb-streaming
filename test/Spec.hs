@@ -10,6 +10,7 @@ import FoundationDB.Versionstamp
 
 import Spec.FDBStreaming.TaskLease
 import Spec.FDBStreaming.AggrTable (tableProps)
+import Spec.FDBStreaming.Watermark (watermarks)
 
 import FDBStreaming.Topic
 
@@ -35,3 +36,4 @@ main = withFoundationDB defaultOptions $
       leaseProps testSS db
     describe "aggregation tables" $
       tableProps testSS db
+    describe "watermarks" $ watermarks testSS db

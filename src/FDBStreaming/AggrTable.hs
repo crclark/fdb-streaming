@@ -25,6 +25,9 @@ module FDBStreaming.AggrTable (
   PutIntLE(..)
 ) where
 
+-- TODO: runGet throws an exception if it fails to parse! Replace with runGetMay
+-- from FDBStreaming.Util
+
 import Control.Concurrent.Async (AsyncCancelled, async, waitAnyCancel)
 import Control.Exception (catch)
 import Control.Monad (forM, void)
