@@ -35,6 +35,14 @@ millisToBytes = toStrict . runPut . putInt64le
 bytesToMillis :: ByteString -> Maybe Int64
 bytesToMillis = runGetMay getInt64le
 
+-- NOTE: unlike most things in this project, we don't need to maintain one
+-- watermark per partition to avoid conflicts. Each worker on each iteration
+-- will read and then write a watermark. There will be no conflicts when reading
+-- watermarks, because they will be reading a watermark based on the version
+-- stamp of the last message in the batch they read -- which necessarily comes
+-- from a transaction that was already committed. When writing a watermark,
+-- they are using a versionstamped key, so there's no way that can conflict.
+
 watermarkIncompleteKey :: WatermarkSS -> Watermark -> ByteString
 watermarkIncompleteKey ss watermark =
   FDB.pack ss [ FDB.Bytes "w"
@@ -64,7 +72,7 @@ type WatermarkKey = ByteString
 -- needs to give us information about the times of the events, or we can't
 -- produce a watermark. For example, a flat text file may not have any natural
 -- timestamp associated with individual lines in the file. In contrast, Kafka
--- can tell us the time at which each event was inserted. In some cases, the
+-- can tell us the time at which each event was inserted. For some sources, the
 -- watermark is a heuristic, and events may arrive late.
 type Watermark = UTCTime
 

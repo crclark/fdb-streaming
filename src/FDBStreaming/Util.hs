@@ -7,12 +7,10 @@ module FDBStreaming.Util (
 import Data.Binary.Get (Get, runGetOrFail)
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (fromStrict)
-import Data.Coerce (coerce)
 import Data.Fixed (Fixed (MkFixed), E12)
-import Data.Time
-import Data.Time.Clock
-import Data.Time.Clock.POSIX
-import Data.Int
+import Data.Time.Clock (NominalDiffTime, UTCTime)
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
+import Data.Int (Int64)
 import Unsafe.Coerce (unsafeCoerce)
 
 millisSinceEpoch :: UTCTime -> Int64

@@ -1,21 +1,22 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module Spec.FDBStreaming.Watermark where
+module Spec.FDBStreaming.Watermark (
+  watermarks
+) where
 
-import Data.Time
+import Data.Time (UTCTime, addUTCTime, getCurrentTime)
 
-import FDBStreaming.Util
-import FDBStreaming.Watermark
-
-import FoundationDB (Database, clearRange, rangeKeys, runTransaction)
-import FoundationDB.Layer.Subspace (Subspace, subspaceRange)
+import FDBStreaming.Util (millisSinceEpoch)
+import FDBStreaming.Watermark (getWatermark, getCurrentWatermark, setWatermark)
+import FoundationDB (Database, runTransaction)
+import FoundationDB.Layer.Subspace (Subspace)
 import qualified FoundationDB as FDB
 import qualified FoundationDB.Layer.Subspace as FDB
 import qualified FoundationDB.Layer.Tuple as FDB
 import qualified FoundationDB.Versionstamp as FDB
 
-import Test.HUnit.Base
-import Test.Hspec (SpecWith, it, shouldBe, shouldSatisfy)
+import Test.HUnit.Base ()
+import Test.Hspec (SpecWith, it, shouldBe)
 
 addSecond :: UTCTime -> UTCTime
 addSecond = addUTCTime 1

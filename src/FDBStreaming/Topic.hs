@@ -95,6 +95,11 @@ data TopicConfig = TopicConfig { topicConfigDB :: FDB.Database
                                , partitionCountKey :: PartitionId -> ByteString
                                , numPartitions :: Integer
                                -- ^ TODO: don't export
+                               , topicCustomMetadataSS :: FDB.Subspace
+                               -- ^ A subspace for application-specific metadata
+                               -- to be used by users of this topic. Nothing in
+                               -- this module will read or write to this
+                               -- subspace.
                                }
 
 makeTopicConfig :: FDB.Database -> FDB.Subspace -> TopicName -> TopicConfig
@@ -111,7 +116,11 @@ makeTopicConfig topicConfigDB topicSS topicName = TopicConfig { .. }
   topicCountSS = FDB.extend
     topicSS
     [C.topics, FDB.Bytes topicName, C.metaCount]
+
   numPartitions = 2 -- TODO: make configurable
+
+  topicCustomMetadataSS =
+    FDB.extend topicSS [C.topics, FDB.Bytes topicName, C.customMeta]
 
 randPartition :: TopicConfig -> IO PartitionId
 randPartition TopicConfig {..} = randomRIO (0, numPartitions - 1)
@@ -196,12 +205,12 @@ writeTopic tc@TopicConfig {..} bss = do
   p <- randPartition tc
   FDB.runTransaction topicConfigDB $ writeTopic' tc p bss
 
-trOutput
+parseOutput
   :: TopicConfig
   -> PartitionId
   -> (ByteString, ByteString)
   -> (Versionstamp 'Complete, ByteString)
-trOutput TopicConfig {..} p (k, v) = case FDB.unpack (partitionMsgsSS p) k of
+parseOutput TopicConfig {..} p (k, v) = case FDB.unpack (partitionMsgsSS p) k of
   Right [FDB.CompleteVS vs] -> (vs, v)
   Right t -> error $ "unexpected tuple: " ++ show t
   Left err -> error $ "failed to decode " ++ show k ++ " because " ++ show err
@@ -288,7 +297,7 @@ readNPastCheckpoint tc p rn n = do
         , rangeLimit   = Just (fromIntegral n)
         , rangeReverse = False
         }
-  fmap (trOutput tc p) <$> withSnapshot (FDB.getEntireRange r)
+  fmap (parseOutput tc p) <$> withSnapshot (FDB.getEntireRange r)
 
 -- TODO: would be useful to have a version of this that returns a watch if
 -- there are no new messages.

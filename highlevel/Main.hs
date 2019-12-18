@@ -280,7 +280,7 @@ instance Message All where
   toMessage = Store.encode
   fromMessage = Store.decodeEx
 
-topology :: MonadStream m => TopicConfig -> m (AT.AggrTable OrderID All)
+topology :: (HasStreamConfig m, MonadStream m) => TopicConfig -> m (AT.AggrTable OrderID All)
 topology incoming = do
   input <- existing incoming
   let fraudChecks = fmap isFraudulent input
@@ -332,7 +332,6 @@ mainLoop db ss Args{ generatorNumThreads
                    , generatorBatchSize
                    , generatorWatchResults
                    , streamRun
-                   , useWatches
                    , printTopicStats
                    , batchSize
                    , numLeaseThreads } = do
@@ -343,7 +342,6 @@ mainLoop db ss Args{ generatorNumThreads
   let conf = FDBStreamConfig { streamConfigDB = db
                              , streamConfigSS = ss
                              , streamMetricsStore = Just metricsStore
-                             , useWatches = coerce useWatches
                              , msgsPerBatch = coerce batchSize
                              , leaseDuration = 10
                              }
@@ -382,7 +380,6 @@ data Args f = Args
   , generatorWatchResults :: f Bool
   , streamRun :: f Bool
   , cleanupFirst :: f Bool
-  , useWatches :: f Bool
   , printTopicStats :: f Bool
   , batchSize :: f Word8
   , numLeaseThreads :: f Int
@@ -403,7 +400,6 @@ applyDefaults Args{..} = Args
   , generatorWatchResults = dflt True generatorWatchResults
   , streamRun = dflt True streamRun
   , cleanupFirst = dflt True cleanupFirst
-  , useWatches = dflt False useWatches
   , printTopicStats = dflt True printTopicStats
   , batchSize = dflt 50 batchSize
   , numLeaseThreads = dflt 12 numLeaseThreads
