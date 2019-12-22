@@ -5,9 +5,14 @@ module Spec.FDBStreaming.Watermark (
 ) where
 
 import Data.Time (UTCTime, addUTCTime, getCurrentTime)
-
+import Data.Int (Int64)
 import FDBStreaming.Util (millisSinceEpoch)
-import FDBStreaming.Watermark (getWatermark, getCurrentWatermark, setWatermark)
+import FDBStreaming.Watermark
+  ( Watermark(Watermark, watermarkUTCTime),
+    getWatermark,
+    getCurrentWatermark,
+    setWatermark
+  )
 import FoundationDB (Database, runTransaction)
 import FoundationDB.Layer.Subspace (Subspace)
 import qualified FoundationDB as FDB
@@ -21,30 +26,34 @@ import Test.Hspec (SpecWith, it, shouldBe)
 addSecond :: UTCTime -> UTCTime
 addSecond = addUTCTime 1
 
+-- Round to milliseconds
+rounded :: Watermark -> Int64
+rounded = millisSinceEpoch . watermarkUTCTime
+
 watermarks :: Subspace -> Database -> SpecWith ()
 watermarks ss db = do
   let watermarkSS = FDB.extend ss [FDB.Bytes "watermarktest"]
   it "should get what we set" $ do
-    t <- getCurrentTime
+    t <- Watermark <$> getCurrentTime
     runTransaction db $ setWatermark watermarkSS t
     mw <- runTransaction db $ getCurrentWatermark watermarkSS >>= FDB.await
-    fmap millisSinceEpoch mw `shouldBe` Just (millisSinceEpoch t)
+    (fmap rounded mw) `shouldBe` Just (rounded t)
 
   it "allows looking up watermark by version" $ do
-    t <- getCurrentTime
+    t <- Watermark <$> getCurrentTime
     fv <- runTransaction db $ do setWatermark watermarkSS t
                                  FDB.getVersionstamp
     (Right (Right (FDB.TransactionVersionstamp v _))) <- FDB.awaitIO fv
-    runTransaction db $ setWatermark watermarkSS (addSecond t)
+    runTransaction db $ setWatermark watermarkSS (Watermark $ addSecond $ watermarkUTCTime t)
     mw <- runTransaction db $ getWatermark watermarkSS v >>= FDB.await
-    fmap millisSinceEpoch mw `shouldBe` Just (millisSinceEpoch t)
+    (fmap rounded mw) `shouldBe` Just (rounded t)
 
   it "is guaranteed to monotonically increase, regardless of input" $ do
     t1 <- getCurrentTime
     let t2 = addSecond t1
-    runTransaction db $ setWatermark watermarkSS t2
-    runTransaction db $ setWatermark watermarkSS t1
+    runTransaction db $ setWatermark watermarkSS $ Watermark t2
+    runTransaction db $ setWatermark watermarkSS $ Watermark t1
     mw <- runTransaction db $ getCurrentWatermark watermarkSS >>= FDB.await
-    fmap millisSinceEpoch mw `shouldBe` Just (millisSinceEpoch t2)
+    (fmap rounded mw) `shouldBe` Just (rounded $ Watermark t2)
 
 

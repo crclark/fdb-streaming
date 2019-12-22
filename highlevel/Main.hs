@@ -280,7 +280,7 @@ instance Message All where
   toMessage = Store.encode
   fromMessage = Store.decodeEx
 
-topology :: (HasStreamConfig m, MonadStream m) => TopicConfig -> m (AT.AggrTable OrderID All)
+topology :: (MonadStream m) => TopicConfig -> m (AT.AggrTable OrderID All)
 topology incoming = do
   input <- existing incoming
   let fraudChecks = fmap isFraudulent input

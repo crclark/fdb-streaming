@@ -1,21 +1,28 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE DerivingVia #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 
 module FDBStreaming.Watermark (
-  Watermark,
+  Watermark(..),
   WatermarkKey,
   WatermarkSS,
   setWatermark,
   getCurrentWatermark,
-  getWatermark
+  getWatermark,
+  minWatermark,
+  watermarkMillisSinceEpoch
 ) where
 
+import Control.DeepSeq (NFData)
 import Data.Binary.Get (getInt64le)
 import Data.Binary.Put (runPut, putInt64le)
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (toStrict)
+import Data.Data (Data)
 import Data.Int (Int64)
-import Data.Time (UTCTime)
+import Data.Time (UTCTime, ParseTime, FormatTime)
 import Data.Word (Word64)
 import qualified FoundationDB as FDB
 import qualified FoundationDB.Layer.Subspace as FDB
@@ -28,6 +35,9 @@ import FoundationDB as FDB
     Future
   )
 import FDBStreaming.Util (millisSinceEpoch, millisSinceEpochToUTC, runGetMay)
+
+watermarkMillisSinceEpoch :: Watermark -> Int64
+watermarkMillisSinceEpoch = millisSinceEpoch . watermarkUTCTime
 
 millisToBytes :: Int64 -> ByteString
 millisToBytes = toStrict . runPut . putInt64le
@@ -47,7 +57,10 @@ watermarkIncompleteKey :: WatermarkSS -> Watermark -> ByteString
 watermarkIncompleteKey ss watermark =
   FDB.pack ss [ FDB.Bytes "w"
               , FDB.IncompleteVS (FDB.IncompleteVersionstamp 0)
-              , FDB.Bytes $ millisToBytes $ millisSinceEpoch watermark]
+              , FDB.Bytes
+                  $ millisToBytes
+                  $ millisSinceEpoch
+                  $ watermarkUTCTime watermark]
 
 versionWatermarkQueryKey :: WatermarkSS -> Word64 -> ByteString
 versionWatermarkQueryKey ss version =
@@ -74,7 +87,17 @@ type WatermarkKey = ByteString
 -- timestamp associated with individual lines in the file. In contrast, Kafka
 -- can tell us the time at which each event was inserted. For some sources, the
 -- watermark is a heuristic, and events may arrive late.
-type Watermark = UTCTime
+--
+-- For technical reasons, we must in some cases return a default minimum
+-- watermark when no watermark is otherwise available. In such cases, use
+-- 'minWatermark', which is arbitrarily defined to be the start of the
+-- Unix Epoch.
+newtype Watermark = Watermark { watermarkUTCTime :: UTCTime }
+  deriving stock (Eq, Data, Ord, Read, Show)
+  deriving newtype (FormatTime, NFData, ParseTime)
+
+minWatermark :: Watermark
+minWatermark = Watermark $ millisSinceEpochToUTC 0
 
 type WatermarkSS = FDB.Subspace
 
@@ -93,7 +116,7 @@ parseWatermarkKeyResult ss k = case FDB.unpack ss k of
   Right [FDB.Bytes "w", FDB.CompleteVS _, FDB.Bytes millisBytes] ->
     case bytesToMillis millisBytes of
       Nothing -> error "Failed to parse watermark"
-      Just watermark -> Just (millisSinceEpochToUTC watermark)
+      Just watermark -> Just $ Watermark $ millisSinceEpochToUTC watermark
   Right _ -> Nothing
 
 -- Get the current high watermark for the given watermark subspace.
