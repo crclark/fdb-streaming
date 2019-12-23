@@ -60,7 +60,6 @@ import Control.Monad.State.Strict (MonadState, StateT, gets)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BS8
 import Data.Foldable (toList)
-import Data.Maybe (fromJust, fromMaybe, isJust, isNothing)
 import Data.Sequence (Seq ())
 import qualified Data.Sequence as Seq
 import Data.Text.Encoding (decodeUtf8)
@@ -197,7 +196,7 @@ data Stream a
       { getTopicConfig :: TopicConfig
       , isWatermarked :: Bool
       -- ^ True iff the processor writing to this stream
-      -- is watermarking it. If True, 'watermarkSS' will
+      -- or a periodic job is watermarking it. If True, 'watermarkSS' will
       -- return a non-Nothing result. When using 'existing'
       -- to access a stream created elsewhere, this will
       -- default to false, even if it really is watermarked.
@@ -244,25 +243,58 @@ benignIO g (Stream cfg ps (f :: c -> IO (Maybe a))) =
       Nothing -> return Nothing
       Just z -> g z
 
+-- | Type specifying how the output stream of a stream processor should be
+-- watermarked.
+data WatermarkBy a =
+  -- | Watermark the output stream by taking the minimum checkpoint across
+  -- all partitions of all input streams, getting the watermark of all those
+  -- streams as of those checkpoints, and persisting that as the watermark at
+  -- the current database version. Because this logic is somewhat expensive,
+  -- it is not run transactionally with the stream processor's core logic.
+  -- Instead, it is executed periodically.
+  DefaultWatermark
+  -- | A function that assigns a watermark to the output of a stream processor.
+  --
+  -- This function will be called on only one output event for each batch of events
+  -- processed.
+  --
+  -- If this function returns a watermark that is less than the watermark it
+  -- returned on a previous invocation for the stream, its output will be
+  -- ignored, because watermarks must be monotonically increasing.
+  --
+  -- This watermark will be applied transactionally with each batch processed.
+  | CustomWatermark (a -> Transaction Watermark)
+  -- | Do not watermark the output stream. This can be used for batch inputs,
+  -- or in cases where there are no concerns about the completeness of data
+  -- in aggregation tables. Naturally, this option is most performant.
+  | NoWatermark
+
+producesWatermark :: WatermarkBy a -> Bool
+producesWatermark NoWatermark = False
+producesWatermark _           = True
+
 -- | A step that writes to a topic. This would usually be used for testing and
 -- such, since it doesn't have any checkpointing mechanism.
 data WriteOnlyProcessor a = WriteOnlyProcessor {
-  writeOnlyWatermarkBy :: Maybe (a -> Transaction Watermark),
+  writeOnlyWatermarkBy :: WatermarkBy a,
   writeOnlyProduce :: Transaction (Maybe a)
 }
 
 data StreamProcessor a b = StreamProcessor {
   streamProcessorInStream :: Stream a,
-  _watermarkBy :: Maybe ((Versionstamp 'Complete, a) -> Transaction Watermark),
+  _watermarkBy :: WatermarkBy b,
   processBatch :: Seq (Versionstamp 'Complete, a)
                -> Transaction (Seq b)
 }
 
+--TODO: I think this could be replaced with a more general horizontal
+--composition processor that contains two normal stream processors that
+--both write to the same output stream.
 data JoinProcessor a b where
   Join2Processor :: (Message a1, Message a2, Message b)
                  => Stream a1
                  -> Stream a2
-                 -> Maybe ((Versionstamp 'Complete, (a1,a2)) -> Transaction Watermark)
+                 -> WatermarkBy b
                  -- TODO: passing in the TopicConfig so that the step knows
                  -- where to write its state. Probably all user-provided
                  -- batch processing callbacks should take a subspace that they
@@ -280,7 +312,14 @@ data JoinProcessor a b where
 data TableProcessor k v aggr = TableProcessor {
   tableProcessorGroupedBy :: GroupedBy k v,
   tableProcessorAggregation :: v -> aggr,
-  tableProcessorWatermarkBy :: Maybe ((Versionstamp 'Complete, v) -> Transaction Watermark)
+  -- | An optional custom watermark function for this aggregation.
+  -- NOTE: the input to the watermark function will be only the
+  -- value that will be monoidally appended to the value already
+  -- stored in the table at key k, not the full value stored at
+  -- k. This is done for efficiency reasons. If you want the full
+  -- value at key k, you will need to fetch it yourself inside
+  -- your watermark function. --TODO: is that possible?
+  tableProcessorWatermarkBy :: WatermarkBy (k, aggr)
 }
 
 data TriggeringTableProcessor k v aggr = TriggeringTableProcessor {
@@ -294,10 +333,6 @@ triggerBy :: ((Versionstamp 'Complete, v, [k]) -> Transaction [(k,aggr)])
           -> TriggeringTableProcessor k v aggr
 triggerBy f tbp = TriggeringTableProcessor tbp f
 
--- WIP replacement for MonadStream with new functions that take our new records
--- as input. The original functions in MonadStream will still be exported from
--- this namespace, but they won't be part of the type class anymore.
---
 -- The functions in this type class will not be exported. Instead, The generic
 -- run function in StreamStep will be. This will allow users to either keep
 -- using the simple interface provided by the original MonadStream helper
@@ -312,7 +347,9 @@ triggerBy f tbp = TriggeringTableProcessor tbp f
 -- the record types, when it seems like we might only need one, is because we
 -- want the benefits of both. The tagless final interface allows us to interpret
 -- the DAG in multiple ways, including checking for errors, forward
--- compatibility checks, running with different strategies, etc.
+-- compatibility checks, running with different strategies, etc. The record
+-- interface allows us to use a builder style to modify our stream processors
+-- at a distance, with functions like 'watermarkBy'.
 class Monad m => MonadStream m where
   runWriteOnlyProcessor :: Message a => StepName -> WriteOnlyProcessor a -> m (Stream a)
   runStreamProcessor :: (Message a, Message b) => StepName -> StreamProcessor a b -> m (Stream b)
@@ -323,6 +360,8 @@ class Monad m => MonadStream m where
 -- For pipe-like steps that produce Streams.
 -- TODO: consider whether it would be possible to unify the constituents into a
 -- sum type.
+-- TODO: there is documentation in WatermarkBy that should be moved to
+-- watermarkBy.
 class StreamStep s where
   -- TODO: it's kind of weird that these are indexed type families instead of
   -- parameters of s. We seem to need this in order to allow individual
@@ -335,27 +374,25 @@ class StreamStep s where
   type StepOutputMessage s
   type StepOutput s
   run :: (Message (StepInputMessage s), Message (StepOutputMessage s), MonadStream m) => StepName -> s -> m (StepOutput s)
-  watermarkBy :: ((Versionstamp 'Complete, StepInputMessage s) -> Transaction Watermark)
+  watermarkBy :: ((StepOutputMessage s) -> Transaction Watermark)
               -> s
               -> s
   -- TODO: other composable optional operations we want to share across
   -- different step types.
 
-
--- TODO: figure out watermarkBy. I guess we could just pass in the read version
 instance StreamStep (WriteOnlyProcessor a) where
   type StepInputMessage (WriteOnlyProcessor a) = Void
   type StepOutputMessage (WriteOnlyProcessor a) = a
   type StepOutput (WriteOnlyProcessor a) = Stream a
   run = runWriteOnlyProcessor
-  watermarkBy = error "watermarkBy not supported for WriteOnlyProcessor"
+  watermarkBy f sp = sp {writeOnlyWatermarkBy = CustomWatermark f}
 
 instance StreamStep (StreamProcessor a b) where
   type StepInputMessage (StreamProcessor a b) = a
   type StepOutputMessage (StreamProcessor a b) = b
   type StepOutput (StreamProcessor a b) = Stream b
   run = runStreamProcessor
-  watermarkBy f sp = sp {_watermarkBy = Just f}
+  watermarkBy f sp = sp {_watermarkBy = CustomWatermark f}
 
 instance StreamStep (JoinProcessor a b) where
   type StepInputMessage (JoinProcessor a b) = a
@@ -363,49 +400,21 @@ instance StreamStep (JoinProcessor a b) where
   type StepOutput (JoinProcessor a b) = Stream b
   run = runJoinProcessor
   watermarkBy f (Join2Processor s1 s2 _ p1 p2) =
-    Join2Processor s1 s2 (Just f) p1 p2
+    Join2Processor s1 s2 (CustomWatermark f) p1 p2
 
 instance (Ord k, AT.TableKey k, AT.TableSemigroup aggr)
   => StreamStep (TableProcessor k v aggr) where
   type StepInputMessage (TableProcessor k v aggr) = v
-  type StepOutputMessage (TableProcessor k v aggr) = aggr
+  type StepOutputMessage (TableProcessor k v aggr) = (k, aggr)
   type StepOutput (TableProcessor k v aggr) = AT.AggrTable k aggr
   run = runTableProcessor
   watermarkBy f (TableProcessor gb aggr _) =
-    TableProcessor gb aggr (Just f)
-
--- | Takes the result of getWatermarkSS from each parent stream of
--- the current stream. If all parent streams are watermarked
--- (signified by non-Nothing results from getWatermarkSS), watermark
--- elements we send downstream using the minimum of the watermarks of
--- the parent streams.
-defaultWatermark :: [Maybe WatermarkSS] -> Maybe ((Versionstamp 'Complete, a) -> Transaction Watermark)
-defaultWatermark [] = Nothing
-defaultWatermark parents | any isNothing parents = Nothing
-defaultWatermark parents = Just $ \(CompleteVersionstamp (TransactionVersionstamp version _) _,_) -> do
-  futures <- forM parents $ \parent -> getWatermark (fromJust parent) version
-  mWatermarks <- forM futures await
-  -- We have a sequence of Maybe Watermark.
-  -- If one is Nothing, that means that the upstream
-  -- topic has a watermark function defined, but has
-  -- never been watermarked, meaning the upstream
-  -- topic is empty. Since a watermark is the minimum
-  -- timestamp for which we have all data, we need to
-  -- take the minimum of the parent watermarks. Also,
-  -- watermarks should be monotonically increasing. It
-  -- seems our only choice is to replace them with
-  -- the start of the Unix Epoch, even though this
-  -- might be confusing to users in weird edge cases.
-  -- TODO: document this somewhere.
-  return
-    $ minimum
-    $ map (fromMaybe minWatermark)
-    $ mWatermarks
+    TableProcessor gb aggr (CustomWatermark f)
 
 instance (Ord k, AT.TableKey k, AT.TableSemigroup aggr)
   => StreamStep (TriggeringTableProcessor k v aggr) where
   type StepInputMessage (TriggeringTableProcessor k v aggr) = v
-  type StepOutputMessage (TriggeringTableProcessor k v aggr) = aggr
+  type StepOutputMessage (TriggeringTableProcessor k v aggr) = (k, aggr)
   type StepOutput (TriggeringTableProcessor k v aggr) = (AT.AggrTable k aggr, Stream (k,aggr))
   run = runTriggeringTableProcessor
   watermarkBy f (TriggeringTableProcessor tp tb) =
@@ -433,7 +442,7 @@ existing tc = return (Stream tc False (return . Just))
 produce :: (Message a, MonadStream m) => StepName -> Transaction (Maybe a) -> m (Stream a)
 produce sn f =
   runWriteOnlyProcessor sn
-    $ WriteOnlyProcessor Nothing f
+    $ WriteOnlyProcessor NoWatermark f
 
 -- TODO: better operation for externally-visible side effects. Perhaps we can
 -- introduce an atMostOnceSideEffect type for these sorts of things, that
@@ -449,7 +458,7 @@ atLeastOnce :: (Message a, MonadStream m) => StepName -> Stream a -> (a -> IO ()
 atLeastOnce sn input f = void $ do
   runStreamProcessor sn
     $ StreamProcessor {streamProcessorInStream = input,
-                       _watermarkBy = defaultWatermark [watermarkSS input],
+                       _watermarkBy = NoWatermark,
                        processBatch = (mapM (\(_,x) -> liftIO $ f x))}
 
 -- I think we can do so if we remove the DB from the topic config internals. Not
@@ -479,16 +488,14 @@ pipe' ::
   -- TODO: let user take a batch of items at once, and potentially split
   -- one message into multiple downstream messages.
   -- i.e., below type should be (t a -> IO (t b))
-  -- TODO: this should allow adding arbitrary ops to the transaction, so
-  -- that we can implement other cool stuff in terms of this abstraction, like
-  -- secondary indexes.
   (a -> IO (Maybe b)) ->
   StreamProcessor a b
 pipe' input f =
   StreamProcessor {streamProcessorInStream = input,
-                   _watermarkBy = defaultWatermark [watermarkSS input], --TODO: wrong. this doesn't actually tell us whether the parent is being watermarked or not, just gives us the SS where the watermark might be written
+                   _watermarkBy = if isWatermarked input
+                                     then DefaultWatermark
+                                     else NoWatermark,
                    processBatch = (\b -> catMaybes <$> forM b (\(_,x) -> liftIO $ f x))}
-
 
 -- | Streaming one-to-one join. If the relationship is not actually one-to-one
 --   (i.e. the input join functions are not injective), some messages in the
@@ -520,7 +527,9 @@ oneToOneJoin' inl inr pl pr j =
     rstep = \cfg -> oneToOneJoinStep cfg 1 pr (flip j)
     in Join2Processor inl
                       inr
-                      (defaultWatermark [watermarkSS inl, watermarkSS inr])
+                      (if isWatermarked inl && isWatermarked inr
+                          then DefaultWatermark
+                          else NoWatermark)
                       lstep
                       rstep
 
@@ -554,7 +563,10 @@ aggregate' ::
   (v -> aggr) ->
   TableProcessor k v aggr
 aggregate' groupedBy@(GroupedBy input _) f =
-  TableProcessor groupedBy f (defaultWatermark [watermarkSS input])
+  TableProcessor
+    groupedBy
+    f
+    (if isWatermarked input then DefaultWatermark else NoWatermark)
 
 class HasStreamConfig m where
   getStreamConfig :: m FDBStreamConfig
@@ -640,11 +652,15 @@ doForSeconds n f = do
 mkTaskName :: StepName -> PartitionId -> TaskName
 mkTaskName sn pid = TaskName $ BS8.pack (show sn ++ "_" ++ show pid)
 
+runCustomWatermark :: WatermarkBy a -> Transaction (Seq a) -> Transaction (Seq a)
+runCustomWatermark (CustomWatermark f) t = error "TODO"
+runCustomWatermark _ t = t
+
 instance MonadStream LeaseBasedStreamWorker where
 
   runWriteOnlyProcessor sn WriteOnlyProcessor {writeOnlyProduce,
                                                writeOnlyWatermarkBy} = do
-    output <- makeStream sn (isJust writeOnlyWatermarkBy) -- TODO: watermark for this one
+    output <- makeStream sn (producesWatermark writeOnlyWatermarkBy)
     (cfg@FDBStreamConfig {msgsPerBatch, streamConfigDB}, taskReg) <- State.get
     metrics <- registerStepMetrics sn
     let job _stillValid _release =
@@ -652,6 +668,10 @@ instance MonadStream LeaseBasedStreamWorker where
             $ void
             $ logErrors cfg metrics sn
             $ runTransaction streamConfigDB
+            -- TODO: if we trust the user to give us a monotonic
+            -- watermark function, custom watermarking could use versionstamped
+            -- operations for improved performance.
+            $ runCustomWatermark writeOnlyWatermarkBy
             $ produceStep msgsPerBatch (getTopicConfig output) writeOnlyProduce
     liftIO
       $ runTransaction streamConfigDB
@@ -661,7 +681,7 @@ instance MonadStream LeaseBasedStreamWorker where
   runStreamProcessor sn StreamProcessor { streamProcessorInStream
                                         , _watermarkBy
                                         , processBatch} = do
-    output <- makeStream sn (isJust _watermarkBy)
+    output <- makeStream sn (producesWatermark _watermarkBy)
     let outCfg = getTopicConfig output
     (cfg@FDBStreamConfig {streamConfigDB}, _) <- State.get
     metrics <- registerStepMetrics sn
@@ -670,7 +690,7 @@ instance MonadStream LeaseBasedStreamWorker where
             $ void
             $ logErrors cfg metrics sn
             $ runTransaction streamConfigDB
-            -- $ watermarkLogic _watermarkBy --TODO: complete
+            $ runCustomWatermark _watermarkBy --TODO: complete
             $ pipeStep cfg streamProcessorInStream outCfg sn processBatch metrics pid
     forEachPartition streamProcessorInStream $ \pid -> do
       let taskName = mkTaskName sn pid
@@ -861,7 +881,7 @@ logErrors ::
   FDBStreamConfig ->
   Maybe StreamEdgeMetrics ->
   StepName ->
-  IO Int ->
+  IO (Seq a) ->
   IO ()
 logErrors _ metrics sn x =
   flip
@@ -890,7 +910,7 @@ logErrors _ metrics sn x =
     $ do
       threadDelay 150
       t1 <- getTime Monotonic
-      numProcessed <- x
+      numProcessed <- length <$> x
         `catch` \(e :: FDB.Error) -> case e of
           Error (MaxRetriesExceeded (CError TransactionTimedOut)) -> do
             t2 <- getTime Monotonic
@@ -899,13 +919,17 @@ logErrors _ metrics sn x =
               "%s timed out after %d ms, assuming we processed no messages.\n"
               (show sn)
               timeMillis
-            return 0
+            return mempty
           _ -> throw e
       t2 <- getTime Monotonic
       let timeMillis = (`div` 1000000) $ toNanoSecs $ diffTimeSpec t2 t1
       recordBatchLatency metrics timeMillis
       when (numProcessed == 0) (threadDelay 1000000)
 
+-- | Given a function that computes a watermark for a new output value and a
+-- versionstamp, run the function and, if the output watermark is greater
+-- than the current watermark for this stream, sets the stream watermark
+-- to the output watermark.
 watermarkLogic :: Maybe ((Versionstamp 'Complete, a) -> Transaction Watermark)
                -> Transaction (Seq (Versionstamp 'Complete, a))
                -> Transaction (Seq (Versionstamp 'Complete, a))
@@ -917,14 +941,14 @@ produceStep ::
   Word8 ->
   TopicConfig ->
   Transaction (Maybe a) ->
-  FDB.Transaction Int
+  FDB.Transaction (Seq a)
 produceStep batchSize outCfg step = do
   -- TODO: this keeps spinning even if the producer is done and will never
   -- produce again.
   xs <- catMaybes <$> replicateM (fromIntegral batchSize) step
   p' <- liftIO $ randPartition outCfg
   writeTopic' outCfg p' (fmap toMessage xs)
-  return (length xs)
+  return (Seq.fromList xs)
 
 pipeStep ::
   (Message b) =>
@@ -935,7 +959,7 @@ pipeStep ::
   (Seq (Versionstamp 'Complete, a) -> Transaction (Seq b)) ->
   Maybe StreamEdgeMetrics ->
   PartitionId ->
-  Transaction Int -- (Seq (Versionstamp 'Complete, a))
+  Transaction (Seq b)
 pipeStep
   FDBStreamConfig {msgsPerBatch}
   inTopic
@@ -955,7 +979,7 @@ pipeStep
     let outMsgs = fmap toMessage ys
     p' <- liftIO $ randPartition outCfg
     writeTopic' outCfg p' outMsgs
-    return (length inMsgs)
+    return ys
 
 oneToOneJoinStep ::
   forall a1 a2 b c .
@@ -1003,7 +1027,7 @@ aggregateStep ::
   (v -> aggr) ->
   Maybe StreamEdgeMetrics ->
   PartitionId ->
-  FDB.Transaction Int
+  FDB.Transaction (Seq (k,aggr))
 aggregateStep
   c@FDBStreamConfig {msgsPerBatch}
   sn
@@ -1021,4 +1045,4 @@ aggregateStep
         msgsPerBatch
     let kvs = [(k,toAggr v) | v <- toList msgs, k <- toKeys v]
     AT.mappendBatch table pid kvs
-    return (length msgs)
+    return (Seq.fromList kvs)
