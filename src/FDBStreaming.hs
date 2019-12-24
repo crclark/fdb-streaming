@@ -54,15 +54,17 @@ import Control.Exception
     throw,
   )
 import Control.Monad (forM, forM_, forever, replicateM, void, when)
+import Control.Monad.Identity (Identity, runIdentity)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import qualified Control.Monad.State.Strict as State
 import Control.Monad.State.Strict (MonadState, StateT, gets)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BS8
-import Data.Foldable (toList)
+import Data.Foldable (toList, for_)
 import Data.Sequence (Seq ())
 import qualified Data.Sequence as Seq
 import Data.Text.Encoding (decodeUtf8)
+import Data.Traversable (for)
 import Data.Void (Void)
 import Data.Witherable (catMaybes, mapMaybe, Filterable)
 import Data.Word (Word8)
@@ -84,6 +86,7 @@ import FDBStreaming.Topic
   ( PartitionId,
     ReaderName,
     TopicConfig (numPartitions, topicCustomMetadataSS, topicConfigDB, topicSS),
+    getCheckpoints,
     makeTopicConfig,
     randPartition,
     readNAndCheckpoint',
@@ -95,7 +98,8 @@ import FDBStreaming.Watermark
     WatermarkSS,
     getCurrentWatermark,
     getWatermark,
-    minWatermark
+    minWatermark,
+    setWatermark
   )
 import FoundationDB as FDB
   ( Database,
@@ -116,6 +120,7 @@ import FoundationDB.Versionstamp
     VersionstampCompleteness(Complete),
     TransactionVersionstamp(TransactionVersionstamp)
   )
+import Safe.Foldable (minimumDef, minimumMay)
 import System.Clock (Clock (Monotonic), diffTimeSpec, getTime, toNanoSecs)
 import qualified System.Metrics as Metrics
 import System.Metrics.Counter (Counter)
@@ -210,14 +215,16 @@ data Stream a
         -- consumers of this topic, so they should be idempotent.
       }
 
+topicWatermarkSS :: TopicConfig -> WatermarkSS
+topicWatermarkSS = flip FDB.extend [FDB.Bytes "wm"] . topicCustomMetadataSS
+
 -- | Returns the subspace in which the given stream's watermarks are stored.
 --
 watermarkSS :: Stream a -> Maybe WatermarkSS
 watermarkSS stream =
   if isWatermarked stream
     then Just
-           $ flip FDB.extend [FDB.Bytes "wm"]
-           $ topicCustomMetadataSS
+           $ topicWatermarkSS
            $ getTopicConfig stream
     else Nothing
 
@@ -357,6 +364,31 @@ class Monad m => MonadStream m where
   runTableProcessor :: (Ord k, AT.TableKey k, AT.TableSemigroup aggr) => StepName -> TableProcessor k v aggr -> m (AT.AggrTable k aggr)
   runTriggeringTableProcessor :: StepName -> TriggeringTableProcessor k v aggr -> m (AT.AggrTable k aggr, Stream (k,aggr))
 
+-- | Monad that traverses a stream DAG, building up a transaction that updates
+-- the watermarks for all streams that don't have custom watermarks defined.
+-- This transaction will be run periodically, while custom watermarks are
+-- committed transactionally with the batch of events being processed.
+--
+-- The reason this traverses the DAG is so that the watermarks are updated in
+-- topological order. This ensures that each stream sees the latest watermark
+-- info for its parent streams. The downside is that the transaction may be
+-- somewhat large for very large DAGs.
+newtype DefaultWatermarker a = DefaultWatermarker
+  {runDefaultWatermarker :: StateT (Transaction ()) Identity a}
+  deriving (Functor, Applicative, Monad, MonadState (Transaction ()))
+
+instance MonadStream DefaultWatermarker where
+  runWriteOnlyProcessor sn p = do
+    undefined
+  runStreamProcessor sn p = do
+    undefined
+  runJoinProcessor sn p = do
+    undefined
+  runTableProcessor sn p = do
+    undefined
+  runTriggeringTableProcessor sn p = do
+    undefined
+
 -- For pipe-like steps that produce Streams.
 -- TODO: consider whether it would be possible to unify the constituents into a
 -- sum type.
@@ -370,6 +402,8 @@ class StreamStep s where
   -- A better way to do this would be to put the miscellaneous extra params
   -- at the front of the list and make the last two the input and output
   -- message types. However, then we seem to still need StepOutput.
+  -- Actually, a GADT could do the trick -- different step output type for
+  -- each constructor.
   type StepInputMessage s
   type StepOutputMessage s
   type StepOutput s
@@ -419,6 +453,45 @@ instance (Ord k, AT.TableKey k, AT.TableSemigroup aggr)
   run = runTriggeringTableProcessor
   watermarkBy f (TriggeringTableProcessor tp tb) =
     TriggeringTableProcessor (watermarkBy f tp) tb
+
+-- | Runs the standard watermark logic for a stream. For each input stream,
+-- finds the minimum checkpoint across all its partitions. For each of these
+-- checkpoints, find the corresponding watermark for the corresponding input
+-- stream. The minimum of these watermarks is our new watermark. This watermark
+-- is persisted as the watermark for the output topic.
+--
+-- This function assumes that all parent watermarks are monotonically
+-- increasing, for efficiency. If that's not true, chaos will ensue.
+--
+-- This function also assumes that all input streams are actually
+-- watermarked. If not, we produce the default watermark (Jan 1 1970).
+defaultWatermark :: [TopicConfig]
+                 -- ^ All parent input streams
+                 -> StepName
+                 -- ^ The name of the step producing the output stream
+                 -> Stream a
+                 -- ^ The output stream we are watermarking
+                 -> Transaction ()
+defaultWatermark parents sn outStream = for_ (watermarkSS outStream) \wmSS -> do
+  minCheckpointsF <- withSnapshot $ for parents \parent -> do
+                       chkptsF <- getCheckpoints parent sn
+                       return
+                         $ flip fmap chkptsF \ckpts -> (parent, minimumDef minBound ckpts)
+  ourOldWMF <- getCurrentWatermark wmSS
+  minCheckpoints <- for minCheckpointsF await
+  parentWMsF <- for minCheckpoints
+                    \(parent, CompleteVersionstamp (TransactionVersionstamp v _) _) ->
+                      getWatermark (topicWatermarkSS parent) v
+  parentsWMs <- for parentWMsF await
+  let minParentWM = minimumMay (catMaybes parentsWMs)
+  ourOldWM <- await ourOldWMF
+  case (ourOldWM, minParentWM) of
+    -- parents don't have watermarks, and we don't. Don't bother writing.
+    (Nothing, Nothing) -> return ()
+    (Nothing, Just newWM) -> setWatermark wmSS newWM
+    (Just oldWM, Nothing) -> return ()
+    (Just oldWM, Just newWM) | newWM > oldWM -> setWatermark wmSS newWM
+    (Just _, Just _) -> return ()
 
 -- | Read messages from an existing Stream.
 --

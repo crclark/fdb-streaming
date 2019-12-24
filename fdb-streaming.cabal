@@ -54,7 +54,8 @@ library
       unliftio,
       witherable,
       uuid,
-      time
+      time,
+      safe
   default-language: Haskell2010
 
 executable fdb-streaming-writer
