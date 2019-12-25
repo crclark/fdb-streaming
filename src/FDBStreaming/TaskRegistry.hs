@@ -65,7 +65,7 @@ addTask
         -- ^ A unique string name for this task. If the given name already
         -- exists, it will be overwritten.
   -> Int
-  -- ^ How long to lock the task when it runs.
+  -- ^ How long to lock the task when it runs, in seconds.
   -> (Transaction Bool -> Transaction ReleaseResult -> IO ())
         -- ^ An action that is run once per lease acquisition. It is passed two
         -- transactions: one that returns true if the acquired lease is still

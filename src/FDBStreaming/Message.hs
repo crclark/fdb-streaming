@@ -4,6 +4,7 @@ module FDBStreaming.Message (Message(..)) where
 
 
 import           Data.ByteString                ( ByteString )
+import           Data.Void                      (Void, absurd)
 import           FoundationDB.Layer.Tuple       ( decodeTupleElems
                                                 , encodeTupleElems
                                                 , Elem(Bytes)
@@ -16,6 +17,10 @@ import           FoundationDB.Layer.Tuple       ( decodeTupleElems
 class Message a where
   toMessage :: a -> ByteString
   fromMessage :: ByteString -> a
+
+instance Message Void where
+  toMessage = absurd
+  fromMessage = error "Can't parse message to Void"
 
 instance Message () where
   toMessage = const ""

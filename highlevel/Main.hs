@@ -362,7 +362,7 @@ mainLoop db ss Args{ generatorNumThreads
     when (coerce printTopicStats) $ printStats db ss
     threadDelay 1000000
   when (coerce streamRun)
-    $ runLeaseStreamWorker (coerce numLeaseThreads) conf (topology input)
+    $ runStream (coerce numLeaseThreads) conf (topology input)
 
 
 cleanup :: Database -> Subspace -> IO ()

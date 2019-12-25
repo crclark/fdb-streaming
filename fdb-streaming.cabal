@@ -36,7 +36,7 @@ library
       src
   ghc-options: -Wall -g -fno-omit-yields -Wincomplete-uni-patterns
                -Wincomplete-record-updates -Widentities -Wredundant-constraints
-               -Wmissing-export-lists -Wmissing-import-lists -Wpartial-fields
+               -Wmissing-export-lists -Wmissing-import-lists
                -Wcompat
   build-depends:
       base >=4.7 && <5,
