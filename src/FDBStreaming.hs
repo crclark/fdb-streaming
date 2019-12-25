@@ -34,12 +34,7 @@ module FDBStreaming
     triggerBy,
     watermarkBy,
     -- * Advanced Usage
-    StreamStep,
-    WriteOnlyProcessor(..),
-    StreamProcessor(..),
-    TableProcessor(..),
-    TriggeringTableProcessor(..),
-    JoinProcessor(..),
+    StreamStep(..),
     getWatermark, --TODO: don't export?
   )
 where
@@ -280,76 +275,81 @@ producesWatermark :: WatermarkBy a -> Bool
 producesWatermark NoWatermark = False
 producesWatermark _           = True
 
--- | A step that writes to a topic. This would usually be used for testing and
--- such, since it doesn't have any checkpointing mechanism.
-data WriteOnlyProcessor a = WriteOnlyProcessor {
-  writeOnlyWatermarkBy :: WatermarkBy a,
-  writeOnlyProduce :: Transaction (Maybe a)
-}
+-- TODO: think more about what type params we actually need.
+-- Do we need both outMsg and runResult? Do we need inMsg, or
+-- instead should we have inStream?
+data StreamStep inMsg outMsg runResult where
 
-data StreamProcessor a b = StreamProcessor {
-  streamProcessorInStream :: Stream a,
-  _watermarkBy :: WatermarkBy b,
-  processBatch :: Seq (Versionstamp 'Complete, a)
-               -> Transaction (Seq b)
-}
+  -- | A step that writes to a topic. This would usually be used for testing and
+  -- such, since it doesn't have any checkpointing mechanism.
+  WriteOnlyProcessor :: Message a => {
+    writeOnlyWatermarkBy :: WatermarkBy a,
+    writeOnlyProduce :: Transaction (Maybe a)
+  } -> StreamStep Void a (Stream a)
 
---TODO: I think this could be replaced with a more general horizontal
---composition processor that contains two normal stream processors that
---both write to the same output stream.
-data JoinProcessor a b where
-  Join2Processor :: (Message a1, Message a2, Message b)
-                 => Stream a1
-                 -> Stream a2
-                 -> WatermarkBy b
-                 -- TODO: passing in the TopicConfig so that the step knows
-                 -- where to write its state. Probably all user-provided
-                 -- batch processing callbacks should take a subspace that they
-                 -- can use to write per-processor state. That way, deleting a
-                 -- processing step would be guaranteed to clean up everything
-                 -- the user created, too.
-                 -> (TopicConfig
-                     -> Seq (Versionstamp 'Complete, a1)
-                     -> Transaction (Seq b))
-                 -> (TopicConfig
-                     -> Seq (Versionstamp 'Complete, a2)
-                     -> Transaction (Seq b))
-                 -> JoinProcessor (a1,a2) b
+  StreamProcessor :: Message b => {
+    streamProcessorInStream     :: Stream a,
+    streamProcessorWatermarkBy  :: WatermarkBy b,
+    streamProcessorProcessBatch :: Seq (Versionstamp 'Complete, a)
+                                -> Transaction (Seq b)
+    } -> StreamStep a b (Stream b)
 
-data TableProcessor k v aggr = TableProcessor {
-  tableProcessorGroupedBy :: GroupedBy k v,
-  tableProcessorAggregation :: v -> aggr,
-  -- | An optional custom watermark function for this aggregation.
-  -- NOTE: the input to the watermark function will be only the
-  -- value that will be monoidally appended to the value already
-  -- stored in the table at key k, not the full value stored at
-  -- k. This is done for efficiency reasons. If you want the full
-  -- value at key k, you will need to fetch it yourself inside
-  -- your watermark function. --TODO: is that possible?
-  tableProcessorWatermarkBy :: WatermarkBy (k, aggr)
-}
+  -- TODO: the tuple input here is kind of a lie. It would
+  -- be the user's job to tie them together into pairs, like we
+  -- do with the 1-to-1 join logic.
+  Stream2Processor :: Message b => {
+    stream2ProcessorInStreamL :: Stream a1,
+    stream2ProcessorInStreamR :: Stream a2,
+    stream2ProcessorWatermarkBy :: WatermarkBy b,
+    -- TODO: passing in the TopicConfig so that the step knows
+    -- where to write its state. Probably all user-provided
+    -- batch processing callbacks should take a subspace that they
+    -- can use to write per-processor state. That way, deleting a
+    -- processing step would be guaranteed to clean up everything
+    -- the user created, too.
+    stream2ProcessorRunBatchL :: (TopicConfig
+                              -> Seq (Versionstamp 'Complete, a1)
+                              -> Transaction (Seq b)),
+    stream2ProcessorRunBatchR :: (TopicConfig
+                              -> Seq (Versionstamp 'Complete, a2)
+                              -> Transaction (Seq b))
+  } -> StreamStep (a1,a2) b (Stream b)
 
-data TriggeringTableProcessor k v aggr = TriggeringTableProcessor {
-  triggeringTableProcessorTableProcessor :: TableProcessor k v aggr,
-  triggeringTableProcessorTriggerBy :: (Versionstamp 'Complete, v, [k])
-                                    -> Transaction [(k,aggr)]
-}
+  TableProcessor :: (Ord k, AT.TableKey k, AT.TableSemigroup aggr) => {
+    tableProcessorGroupedBy :: GroupedBy k v,
+    tableProcessorAggregation :: v -> aggr,
+    -- | An optional custom watermark function for this aggregation.
+    -- NOTE: the input to the watermark function will be only the
+    -- value that will be monoidally appended to the value already
+    -- stored in the table at key k, not the full value stored at
+    -- k. This is done for efficiency reasons. If you want the full
+    -- value at key k, you will need to fetch it yourself inside
+    -- your watermark function. --TODO: is that possible?
+    tableProcessorWatermarkBy :: WatermarkBy (k, aggr)
+  } -> StreamStep v (k, aggr) (AT.AggrTable k aggr)
+
+  TriggeringTableProcessor :: {
+    --TODO: now that we can't constrain this to being a plain TableProcessor,
+    --we could have nested triggering table processors. Add another type tag?
+    --live with it?
+    triggeringTableProcessorTableProcessor :: StreamStep v (k, aggr) (AT.AggrTable k aggr),
+    triggeringTableProcessorTriggerBy :: (Versionstamp 'Complete, v, [k])
+                                      -> Transaction [(k,aggr)]
+  } -> StreamStep v (k, aggr) (AT.AggrTable k aggr)
+
+watermarkBy :: (b -> Transaction Watermark) -> StreamStep a b r -> StreamStep a b r
+watermarkBy f s@WriteOnlyProcessor{} = s { writeOnlyWatermarkBy = CustomWatermark f }
+watermarkBy f s@StreamProcessor{} = s { streamProcessorWatermarkBy = CustomWatermark f }
+watermarkBy f s@Stream2Processor{} = s { stream2ProcessorWatermarkBy = CustomWatermark f }
+watermarkBy f (TableProcessor g a _) = TableProcessor g a (CustomWatermark f)
+watermarkBy f (TriggeringTableProcessor s t) = TriggeringTableProcessor (watermarkBy f s) t
 
 triggerBy :: ((Versionstamp 'Complete, v, [k]) -> Transaction [(k,aggr)])
-          -> TableProcessor k v aggr
-          -> TriggeringTableProcessor k v aggr
-triggerBy f tbp = TriggeringTableProcessor tbp f
+          -> StreamStep v (k, aggr) (AT.AggrTable k aggr)
+          -> StreamStep v (k, aggr) (AT.AggrTable k aggr)
+triggerBy f tbp@(TableProcessor{}) = TriggeringTableProcessor tbp f
+triggerBy f (TriggeringTableProcessor tbp _) = TriggeringTableProcessor tbp f
 
--- The functions in this type class will not be exported. Instead, The generic
--- run function in StreamStep will be. This will allow users to either keep
--- using the simple interface provided by the original MonadStream helper
--- functions (pipe, oneToOneJoin, groupBy, aggregate, etc), or, if they want to
--- control triggering, watermarks, etc., they can use a builder-style interface
--- that should look something like @run "myStep" $ watermarkBy f $ pipe' xs g@.
--- The names of the base functions for this more advanced interface are still
--- TBD. I am thinking of just using the simple interface functions, but with
--- a quote added.
---
 -- The reason we are using a tagless final interface like this in addition to
 -- the record types, when it seems like we might only need one, is because we
 -- want the benefits of both. The tagless final interface allows us to interpret
@@ -357,12 +357,10 @@ triggerBy f tbp = TriggeringTableProcessor tbp f
 -- compatibility checks, running with different strategies, etc. The record
 -- interface allows us to use a builder style to modify our stream processors
 -- at a distance, with functions like 'watermarkBy'.
+-- TODO: hey, are we even tagless final anymore? Looks like we have returned to
+-- where we started, more or less.
 class Monad m => MonadStream m where
-  runWriteOnlyProcessor :: Message a => StepName -> WriteOnlyProcessor a -> m (Stream a)
-  runStreamProcessor :: (Message a, Message b) => StepName -> StreamProcessor a b -> m (Stream b)
-  runJoinProcessor :: StepName -> JoinProcessor a b -> m (Stream b)
-  runTableProcessor :: (Ord k, AT.TableKey k, AT.TableSemigroup aggr) => StepName -> TableProcessor k v aggr -> m (AT.AggrTable k aggr)
-  runTriggeringTableProcessor :: StepName -> TriggeringTableProcessor k v aggr -> m (AT.AggrTable k aggr, Stream (k,aggr))
+  run :: StepName -> StreamStep inMsg outMsg runResult -> m runResult
 
 -- | Monad that traverses a stream DAG, building up a transaction that updates
 -- the watermarks for all streams that don't have custom watermarks defined.
@@ -378,81 +376,7 @@ newtype DefaultWatermarker a = DefaultWatermarker
   deriving (Functor, Applicative, Monad, MonadState (Transaction ()))
 
 instance MonadStream DefaultWatermarker where
-  runWriteOnlyProcessor sn p = do
-    undefined
-  runStreamProcessor sn p = do
-    undefined
-  runJoinProcessor sn p = do
-    undefined
-  runTableProcessor sn p = do
-    undefined
-  runTriggeringTableProcessor sn p = do
-    undefined
-
--- For pipe-like steps that produce Streams.
--- TODO: consider whether it would be possible to unify the constituents into a
--- sum type.
--- TODO: there is documentation in WatermarkBy that should be moved to
--- watermarkBy.
-class StreamStep s where
-  -- TODO: it's kind of weird that these are indexed type families instead of
-  -- parameters of s. We seem to need this in order to allow individual
-  -- stream step types to have different numbers of parameters. The downside
-  -- is that the type errors are going to be hard to understand.
-  -- A better way to do this would be to put the miscellaneous extra params
-  -- at the front of the list and make the last two the input and output
-  -- message types. However, then we seem to still need StepOutput.
-  -- Actually, a GADT could do the trick -- different step output type for
-  -- each constructor.
-  type StepInputMessage s
-  type StepOutputMessage s
-  type StepOutput s
-  run :: (Message (StepInputMessage s), Message (StepOutputMessage s), MonadStream m) => StepName -> s -> m (StepOutput s)
-  watermarkBy :: ((StepOutputMessage s) -> Transaction Watermark)
-              -> s
-              -> s
-  -- TODO: other composable optional operations we want to share across
-  -- different step types.
-
-instance StreamStep (WriteOnlyProcessor a) where
-  type StepInputMessage (WriteOnlyProcessor a) = Void
-  type StepOutputMessage (WriteOnlyProcessor a) = a
-  type StepOutput (WriteOnlyProcessor a) = Stream a
-  run = runWriteOnlyProcessor
-  watermarkBy f sp = sp {writeOnlyWatermarkBy = CustomWatermark f}
-
-instance StreamStep (StreamProcessor a b) where
-  type StepInputMessage (StreamProcessor a b) = a
-  type StepOutputMessage (StreamProcessor a b) = b
-  type StepOutput (StreamProcessor a b) = Stream b
-  run = runStreamProcessor
-  watermarkBy f sp = sp {_watermarkBy = CustomWatermark f}
-
-instance StreamStep (JoinProcessor a b) where
-  type StepInputMessage (JoinProcessor a b) = a
-  type StepOutputMessage (JoinProcessor a b) = b
-  type StepOutput (JoinProcessor a b) = Stream b
-  run = runJoinProcessor
-  watermarkBy f (Join2Processor s1 s2 _ p1 p2) =
-    Join2Processor s1 s2 (CustomWatermark f) p1 p2
-
-instance (Ord k, AT.TableKey k, AT.TableSemigroup aggr)
-  => StreamStep (TableProcessor k v aggr) where
-  type StepInputMessage (TableProcessor k v aggr) = v
-  type StepOutputMessage (TableProcessor k v aggr) = (k, aggr)
-  type StepOutput (TableProcessor k v aggr) = AT.AggrTable k aggr
-  run = runTableProcessor
-  watermarkBy f (TableProcessor gb aggr _) =
-    TableProcessor gb aggr (CustomWatermark f)
-
-instance (Ord k, AT.TableKey k, AT.TableSemigroup aggr)
-  => StreamStep (TriggeringTableProcessor k v aggr) where
-  type StepInputMessage (TriggeringTableProcessor k v aggr) = v
-  type StepOutputMessage (TriggeringTableProcessor k v aggr) = (k, aggr)
-  type StepOutput (TriggeringTableProcessor k v aggr) = (AT.AggrTable k aggr, Stream (k,aggr))
-  run = runTriggeringTableProcessor
-  watermarkBy f (TriggeringTableProcessor tp tb) =
-    TriggeringTableProcessor (watermarkBy f tp) tb
+  run = undefined --TODO
 
 -- | Runs the standard watermark logic for a stream. For each input stream,
 -- finds the minimum checkpoint across all its partitions. For each of these
@@ -514,7 +438,7 @@ existing tc = return (Stream tc False (return . Just))
 -- need pipe.
 produce :: (Message a, MonadStream m) => StepName -> Transaction (Maybe a) -> m (Stream a)
 produce sn f =
-  runWriteOnlyProcessor sn
+  run sn
     $ WriteOnlyProcessor NoWatermark f
 
 -- TODO: better operation for externally-visible side effects. Perhaps we can
@@ -529,10 +453,10 @@ produce sn f =
 -- TODO: is this going to leave traces of an empty topic in FDB?
 atLeastOnce :: (Message a, MonadStream m) => StepName -> Stream a -> (a -> IO ()) -> m ()
 atLeastOnce sn input f = void $ do
-  runStreamProcessor sn
+  run sn
     $ StreamProcessor {streamProcessorInStream = input,
-                       _watermarkBy = NoWatermark,
-                       processBatch = (mapM (\(_,x) -> liftIO $ f x))}
+                       streamProcessorWatermarkBy = NoWatermark,
+                       streamProcessorProcessBatch = (mapM (\(_,x) -> liftIO $ f x))}
 
 -- I think we can do so if we remove the DB from the topic config internals. Not
 -- sure why it's there in the first place. Alternatively, maybe we should remove
@@ -553,22 +477,23 @@ pipe ::
   (a -> IO (Maybe b)) ->
   m (Stream b)
 pipe sn input f =
-  runStreamProcessor sn
+  run sn
     $ pipe' input f
 
 pipe' ::
+  Message b =>
   Stream a ->
   -- TODO: let user take a batch of items at once, and potentially split
   -- one message into multiple downstream messages.
   -- i.e., below type should be (t a -> IO (t b))
   (a -> IO (Maybe b)) ->
-  StreamProcessor a b
+  StreamStep a b (Stream b)
 pipe' input f =
   StreamProcessor {streamProcessorInStream = input,
-                   _watermarkBy = if isWatermarked input
-                                     then DefaultWatermark
-                                     else NoWatermark,
-                   processBatch = (\b -> catMaybes <$> forM b (\(_,x) -> liftIO $ f x))}
+                   streamProcessorWatermarkBy = if isWatermarked input
+                                                   then DefaultWatermark
+                                                   else NoWatermark,
+                   streamProcessorProcessBatch = (\b -> catMaybes <$> forM b (\(_,x) -> liftIO $ f x))}
 
 -- | Streaming one-to-one join. If the relationship is not actually one-to-one
 --   (i.e. the input join functions are not injective), some messages in the
@@ -583,7 +508,7 @@ oneToOneJoin ::
   (a -> b -> d) ->
   m (Stream d)
 oneToOneJoin sn in1 in2 p1 p2 j =
-  runJoinProcessor sn
+  run sn
     $ oneToOneJoin' in1 in2 p1 p2 j
 
 oneToOneJoin' ::
@@ -593,18 +518,18 @@ oneToOneJoin' ::
   (a -> c) ->
   (b -> c) ->
   (a -> b -> d) ->
-  JoinProcessor (a, b) d
+  StreamStep (a, b) d (Stream d)
 oneToOneJoin' inl inr pl pr j =
   let
     lstep = \cfg -> oneToOneJoinStep cfg 0 pl j
     rstep = \cfg -> oneToOneJoinStep cfg 1 pr (flip j)
-    in Join2Processor inl
-                      inr
-                      (if isWatermarked inl && isWatermarked inr
-                          then DefaultWatermark
-                          else NoWatermark)
-                      lstep
-                      rstep
+    in Stream2Processor inl
+                        inr
+                        (if isWatermarked inl && isWatermarked inr
+                            then DefaultWatermark
+                            else NoWatermark)
+                        lstep
+                        rstep
 
 -- NOTE: the reason that this is a separate constructor from StreamAggregate
 -- is so that our helper functions can be combined more easily. It's easier to
@@ -621,20 +546,20 @@ groupBy ::
 groupBy k t = return (GroupedBy t k)
 
 aggregate ::
-  (Ord k, AT.TableKey k, AT.TableSemigroup aggr, MonadStream m) =>
+  (Message v, Ord k, AT.TableKey k, AT.TableSemigroup aggr, MonadStream m) =>
   StepName ->
   GroupedBy k v ->
   (v -> aggr) ->
   m (AT.AggrTable k aggr)
 aggregate sn groupedBy f =
-  runTableProcessor sn
+  run sn
     $ aggregate' groupedBy f
 
 aggregate' ::
-  -- (Message v, Ord k, AT.TableKey k, AT.TableSemigroup aggr) =>
+  (Message v, Ord k, AT.TableKey k, AT.TableSemigroup aggr) =>
   GroupedBy k v ->
   (v -> aggr) ->
-  TableProcessor k v aggr
+  StreamStep v (k, aggr) (AT.AggrTable k aggr)
 aggregate' groupedBy@(GroupedBy input _) f =
   TableProcessor
     groupedBy
@@ -731,8 +656,8 @@ runCustomWatermark _ t = t
 
 instance MonadStream LeaseBasedStreamWorker where
 
-  runWriteOnlyProcessor sn WriteOnlyProcessor {writeOnlyProduce,
-                                               writeOnlyWatermarkBy} = do
+  run sn WriteOnlyProcessor {writeOnlyProduce,
+                             writeOnlyWatermarkBy} = do
     output <- makeStream sn (producesWatermark writeOnlyWatermarkBy)
     (cfg@FDBStreamConfig {msgsPerBatch, streamConfigDB}, taskReg) <- State.get
     metrics <- registerStepMetrics sn
@@ -751,10 +676,10 @@ instance MonadStream LeaseBasedStreamWorker where
       $ addTask taskReg (TaskName sn) (leaseDuration cfg) job
     return output
 
-  runStreamProcessor sn StreamProcessor { streamProcessorInStream
-                                        , _watermarkBy
-                                        , processBatch} = do
-    output <- makeStream sn (producesWatermark _watermarkBy)
+  run sn StreamProcessor { streamProcessorInStream
+                        , streamProcessorWatermarkBy
+                        , streamProcessorProcessBatch} = do
+    output <- makeStream sn (producesWatermark streamProcessorWatermarkBy)
     let outCfg = getTopicConfig output
     (cfg@FDBStreamConfig {streamConfigDB}, _) <- State.get
     metrics <- registerStepMetrics sn
@@ -763,8 +688,8 @@ instance MonadStream LeaseBasedStreamWorker where
             $ void
             $ logErrors cfg metrics sn
             $ runTransaction streamConfigDB
-            $ runCustomWatermark _watermarkBy --TODO: complete
-            $ pipeStep cfg streamProcessorInStream outCfg sn processBatch metrics pid
+            $ runCustomWatermark streamProcessorWatermarkBy --TODO: complete
+            $ pipeStep cfg streamProcessorInStream outCfg sn streamProcessorProcessBatch metrics pid
     forEachPartition streamProcessorInStream $ \pid -> do
       let taskName = mkTaskName sn pid
       taskReg <- taskRegistry
@@ -773,7 +698,7 @@ instance MonadStream LeaseBasedStreamWorker where
         $ addTask taskReg taskName (leaseDuration cfg) (job pid)
     return output
 
-  runJoinProcessor sn (Join2Processor inl inr _watermarker ls rs) = do
+  run sn (Stream2Processor inl inr _watermarker ls rs) = do
     cfg@FDBStreamConfig {streamConfigDB} <- getStreamConfig
     output <- makeStream sn (isWatermarked inl && isWatermarked inr)
     let outCfg = getTopicConfig output
@@ -806,8 +731,8 @@ instance MonadStream LeaseBasedStreamWorker where
         $ addTask taskReg rTaskName (leaseDuration cfg) (rjob pid)
     return output
 
-  runTableProcessor sn TableProcessor { tableProcessorGroupedBy
-                                      , tableProcessorAggregation } = do
+  run sn TableProcessor { tableProcessorGroupedBy
+                        , tableProcessorAggregation } = do
     cfg@FDBStreamConfig {streamConfigDB} <- getStreamConfig
     let table = getAggrTable cfg sn
     let (GroupedBy inStream _) = tableProcessorGroupedBy
@@ -831,7 +756,7 @@ instance MonadStream LeaseBasedStreamWorker where
         $ addTask taskReg taskName (leaseDuration cfg) (job pid)
     return table
 
-  runTriggeringTableProcessor _sn _ttp = error "triggers not implemented"
+  run _sn TriggeringTableProcessor{} = error "triggers not implemented"
 
 -- TODO: what if we have recently removed steps from our topology? Old leases
 -- will be registered forever. Need to remove old ones.
