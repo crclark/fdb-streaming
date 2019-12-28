@@ -1064,23 +1064,24 @@ oneToOneJoinStep outputTopicCfg streamJoinIx pl combiner msgs = do
   -- join table to see if the partner is already there. If so, write the tuple
   -- downstream. If not, write the one message we do have to the join table.
   -- TODO: think of a way to garbage collect items that never get joined.
-  let sn = "1:1" --TODO: is this constant safe?
+  let sn = "1:1"
   let joinSS = topicCustomMetadataSS outputTopicCfg --TODO: pass in only this?
   let otherIx = if streamJoinIx == 0 then 1 else 0
   joinFutures <-
-      for
-        (fmap (pl . snd) msgs)
-        -- TODO: changed where we are storing join data -- high potential for bugs here
-        (withSnapshot . get1to1JoinData joinSS sn otherIx)
-  joinData <- Seq.zip msgs <$> mapM await joinFutures
-  fmap catMaybes $ for joinData $ \(lmsg, d) -> do
-    let k = pl (snd lmsg)
+      for msgs \(_, msg) -> do
+        let k = pl msg
+        joinF <- withSnapshot $ get1to1JoinData joinSS sn otherIx k
+        return (k, msg, joinF)
+  joinData <- for joinFutures \(k, msg, joinF) -> do
+    d <- await joinF
+    return (k, msg, d)
+  fmap catMaybes $ for joinData \(k, lmsg, d) -> do
     case d of
       Just (rmsg :: a2) -> do
         delete1to1JoinData joinSS sn k
-        return $ Just $ combiner (snd lmsg) rmsg
+        return $ Just $ combiner lmsg rmsg
       Nothing -> do
-        write1to1JoinData joinSS sn k streamJoinIx (snd lmsg :: a1)
+        write1to1JoinData joinSS sn k streamJoinIx (lmsg :: a1)
         return Nothing
 
 aggregateStep ::
