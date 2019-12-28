@@ -334,9 +334,10 @@ printStats db ss = catches (do
 
 printWatermarkLag :: Database -> WatermarkSS -> WatermarkSS -> IO ()
 printWatermarkLag db root leaf = do
-  (r,l) <- runTransaction db $ do r <- getCurrentWatermark root >>= await
-                                  l <- getCurrentWatermark leaf >>= await
-                                  return (r,l)
+  (r,l) <- runTransaction db
+           $ withSnapshot $ do r <- getCurrentWatermark root >>= await
+                               l <- getCurrentWatermark leaf >>= await
+                               return (r,l)
   printf "Watermark of root is %s\n" $ show r
   printf "Watermark of leaf is %s\n" $ show l
   printf "Watermark lag is %s\n" $ show (fmap round (diffUTCTime <$> (fmap watermarkUTCTime r) <*> (fmap watermarkUTCTime l)))
@@ -380,7 +381,7 @@ mainLoop db ss Args{ generatorNumThreads
     when (coerce printTopicStats) $ printStats db ss
     threadDelay 1000000
   forkIO $ forever $ do
-    printWatermarkLag db (topicWatermarkSS input) (AT.aggrTableWatermarkSS table)
+    --printWatermarkLag db (topicWatermarkSS input) (AT.aggrTableWatermarkSS table)
     threadDelay 1000000
   when (coerce streamRun)
     $ runStream conf (topology input (coerce watermark))

@@ -718,13 +718,13 @@ doForSeconds n f = do
 mkTaskName :: StepName -> PartitionId -> TaskName
 mkTaskName sn pid = TaskName $ BS8.pack (show sn ++ "_" ++ show pid)
 
-runCustomWatermark :: WatermarkBy a -> Transaction (Seq a) -> Transaction (Seq a)
+runCustomWatermark :: WatermarkBy a -> Transaction (Int, Seq a) -> Transaction (Int, Seq a)
 runCustomWatermark (CustomWatermark f) t = do
-  xs <- t
+  (n, xs) <- t
   case xs of
     (_ Seq.:|> x) -> void $ f x
     _ -> return ()
-  return xs
+  return (n, xs)
 runCustomWatermark _ t = t
 
 instance MonadStream LeaseBasedStreamWorker where
@@ -956,7 +956,7 @@ logErrors ::
   FDBStreamConfig ->
   Maybe StreamEdgeMetrics ->
   StepName ->
-  IO (Seq a) ->
+  IO (Int, Seq a) ->
   IO ()
 logErrors _ metrics sn x =
   flip
@@ -985,7 +985,7 @@ logErrors _ metrics sn x =
     $ do
       threadDelay 150
       t1 <- getTime Monotonic
-      numProcessed <- length <$> x
+      (numConsumed, _) <- x
         `catch` \(e :: FDB.Error) -> case e of
           Error (MaxRetriesExceeded (CError TransactionTimedOut)) -> do
             t2 <- getTime Monotonic
@@ -994,27 +994,29 @@ logErrors _ metrics sn x =
               "%s timed out after %d ms, assuming we processed no messages.\n"
               (show sn)
               timeMillis
-            return mempty
+            return (0, mempty)
           _ -> throw e
       t2 <- getTime Monotonic
       let timeMillis = (`div` 1000000) $ toNanoSecs $ diffTimeSpec t2 t1
       recordBatchLatency metrics timeMillis
-      when (numProcessed == 0) (threadDelay 1000000)
+      when (numConsumed == 0) (threadDelay 1000000)
 
 produceStep ::
   Message a =>
   Word8 ->
   TopicConfig ->
   Transaction (Maybe a) ->
-  FDB.Transaction (Seq a)
+  FDB.Transaction (Int, Seq a) -- ^ Number of incoming messages consumed, outgoing messages
 produceStep batchSize outCfg step = do
   -- TODO: this keeps spinning even if the producer is done and will never
   -- produce again.
   xs <- catMaybes <$> Seq.replicateM (fromIntegral batchSize) step
   p' <- liftIO $ randPartition outCfg
   writeTopic' outCfg p' (fmap toMessage xs)
-  return xs
+  return (0, xs)
 
+-- | Returns number of messages consumed from upstream, and
+-- new messages to send downstream.
 pipeStep ::
   (Message b) =>
   FDBStreamConfig ->
@@ -1024,7 +1026,7 @@ pipeStep ::
   (Seq (Versionstamp 'Complete, a) -> Transaction (Seq b)) ->
   Maybe StreamEdgeMetrics ->
   PartitionId ->
-  Transaction (Seq b)
+  Transaction (Int, Seq b)
 pipeStep
   FDBStreamConfig {msgsPerBatch}
   inTopic
@@ -1044,7 +1046,7 @@ pipeStep
     let outMsgs = fmap toMessage ys
     p' <- liftIO $ randPartition outCfg
     writeTopic' outCfg p' outMsgs
-    return ys
+    return (length inMsgs, ys)
 
 oneToOneJoinStep ::
   forall a1 a2 b c .
@@ -1093,7 +1095,7 @@ aggregateStep ::
   (v -> aggr) ->
   Maybe StreamEdgeMetrics ->
   PartitionId ->
-  FDB.Transaction (Seq (k,aggr))
+  FDB.Transaction (Int, Seq (k,aggr))
 aggregateStep
   c@FDBStreamConfig {msgsPerBatch}
   sn
@@ -1111,7 +1113,7 @@ aggregateStep
         msgsPerBatch
     let kvs = Seq.fromList [(k,toAggr v) | v <- toList msgs, k <- toKeys v]
     AT.mappendBatch table pid kvs
-    return kvs
+    return (length msgs, kvs)
 
 runStream :: FDBStreamConfig -> (forall m . MonadStream m => m a) -> IO ()
 runStream

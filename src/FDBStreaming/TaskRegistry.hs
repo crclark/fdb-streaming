@@ -10,6 +10,7 @@ module FDBStreaming.TaskRegistry (
   runRandomTask
 ) where
 
+import Control.Concurrent (myThreadId)
 import           Control.Monad.IO.Class ( liftIO )
 import           Data.IORef (IORef, newIORef, atomicModifyIORef', readIORef)
 import           FoundationDB (Transaction)
@@ -91,7 +92,7 @@ runRandomTask db (TaskRegistry ts tr) = do
       --tid <- myThreadId
       --putStrLn $ show tid ++ "couldn't find an unlocked task."
       return False
-    Just (taskName, lease, _howAcquired) -> case M.lookup taskName tr' of
+    Just (taskName, lease, howAcquired) -> case M.lookup taskName tr' of
       Nothing -> do
         --tid <- myThreadId
         {-
@@ -100,8 +101,8 @@ runRandomTask db (TaskRegistry ts tr) = do
         -}
         return False --TODO: warn? this implies tasks outside registry
       Just (taskID, _dur, f) -> do
-        --tid <- myThreadId
-        {-
+        tid <- myThreadId
+
         putStrLn $ show tid
                    ++ " starting on task "
                    ++ show taskName
@@ -109,7 +110,7 @@ runRandomTask db (TaskRegistry ts tr) = do
                    ++ show taskID
                    ++ " acquired by "
                    ++ show howAcquired
-        -}
+
         f ((&&) <$> isLeaseValid ts taskID lease
                 <*> isLocked ts taskName)
           (release ts taskName lease)
