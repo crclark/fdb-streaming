@@ -85,7 +85,7 @@ import FDBStreaming.TaskRegistry as TaskRegistry
 import FDBStreaming.Topic
   ( PartitionId,
     ReaderName,
-    TopicConfig (numPartitions, topicCustomMetadataSS, topicName),
+    TopicConfig (numPartitions, topicCustomMetadataSS),
     getCheckpoints,
     makeTopicConfig,
     randPartition,
@@ -105,8 +105,7 @@ import FoundationDB as FDB
     Transaction,
     await,
     runTransaction,
-    withSnapshot,
-    getReadVersion
+    withSnapshot
   )
 import FoundationDB.Error as FDB
   ( CError (NotCommitted, TransactionTimedOut),
@@ -480,8 +479,7 @@ defaultWatermark topicsAndReaders wmSS = do
   ourOldWMF <- getCurrentWatermark wmSS
   minCheckpoints <- for minCheckpointsF await
   parentWMsF <- for minCheckpoints
-                    \(parent, CompleteVersionstamp (TransactionVersionstamp v _) _) -> do
-                      rv <- getReadVersion >>= await
+                    \(parent, CompleteVersionstamp (TransactionVersionstamp v _) _) ->
                       getWatermark (topicWatermarkSS parent) v
   parentsWMs <- for parentWMsF await
   let minParentWM = minimumMay (catMaybes parentsWMs)
@@ -1012,10 +1010,10 @@ produceStep ::
 produceStep batchSize outCfg step = do
   -- TODO: this keeps spinning even if the producer is done and will never
   -- produce again.
-  xs <- catMaybes <$> replicateM (fromIntegral batchSize) step
+  xs <- catMaybes <$> Seq.replicateM (fromIntegral batchSize) step
   p' <- liftIO $ randPartition outCfg
   writeTopic' outCfg p' (fmap toMessage xs)
-  return (Seq.fromList xs)
+  return xs
 
 pipeStep ::
   (Message b) =>
@@ -1110,9 +1108,9 @@ aggregateStep
         sn
         pid
         msgsPerBatch
-    let kvs = [(k,toAggr v) | v <- toList msgs, k <- toKeys v]
+    let kvs = Seq.fromList [(k,toAggr v) | v <- toList msgs, k <- toKeys v]
     AT.mappendBatch table pid kvs
-    return (Seq.fromList kvs)
+    return kvs
 
 runStream :: FDBStreamConfig -> (forall m . MonadStream m => m a) -> IO ()
 runStream

@@ -32,7 +32,6 @@ import           Control.Concurrent.Async       ( async
                                                 , waitAny
                                                 )
 import           Control.Monad (void, guard, forM)
-import           Control.Monad.IO.Class (liftIO)
 import           Data.Binary.Get                ( runGet
                                                 , getWord64le
                                                 )

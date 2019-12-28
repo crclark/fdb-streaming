@@ -16,7 +16,6 @@ module FDBStreaming.Watermark (
 ) where
 
 import Control.DeepSeq (NFData)
-import Control.Monad.IO.Class (liftIO)
 import Data.Binary.Get (getInt64le)
 import Data.Binary.Put (runPut, putInt64le)
 import Data.ByteString (ByteString)
