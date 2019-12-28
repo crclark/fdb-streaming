@@ -286,9 +286,9 @@ instance Message All where
   toMessage = Store.encode
   fromMessage = Store.decodeEx
 
-topology :: (MonadStream m) => TopicConfig -> m (AT.AggrTable OrderID All)
-topology incoming = do
-  input <- (\s -> s {isWatermarked = True}) <$> existing incoming
+topology :: (MonadStream m) => TopicConfig -> Bool -> m (AT.AggrTable OrderID All)
+topology incoming watermark = do
+  input <- (\s -> s {isWatermarked = watermark}) <$> existing incoming
   let fraudChecks = fmap isFraudulent input
   let invChecks = fmap inventoryCheck input
   let details = benignIO (fmap Just . randOrderDetails) input
@@ -349,7 +349,8 @@ mainLoop db ss Args{ generatorNumThreads
                    , streamRun
                    , printTopicStats
                    , batchSize
-                   , numLeaseThreads } = do
+                   , numLeaseThreads
+                   , watermark } = do
   metricsStore <- Metrics.newStore
   latencyDist <- Metrics.createDistribution "end_to_end_latency" metricsStore
   awaitedOrders <- Metrics.createGauge "waitingOrders" metricsStore
@@ -382,7 +383,7 @@ mainLoop db ss Args{ generatorNumThreads
     printWatermarkLag db (topicWatermarkSS input) (AT.aggrTableWatermarkSS table)
     threadDelay 1000000
   when (coerce streamRun)
-    $ runStream conf (topology input)
+    $ runStream conf (topology input (coerce watermark))
 
 
 cleanup :: Database -> Subspace -> IO ()
@@ -403,6 +404,7 @@ data Args f = Args
   , printTopicStats :: f Bool
   , batchSize :: f Word8
   , numLeaseThreads :: f Int
+  , watermark :: f Bool
   }
   deriving (Generic)
 
@@ -423,6 +425,7 @@ applyDefaults Args{..} = Args
   , printTopicStats = dflt True printTopicStats
   , batchSize = dflt 50 batchSize
   , numLeaseThreads = dflt 12 numLeaseThreads
+  , watermark = dflt False watermark
   }
 
   where dflt d x = Identity $ fromMaybe d x
