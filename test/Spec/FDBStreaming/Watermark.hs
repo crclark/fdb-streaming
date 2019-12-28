@@ -56,4 +56,7 @@ watermarks ss db = do
     mw <- runTransaction db $ getCurrentWatermark watermarkSS >>= FDB.await
     (fmap rounded mw) `shouldBe` Just (rounded $ Watermark t2)
 
+  it "returns nothing for minBound version" $ do
+    mw <- runTransaction db $ getWatermark watermarkSS 0 >>= FDB.await
+    mw `shouldBe` Nothing
 

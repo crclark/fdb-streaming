@@ -90,16 +90,19 @@ runRandomTask db (TaskRegistry ts tr) = do
   FDB.runTransaction db (acquireRandomUnbiased ts toDur) >>= \case
     Nothing                -> do
       tid <- myThreadId
-      putStrLn $ show tid ++ "couldn't find an unlocked task."
+      --putStrLn $ show tid ++ "couldn't find an unlocked task."
       return False
     Just (taskName, lease, howAcquired) -> case M.lookup taskName tr' of
       Nothing -> do
         tid <- myThreadId
+        {-
         putStrLn $ show tid ++ " found an invalid task " ++ show taskName
                    ++ " not present in " ++ show (M.keys tr')
+        -}
         return False --TODO: warn? this implies tasks outside registry
       Just (taskID, _dur, f) -> do
         tid <- myThreadId
+        {-
         putStrLn $ show tid
                    ++ " starting on task "
                    ++ show taskName
@@ -107,6 +110,7 @@ runRandomTask db (TaskRegistry ts tr) = do
                    ++ show taskID
                    ++ " acquired by "
                    ++ show howAcquired
+        -}
         f ((&&) <$> isLeaseValid ts taskID lease
                 <*> isLocked ts taskName)
           (release ts taskName lease)

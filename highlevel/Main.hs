@@ -1,3 +1,4 @@
+
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DerivingVia #-}
@@ -20,8 +21,10 @@ import           FDBStreaming
 import qualified FDBStreaming.AggrTable as AT
 import           FDBStreaming.Message
 import           FDBStreaming.Topic
+import           FDBStreaming.Watermark (Watermark(Watermark, watermarkUTCTime), WatermarkSS, getCurrentWatermark, setWatermark)
 
 import           Control.Monad
+import           Control.Monad.IO.Class (liftIO)
 import           Control.Concurrent
 import           Control.Concurrent.Async       ( forConcurrently )
 import           Control.Concurrent.STM         ( TVar
@@ -39,6 +42,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Random.MWC as BS
 import           Data.Coerce                    ( coerce )
+import           Data.Time.Clock                ( diffUTCTime, getCurrentTime )
 import           Data.Word                      ( Word16, Word8 )
 import           FoundationDB                  as FDB
 import           FoundationDB.Error
@@ -237,7 +241,9 @@ writeTopicNoRetry tc@TopicConfig {..} bss = do
   FDB.runTransactionWithConfig
     defaultConfig { maxRetries = 0 }
     topicConfigDB
-    $ writeTopic' tc p bss
+    $ do currTime <- liftIO getCurrentTime
+         setWatermark (topicWatermarkSS tc) (Watermark currTime)
+         writeTopic' tc p bss
 
 -- TODO: far too many params!
 orderGeneratorLoop :: TopicConfig
@@ -282,7 +288,7 @@ instance Message All where
 
 topology :: (MonadStream m) => TopicConfig -> m (AT.AggrTable OrderID All)
 topology incoming = do
-  input <- existing incoming
+  input <- (\s -> s {isWatermarked = True}) <$> existing incoming
   let fraudChecks = fmap isFraudulent input
   let invChecks = fmap inventoryCheck input
   let details = benignIO (fmap Just . randOrderDetails) input
@@ -326,6 +332,15 @@ printStats db ss = catches (do
   [ Handler (\(e :: SomeException) ->
                 putStrLn $ "Caught " ++ show e ++ " while getting stats!")]
 
+printWatermarkLag :: Database -> WatermarkSS -> WatermarkSS -> IO ()
+printWatermarkLag db root leaf = do
+  (r,l) <- runTransaction db $ do r <- getCurrentWatermark root >>= await
+                                  l <- getCurrentWatermark leaf >>= await
+                                  return (r,l)
+  printf "Watermark of root is %s\n" $ show r
+  printf "Watermark of leaf is %s\n" $ show l
+  printf "Watermark lag is %s\n" $ show (fmap round (diffUTCTime <$> (fmap watermarkUTCTime r) <*> (fmap watermarkUTCTime l)))
+
 mainLoop :: Database -> Subspace -> Args Identity -> IO ()
 mainLoop db ss Args{ generatorNumThreads
                    , generatorMsgsPerSecond
@@ -344,6 +359,8 @@ mainLoop db ss Args{ generatorNumThreads
                              , streamMetricsStore = Just metricsStore
                              , msgsPerBatch = coerce batchSize
                              , leaseDuration = 10
+                             , numStreamThreads = coerce numLeaseThreads
+                             , numPeriodicJobThreads = 1
                              }
   let input = makeTopicConfig db ss "incoming_orders"
   let table = getAggrTable conf "order_table"
@@ -361,8 +378,11 @@ mainLoop db ss Args{ generatorNumThreads
   forkIO $ forever $ do
     when (coerce printTopicStats) $ printStats db ss
     threadDelay 1000000
+  forkIO $ forever $ do
+    printWatermarkLag db (topicWatermarkSS input) (AT.aggrTableWatermarkSS table)
+    threadDelay 1000000
   when (coerce streamRun)
-    $ runStream (coerce numLeaseThreads) conf (topology input)
+    $ runStream conf (topology input)
 
 
 cleanup :: Database -> Subspace -> IO ()

@@ -132,6 +132,7 @@ executable fdb-streaming-highlevel
     , ekg
     , optparse-generic
     , clock
+    , time
   default-language: Haskell2010
 
 test-suite fdb-streaming-test

@@ -16,6 +16,7 @@ module FDBStreaming.Watermark (
 ) where
 
 import Control.DeepSeq (NFData)
+import Control.Monad.IO.Class (liftIO)
 import Data.Binary.Get (getInt64le)
 import Data.Binary.Put (runPut, putInt64le)
 import Data.ByteString (ByteString)
@@ -134,7 +135,8 @@ getWatermark :: WatermarkSS
              -- ^ Transaction version
              -> Transaction (Future (Maybe Watermark))
 getWatermark ss version = do
-  let sel = FDB.LastLessOrEq (versionWatermarkQueryKey ss version)
+  let k = versionWatermarkQueryKey ss version
+  let sel = FDB.LastLessOrEq k
   fk <- FDB.getKey sel
   return (fmap (parseWatermarkKeyResult ss) fk)
 
