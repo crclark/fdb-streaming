@@ -381,7 +381,7 @@ mainLoop db ss Args{ generatorNumThreads
     when (coerce printTopicStats) $ printStats db ss
     threadDelay 1000000
   forkIO $ forever $ do
-    --printWatermarkLag db (topicWatermarkSS input) (AT.aggrTableWatermarkSS table)
+    printWatermarkLag db (topicWatermarkSS input) (AT.aggrTableWatermarkSS table)
     threadDelay 1000000
   when (coerce streamRun)
     $ runStream conf (topology input (coerce watermark))

@@ -1,40 +1,40 @@
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE DerivingVia #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE OverloadedStrings #-}
 
-module FDBStreaming.Watermark (
-  Watermark(..),
-  WatermarkKey,
-  WatermarkSS,
-  setWatermark,
-  getCurrentWatermark,
-  getWatermark,
-  minWatermark,
-  watermarkMillisSinceEpoch
-) where
+module FDBStreaming.Watermark
+  ( Watermark (..),
+    WatermarkKey,
+    WatermarkSS,
+    setWatermark,
+    getCurrentWatermark,
+    getWatermark,
+    minWatermark,
+    watermarkMillisSinceEpoch,
+  )
+where
 
 import Control.DeepSeq (NFData)
 import Data.Binary.Get (getInt64le)
-import Data.Binary.Put (runPut, putInt64le)
+import Data.Binary.Put (putInt64le, runPut)
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (toStrict)
 import Data.Data (Data)
 import Data.Int (Int64)
-import Data.Time (UTCTime, ParseTime, FormatTime)
+import Data.Time (FormatTime, ParseTime, UTCTime)
 import Data.Word (Word64)
+import FDBStreaming.Util (millisSinceEpoch, millisSinceEpochToUTC, runGetMay)
 import qualified FoundationDB as FDB
+import FoundationDB as FDB
+  ( Future,
+    Transaction,
+  )
 import qualified FoundationDB.Layer.Subspace as FDB
 import qualified FoundationDB.Layer.Tuple as FDB
 import qualified FoundationDB.Options as FDB
 import qualified FoundationDB.Versionstamp as FDB
-import FoundationDB as FDB
-  (
-    Transaction,
-    Future
-  )
-import FDBStreaming.Util (millisSinceEpoch, millisSinceEpochToUTC, runGetMay)
 
 watermarkMillisSinceEpoch :: Watermark -> Int64
 watermarkMillisSinceEpoch = millisSinceEpoch . watermarkUTCTime
@@ -55,20 +55,26 @@ bytesToMillis = runGetMay getInt64le
 
 watermarkIncompleteKey :: WatermarkSS -> Watermark -> ByteString
 watermarkIncompleteKey ss watermark =
-  FDB.pack ss [ FDB.Bytes "w"
-              , FDB.IncompleteVS (FDB.IncompleteVersionstamp 0)
-              , FDB.Bytes
-                  $ millisToBytes
-                  $ millisSinceEpoch
-                  $ watermarkUTCTime watermark]
+  FDB.pack
+    ss
+    [ FDB.Bytes "w",
+      FDB.IncompleteVS (FDB.IncompleteVersionstamp 0),
+      FDB.Bytes
+        $ millisToBytes
+        $ millisSinceEpoch
+        $ watermarkUTCTime watermark
+    ]
 
 versionWatermarkQueryKey :: WatermarkSS -> Word64 -> ByteString
 versionWatermarkQueryKey ss version =
-  FDB.pack ss [ FDB.Bytes "w"
-                , FDB.CompleteVS
-                    $ FDB.CompleteVersionstamp
-                      (FDB.TransactionVersionstamp version maxBound)
-                      maxBound]
+  FDB.pack
+    ss
+    [ FDB.Bytes "w",
+      FDB.CompleteVS $
+        FDB.CompleteVersionstamp
+          (FDB.TransactionVersionstamp version maxBound)
+          maxBound
+    ]
 
 currentWatermarkQueryKey :: WatermarkSS -> Transaction (Future ByteString)
 currentWatermarkQueryKey ss =
@@ -92,7 +98,7 @@ type WatermarkKey = ByteString
 -- watermark when no watermark is otherwise available. In such cases, use
 -- 'minWatermark', which is arbitrarily defined to be the start of the
 -- Unix Epoch.
-newtype Watermark = Watermark { watermarkUTCTime :: UTCTime }
+newtype Watermark = Watermark {watermarkUTCTime :: UTCTime}
   deriving stock (Eq, Data, Ord, Read, Show)
   deriving newtype (FormatTime, NFData, ParseTime)
 
@@ -129,16 +135,16 @@ getCurrentWatermark ss = do
 
 -- | Given a watermark subspace and a transaction version, return the watermark
 -- which was current as of that transaction version.
-getWatermark :: WatermarkSS
-             -> Word64
-             -- ^ Transaction version
-             -> Transaction (Future (Maybe Watermark))
+getWatermark ::
+  WatermarkSS ->
+  -- | Transaction version
+  Word64 ->
+  Transaction (Future (Maybe Watermark))
 getWatermark ss version = do
   let k = versionWatermarkQueryKey ss version
   let sel = FDB.LastLessOrEq k
   fk <- FDB.getKey sel
   return (fmap (parseWatermarkKeyResult ss) fk)
-
 -- TODO: the current watermarking algorithm could take about 10 MB per day per
 -- processing step, if we watermark each batch we process. Could we reduce the
 -- overhead further? Don't watermark every batch? And if batches are extremely
