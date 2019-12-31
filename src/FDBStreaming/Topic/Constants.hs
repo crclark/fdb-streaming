@@ -6,7 +6,8 @@ module FDBStreaming.Topic.Constants (
   readers,
   checkpoint,
   aggrTable,
-  oneToOneJoin
+  oneToOneJoin,
+  customMeta
 ) where
 
 import FoundationDB.Layer.Tuple (Elem(Int))
@@ -31,3 +32,6 @@ aggrTable = Int 5
 
 oneToOneJoin :: Elem
 oneToOneJoin = Int 6
+
+customMeta :: Elem
+customMeta = Int 7

@@ -12,6 +12,8 @@ module FDBStreaming.Topic (
   makeTopicConfig,
   randPartition,
   watchPartition,
+  getCheckpoint',
+  getCheckpoints,
   readNAndCheckpoint,
   readNAndCheckpoint',
   writeTopic,
@@ -95,6 +97,11 @@ data TopicConfig = TopicConfig { topicConfigDB :: FDB.Database
                                , partitionCountKey :: PartitionId -> ByteString
                                , numPartitions :: Integer
                                -- ^ TODO: don't export
+                               , topicCustomMetadataSS :: FDB.Subspace
+                               -- ^ A subspace for application-specific metadata
+                               -- to be used by users of this topic. Nothing in
+                               -- this module will read or write to this
+                               -- subspace.
                                }
 
 makeTopicConfig :: FDB.Database -> FDB.Subspace -> TopicName -> TopicConfig
@@ -111,7 +118,11 @@ makeTopicConfig topicConfigDB topicSS topicName = TopicConfig { .. }
   topicCountSS = FDB.extend
     topicSS
     [C.topics, FDB.Bytes topicName, C.metaCount]
+
   numPartitions = 2 -- TODO: make configurable
+
+  topicCustomMetadataSS =
+    FDB.extend topicSS [C.topics, FDB.Bytes topicName, C.customMeta]
 
 randPartition :: TopicConfig -> IO PartitionId
 randPartition TopicConfig {..} = randomRIO (0, numPartitions - 1)
@@ -159,8 +170,11 @@ readerSS :: TopicConfig -> ReaderName -> FDB.Subspace
 readerSS TopicConfig {..} rn =
   FDB.extend topicSS [C.topics, FDB.Bytes topicName, C.readers, FDB.Bytes rn]
 
+readerCheckpointSS :: TopicConfig -> ReaderName -> FDB.Subspace
+readerCheckpointSS tc rn = FDB.extend (readerSS tc rn) [C.checkpoint]
+
 readerCheckpointKey :: TopicConfig -> PartitionId -> ReaderName -> ByteString
-readerCheckpointKey tc i rn = FDB.pack (readerSS tc rn) [FDB.Int i, C.checkpoint]
+readerCheckpointKey tc i rn = FDB.pack (readerCheckpointSS tc rn) [FDB.Int i]
 
 -- TODO: make idempotent to deal with CommitUnknownResult
 -- | Danger!! It's possible to write multiple messages with the same key
@@ -196,12 +210,12 @@ writeTopic tc@TopicConfig {..} bss = do
   p <- randPartition tc
   FDB.runTransaction topicConfigDB $ writeTopic' tc p bss
 
-trOutput
+parseOutput
   :: TopicConfig
   -> PartitionId
   -> (ByteString, ByteString)
   -> (Versionstamp 'Complete, ByteString)
-trOutput TopicConfig {..} p (k, v) = case FDB.unpack (partitionMsgsSS p) k of
+parseOutput TopicConfig {..} p (k, v) = case FDB.unpack (partitionMsgsSS p) k of
   Right [FDB.CompleteVS vs] -> (vs, v)
   Right t -> error $ "unexpected tuple: " ++ show t
   Left err -> error $ "failed to decode " ++ show k ++ " because " ++ show err
@@ -256,8 +270,13 @@ checkpoint' tc p rn vs = do
   let v = encodeVersionstamp vs
   FDB.atomicOp k (Op.byteMax v)
 
+decodeCheckpoint :: ByteString -> Versionstamp 'Complete
+decodeCheckpoint bs = case decodeVersionstamp bs of
+  Nothing -> error $ "Failed to decode checkpoint: " ++ show bs
+  Just vs -> vs
+
 -- | For a given reader, returns a versionstamp that is guaranteed to be less
--- than the first uncheckpointed message in the topic partition. If the reader
+-- than the first unread message in the topic partition. If the reader
 -- hasn't made a checkpoint yet, returns a versionstamp containing all zeros.
 getCheckpoint'
   :: TopicConfig
@@ -267,10 +286,25 @@ getCheckpoint'
 getCheckpoint' tc p rn = do
   let cpk = readerCheckpointKey tc p rn
   bs <- FDB.get cpk >>= await
-  case decodeVersionstamp <$> bs of
-    Just Nothing -> error $ "Failed to decode checkpoint: " ++ show bs
-    Just (Just vs) -> return vs
+  case decodeCheckpoint <$> bs of
+    Just vs -> return vs
     Nothing -> return $ CompleteVersionstamp (TransactionVersionstamp 0 0) 0
+
+-- | Return all checkpoints for all partitions for a reader.
+getCheckpoints :: TopicConfig
+               -> ReaderName
+               -> Transaction (FDB.Future (Seq (Versionstamp 'Complete)))
+getCheckpoints tc rn = do
+  let ss = readerCheckpointSS tc rn
+  let ssRange = FDB.subspaceRange ss
+  rangeResult <- FDB.getRange' ssRange FDB.StreamingModeWantAll
+  return
+    $ flip fmap rangeResult
+    $ \case
+        FDB.RangeDone kvs -> fmap (decodeCheckpoint . snd) kvs
+        -- TODO: we need to be able to register monadic callbacks on
+        -- futures to handle this.
+        FDB.RangeMore _ _ -> error "Internal error: unexpectedly large number of partitions"
 
 readNPastCheckpoint
   :: TopicConfig
@@ -288,7 +322,7 @@ readNPastCheckpoint tc p rn n = do
         , rangeLimit   = Just (fromIntegral n)
         , rangeReverse = False
         }
-  fmap (trOutput tc p) <$> withSnapshot (FDB.getEntireRange r)
+  fmap (parseOutput tc p) <$> withSnapshot (FDB.getEntireRange r)
 
 -- TODO: would be useful to have a version of this that returns a watch if
 -- there are no new messages.

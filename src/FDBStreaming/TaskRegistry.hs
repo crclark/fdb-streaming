@@ -10,7 +10,7 @@ module FDBStreaming.TaskRegistry (
   runRandomTask
 ) where
 
-import           Control.Concurrent (myThreadId)
+import Control.Concurrent (myThreadId)
 import           Control.Monad.IO.Class ( liftIO )
 import           Data.IORef (IORef, newIORef, atomicModifyIORef', readIORef)
 import           FoundationDB (Transaction)
@@ -65,7 +65,7 @@ addTask
         -- ^ A unique string name for this task. If the given name already
         -- exists, it will be overwritten.
   -> Int
-  -- ^ How long to lock the task when it runs.
+  -- ^ How long to lock the task when it runs, in seconds.
   -> (Transaction Bool -> Transaction ReleaseResult -> IO ())
         -- ^ An action that is run once per lease acquisition. It is passed two
         -- transactions: one that returns true if the acquired lease is still
@@ -89,17 +89,20 @@ runRandomTask db (TaskRegistry ts tr) = do
                          Just (_, dur, _) -> dur
   FDB.runTransaction db (acquireRandomUnbiased ts toDur) >>= \case
     Nothing                -> do
-      tid <- myThreadId
-      putStrLn $ show tid ++ "couldn't find an unlocked task."
+      --tid <- myThreadId
+      --putStrLn $ show tid ++ "couldn't find an unlocked task."
       return False
     Just (taskName, lease, howAcquired) -> case M.lookup taskName tr' of
       Nothing -> do
-        tid <- myThreadId
+        --tid <- myThreadId
+        {-
         putStrLn $ show tid ++ " found an invalid task " ++ show taskName
                    ++ " not present in " ++ show (M.keys tr')
+        -}
         return False --TODO: warn? this implies tasks outside registry
       Just (taskID, _dur, f) -> do
         tid <- myThreadId
+
         putStrLn $ show tid
                    ++ " starting on task "
                    ++ show taskName
@@ -107,6 +110,7 @@ runRandomTask db (TaskRegistry ts tr) = do
                    ++ show taskID
                    ++ " acquired by "
                    ++ show howAcquired
+
         f ((&&) <$> isLeaseValid ts taskID lease
                 <*> isLocked ts taskName)
           (release ts taskName lease)

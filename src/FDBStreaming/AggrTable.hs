@@ -10,6 +10,7 @@ module FDBStreaming.AggrTable (
   getRow,
   getRowRange,
   getBlocking,
+  aggrTableWatermarkSS,
   TableKey(..),
   OrdTableKey,
   TableSemigroup(..),
@@ -24,6 +25,9 @@ module FDBStreaming.AggrTable (
   getTableRangeVia,
   PutIntLE(..)
 ) where
+
+-- TODO: runGet throws an exception if it fails to parse! Replace with runGetMay
+-- from FDBStreaming.Util
 
 import Control.Concurrent.Async (AsyncCancelled, async, waitAnyCancel)
 import Control.Exception (catch)
@@ -80,6 +84,9 @@ data AggrTable k v = AggrTable {
   , aggrTableNumPartitions :: Integer
   } deriving (Eq, Show)
 
+aggrTableWatermarkSS :: AggrTable k v -> SS.Subspace
+aggrTableWatermarkSS = flip SS.extend [FDB.Bytes "wm"] . aggrTableSS
+
 -- | Class of types that can be serialized as table keys. This is distinct from
 -- 'Message' to enable cases where the user may want to read entire ranges of
 -- a table efficiently. In such cases, the serialized representation of the
@@ -118,7 +125,7 @@ class (Semigroup v) => TableSemigroup v where
   -- | Gets the value at @k@, if present.
   get :: TableKey k => AggrTable k v -> PartitionId -> k -> FDB.Transaction (FDB.Future (Maybe v))
 
--- | Helper function to define 'TableValue.set' easily.
+-- | Helper function to define 'TableSemigroup.set' easily.
 setVia :: TableKey k
        => (v -> ByteString)
        -> AggrTable k v
