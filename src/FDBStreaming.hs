@@ -661,7 +661,7 @@ makeStream ::
 makeStream sn step = do
   let isWm = stepProducesWatermark step
   sc <- getStreamConfig
-  let tc = makeTopicConfig (streamConfigDB sc) (streamConfigSS sc) sn
+  let tc = makeTopicConfig (streamConfigSS sc) sn
   return $
     Stream tc isWm (return . Just)
 
