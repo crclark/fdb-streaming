@@ -7,6 +7,7 @@
 module FDBStreaming.Topic (
   TopicName,
   ReaderName,
+  readerSS,
   PartitionId,
   TopicConfig(..),
   makeTopicConfig,

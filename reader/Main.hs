@@ -38,36 +38,36 @@ testReader = "throughput_test_reader"
 parseWord64 :: ByteString -> Integer
 parseWord64 = fromIntegral . runGet getWord64le . fromStrict
 
-readIntMsgAndCheckpoint :: TopicConfig -> IO Integer
-readIntMsgAndCheckpoint tc = do
+readIntMsgAndCheckpoint :: Database -> TopicConfig -> IO Integer
+readIntMsgAndCheckpoint db tc = do
   putStrLn "Attempting a read"
-  readNAndCheckpoint tc testReader 10 >>= \case
+  readNAndCheckpoint db tc testReader 10 >>= \case
     Empty -> do
       putStrLn "Blocking until new message"
       --blockUntilNew tc -- TODO: deleted this. fix
-      readIntMsgAndCheckpoint tc
+      readIntMsgAndCheckpoint db tc
     xs -> return $ sum $ fmap (parseWord64 . snd) xs
 
 -- | returns (sum, count of messages read)
-readSum :: TopicConfig -> (Integer, Integer) -> IO (Integer, Integer)
-readSum tc (!i,!n) =
-  race timeout (readIntMsgAndCheckpoint tc) >>= \case
+readSum :: Database -> TopicConfig -> (Integer, Integer) -> IO (Integer, Integer)
+readSum db tc (!i,!n) =
+  race timeout (readIntMsgAndCheckpoint db tc) >>= \case
     Left () -> return (i,n)
     Right j -> do
       putStrLn $ "read: " ++ show j
-      readSum tc (j + i, n+1)
+      readSum db tc (j + i, n+1)
 
   where timeout = threadDelay 1000000 -- 1 second in microseconds
 
 main :: IO ()
 main = withFoundationDB defaultOptions $ \db -> do
   let ss = subspace [Bytes "writetest"]
-  let tc = makeTopicConfig db ss "throughput_test"
+  let tc = makeTopicConfig ss "throughput_test"
   ProgramOpts{..} <- getRecord "Throughput test"
   let numReaders' = fromMaybe 1 numReaders
   let numMsgs'    = fromMaybe 100 numMsgs
   let start = replicate numReaders' (0,0)
-  sumsCounts <- mapConcurrentlyBounded numReaders' (readSum tc) start
+  sumsCounts <- mapConcurrentlyBounded numReaders' (readSum db tc) start
   putStrLn $ "Sum of received messages is "
               ++ show (sum $ map fst sumsCounts)
               ++ " and we expected "

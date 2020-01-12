@@ -182,16 +182,17 @@ withProbability p f = do
   when (r <= p) f
 
 awaitOrder
-  :: TopicConfig
+  :: Database
+  -> TopicConfig
   -> AT.AggrTable OrderID All
   -> TVar LatencyStats
   -> Distribution
   -> Gauge
   -> Order
   -> IO ()
-awaitOrder orderTopic table stats latencyDist awaitGauge order@Order{orderID} = withProbability 1 $ catches (do
+awaitOrder db orderTopic table stats latencyDist awaitGauge order@Order{orderID} = withProbability 1 $ catches (do
   Gauge.inc awaitGauge
-  _ <- AT.getBlocking (topicConfigDB orderTopic) table orderID
+  _ <- AT.getBlocking db table orderID
   endTime <- getUnixTime
   let diff = diffUnixTime endTime (unTimestamp $ placedAt order)
   let statsDiff = LatencyStats diff 1
@@ -209,7 +210,8 @@ awaitOrder orderTopic table stats latencyDist awaitGauge order@Order{orderID} = 
 -- | Creates a random order, pushes it onto the given topic, awaits its
 -- arrival in the given AggrTable, and updates the given latency statistics
 -- TVar.
-placeAndAwaitOrders :: TopicConfig
+placeAndAwaitOrders :: Database
+                    -> TopicConfig
                     -> AT.AggrTable OrderID All
                     -> TVar LatencyStats
                     -> Distribution
@@ -219,11 +221,11 @@ placeAndAwaitOrders :: TopicConfig
                     -> Bool
                     -- ^ whether to watch orders to measure end_to_end_latency
                     -> IO ()
-placeAndAwaitOrders orderTopic table stats latencyDist awaitGauge batchSize shouldWatch = catches ( do
+placeAndAwaitOrders db orderTopic table stats latencyDist awaitGauge batchSize shouldWatch = catches ( do
   orders <- replicateM batchSize randOrder
-  writeTopicNoRetry orderTopic (map toMessage orders)
+  writeTopicNoRetry db orderTopic (map toMessage orders)
   when shouldWatch
-    $ forM_ orders $ awaitOrder orderTopic table stats latencyDist awaitGauge
+    $ forM_ orders $ awaitOrder db orderTopic table stats latencyDist awaitGauge
   )
   [ Handler (\case
                Error (MaxRetriesExceeded (CError NotCommitted)) ->
@@ -233,20 +235,21 @@ placeAndAwaitOrders orderTopic table stats latencyDist awaitGauge batchSize shou
                 putStrLn $ "Caught " ++ show e ++ " while writing to topic!")
   ]
 
-writeTopicNoRetry :: Traversable t => TopicConfig -> t ByteString -> IO ()
-writeTopicNoRetry tc@TopicConfig {..} bss = do
+writeTopicNoRetry :: Traversable t => Database -> TopicConfig -> t ByteString -> IO ()
+writeTopicNoRetry db tc@TopicConfig {..} bss = do
   -- TODO: proper error handling
   guard (fromIntegral (length bss) < (maxBound :: Word16))
   p <- randPartition tc
   FDB.runTransactionWithConfig
     defaultConfig { maxRetries = 0 }
-    topicConfigDB
+    db
     $ do currTime <- liftIO getCurrentTime
          setWatermark (topicWatermarkSS tc) (Watermark currTime)
          writeTopic' tc p bss
 
 -- TODO: far too many params!
-orderGeneratorLoop :: TopicConfig
+orderGeneratorLoop :: Database
+                   -> TopicConfig
                    -> AT.AggrTable OrderID All
                    -> Int
                    -- ^ requests per second
@@ -258,11 +261,11 @@ orderGeneratorLoop :: TopicConfig
                    -> Bool
                    -- ^ whether to watch orders to measure end-to-end latency
                    -> IO ()
-orderGeneratorLoop topic table rps batchSize stats latencyDist awaitGauge shouldWatch = do
+orderGeneratorLoop db topic table rps batchSize stats latencyDist awaitGauge shouldWatch = do
   let delay = 1000000 `div` (rps `div` batchSize)
-  void $ forkIO $ placeAndAwaitOrders topic table stats latencyDist awaitGauge batchSize shouldWatch
+  void $ forkIO $ placeAndAwaitOrders db topic table stats latencyDist awaitGauge batchSize shouldWatch
   threadDelay delay
-  orderGeneratorLoop topic table rps batchSize stats latencyDist awaitGauge shouldWatch
+  orderGeneratorLoop db topic table rps batchSize stats latencyDist awaitGauge shouldWatch
 
 latencyReportLoop :: TVar LatencyStats -> IO ()
 latencyReportLoop stats = do
@@ -288,7 +291,7 @@ instance Message All where
 
 topology :: (MonadStream m) => TopicConfig -> Bool -> m (AT.AggrTable OrderID All)
 topology incoming watermark = do
-  input <- (\s -> s {isWatermarked = watermark}) <$> existing incoming
+  input <-if watermark then existingWatermarked incoming else existing incoming
   let fraudChecks = fmap isFraudulent input
   let invChecks = fmap inventoryCheck input
   let details = benignIO (fmap Just . randOrderDetails) input
@@ -334,13 +337,16 @@ printStats db ss = catches (do
 
 printWatermarkLag :: Database -> WatermarkSS -> WatermarkSS -> IO ()
 printWatermarkLag db root leaf = do
-  (r,l) <- runTransaction db
+  res <- runTransaction' db
            $ withSnapshot $ do r <- getCurrentWatermark root >>= await
                                l <- getCurrentWatermark leaf >>= await
                                return (r,l)
-  printf "Watermark of root is %s\n" $ show r
-  printf "Watermark of leaf is %s\n" $ show l
-  printf "Watermark lag is %s\n" $ show (fmap round (diffUTCTime <$> (fmap watermarkUTCTime r) <*> (fmap watermarkUTCTime l)))
+  case res of
+    Left err -> putStrLn $ "Caught " ++ show err ++ " while getting watermark stats"
+    Right (r,l) -> do
+      printf "Watermark of root is %s\n" $ show r
+      printf "Watermark of leaf is %s\n" $ show l
+      printf "Watermark lag is %s\n" $ show (fmap round (diffUTCTime <$> (fmap watermarkUTCTime r) <*> (fmap watermarkUTCTime l)))
 
 mainLoop :: Database -> Subspace -> Args Identity -> IO ()
 mainLoop db ss Args{ generatorNumThreads
@@ -364,11 +370,12 @@ mainLoop db ss Args{ generatorNumThreads
                              , numStreamThreads = coerce numLeaseThreads
                              , numPeriodicJobThreads = 1
                              }
-  let input = makeTopicConfig db ss "incoming_orders"
+  let input = makeTopicConfig ss "incoming_orders"
   let table = getAggrTable conf "order_table"
   stats <- newTVarIO $ LatencyStats 0 1
   replicateM_ (coerce generatorNumThreads)
-    $ forkIO $ orderGeneratorLoop input
+    $ forkIO $ orderGeneratorLoop db
+                                  input
                                   table
                                   (coerce generatorMsgsPerSecond)
                                   (coerce generatorBatchSize)
@@ -388,11 +395,12 @@ mainLoop db ss Args{ generatorNumThreads
 
 
 cleanup :: Database -> Subspace -> IO ()
-cleanup db ss = do
+cleanup db ss = catches (do
   putStrLn "Cleaning up FDB state"
   let (delBegin, delEnd) = rangeKeys $ subspaceRange ss
   runTransactionWithConfig defaultConfig {timeout = 5000} db $ clearRange delBegin delEnd
-  putStrLn "Cleanup successful"
+  putStrLn "Cleanup successful")
+  [Handler $ \(CError err) -> putStrLn $ "Caught " ++ show err ++ "while clearing subspace"]
 
 data Args f = Args
   { subspaceName :: f ByteString
