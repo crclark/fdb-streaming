@@ -362,14 +362,15 @@ mainLoop db ss Args{ generatorNumThreads
   latencyDist <- Metrics.createDistribution "end_to_end_latency" metricsStore
   awaitedOrders <- Metrics.createGauge "waitingOrders" metricsStore
   forkStatsd defaultStatsdOptions metricsStore
-  let conf = FDBStreamConfig { streamConfigDB = db
-                             , streamConfigSS = ss
-                             , streamMetricsStore = Just metricsStore
-                             , msgsPerBatch = coerce batchSize
-                             , leaseDuration = 10
-                             , numStreamThreads = coerce numLeaseThreads
-                             , numPeriodicJobThreads = 1
-                             }
+  let conf = JobConfig
+             { jobConfigDB = db
+             , jobConfigSS = ss
+             , streamMetricsStore = Just metricsStore
+             , msgsPerBatch = coerce batchSize
+             , leaseDuration = 10
+             , numStreamThreads = coerce numLeaseThreads
+             , numPeriodicJobThreads = 1
+             }
   let input = makeTopicConfig ss "incoming_orders"
   let table = getAggrTable conf "order_table"
   stats <- newTVarIO $ LatencyStats 0 1
@@ -390,8 +391,9 @@ mainLoop db ss Args{ generatorNumThreads
   forkIO $ forever $ do
     printWatermarkLag db (topicWatermarkSS input) (AT.aggrTableWatermarkSS table)
     threadDelay 1000000
-  when (coerce streamRun)
-    $ runStream conf (topology input (coerce watermark))
+  if coerce streamRun
+     then runStream conf (topology input (coerce watermark))
+     else threadDelay maxBound
 
 
 cleanup :: Database -> Subspace -> IO ()

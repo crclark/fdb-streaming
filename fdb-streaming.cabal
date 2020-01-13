@@ -23,10 +23,12 @@ library
       FDBStreaming,
       FDBStreaming.AggrTable,
       FDBStreaming.Message,
+      FDBStreaming.Stream,
       FDBStreaming.TaskLease,
       FDBStreaming.TaskRegistry,
       FDBStreaming.Topic,
       FDBStreaming.Topic.Constants,
+      FDBStreaming.JobConfig
       FDBStreaming.Joins,
       FDBStreaming.Util,
       FDBStreaming.Watermark

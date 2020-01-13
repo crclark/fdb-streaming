@@ -35,6 +35,3 @@ oneToOneJoin = Int 6
 
 customMeta :: Elem
 customMeta = Int 7
-
-externalDataSourceCheckpoint :: Elem
-externalDataSourceCheckpoint = Int 8
