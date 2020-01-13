@@ -80,8 +80,8 @@ import FDBStreaming.Joins
   )
 import FDBStreaming.Message (Message (fromMessage, toMessage))
 import FDBStreaming.TaskLease (TaskName (TaskName), secondsSinceEpoch)
-import FDBStreaming.Stream (Stream (Stream, streamWatermarkSS, streamReadAndCheckpoint, streamMinReaderPartitions, streamTopicConfig, streamName), StreamName, isStreamWatermarked, streamConsumerCheckpointSS, getStreamWatermark)
-import FDBStreaming.JobConfig(JobConfig(JobConfig, jobConfigDB, msgsPerBatch, numStreamThreads, numPeriodicJobThreads, streamMetricsStore, jobConfigSS, leaseDuration))
+import FDBStreaming.Stream.Internal (Stream (Stream, streamWatermarkSS, streamReadAndCheckpoint, streamMinReaderPartitions, streamTopicConfig, streamName), StreamName, isStreamWatermarked, streamConsumerCheckpointSS, getStreamWatermark)
+import FDBStreaming.JobConfig(JobConfig(JobConfig, jobConfigDB, msgsPerBatch, numStreamThreads, numPeriodicJobThreads, streamMetricsStore, jobConfigSS, leaseDuration), JobSubspace)
 import FDBStreaming.TaskRegistry as TaskRegistry
   ( TaskRegistry,
     addTask,
@@ -200,8 +200,10 @@ topicWatermarkSS :: TopicConfig -> WatermarkSS
 topicWatermarkSS = flip FDB.extend [FDB.Bytes "wm"] . topicCustomMetadataSS
 
 -- | Returns the subspace in which the given stream's watermarks are stored.
-watermarkSS :: Stream a -> Maybe WatermarkSS
-watermarkSS = streamWatermarkSS
+watermarkSS :: JobSubspace -> Stream a -> Maybe WatermarkSS
+watermarkSS jobSS stream = case streamWatermarkSS stream of
+  Nothing -> Nothing
+  Just wmSS -> Just (wmSS jobSS)
 
 -- | Registers an IO transformation to perform on each message if/when the
 -- stream is consumed downstream. Return 'Nothing' to filter the stream. Side
@@ -392,6 +394,7 @@ watermarkNext t = do
 instance MonadStream DefaultWatermarker where
   run sn w@WriteOnlyProcessor {} = makeStream sn sn w --writer has no parents, nothing to do
   run sn step@StreamProcessor {streamProcessorInStream} = do
+    JobConfig{jobConfigSS} <- getStreamConfig
     output <- makeStream sn sn step
     -- TODO:
     -- We need to check that a lot of stuff is in place before we can default
@@ -407,7 +410,7 @@ instance MonadStream DefaultWatermarker where
     --
     -- This is a long list! Need to find a way to simplify it.
     case ( isStepDefaultWatermarked step
-         , watermarkSS output
+         , watermarkSS jobConfigSS output
          , streamWatermarkSS streamProcessorInStream
          , streamTopicConfig streamProcessorInStream) of
       (True, Just wmSS, Just _inWmSS, Just inTopic) ->
@@ -416,9 +419,10 @@ instance MonadStream DefaultWatermarker where
     return output
 
   run sn step@Stream2Processor {stream2ProcessorInStreamL, stream2ProcessorInStreamR} = do
+    JobConfig{jobConfigSS} <- getStreamConfig
     output <- makeStream sn sn step
     case ( isStepDefaultWatermarked step
-         , watermarkSS output
+         , watermarkSS jobConfigSS output
          , streamWatermarkSS stream2ProcessorInStreamL
          , streamTopicConfig stream2ProcessorInStreamL
          , streamWatermarkSS stream2ProcessorInStreamR
@@ -670,7 +674,7 @@ makeStream stepName streamName step = do
 -- default watermark) set. Don't export this; too confusing for users.
 setStreamWatermarkByTopic :: TopicConfig -> Stream a -> Stream a
 setStreamWatermarkByTopic tc stream =
-  stream { streamWatermarkSS = Just $ topicWatermarkSS tc}
+  stream { streamWatermarkSS = Just $ \_ -> topicWatermarkSS tc}
 
 -- | Create a stream from a topic. Assumes the topic is not watermarked. If it
 -- is and you want to propagate watermarks downstream, the caller must call

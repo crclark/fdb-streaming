@@ -23,7 +23,8 @@ library
       FDBStreaming,
       FDBStreaming.AggrTable,
       FDBStreaming.Message,
-      FDBStreaming.Stream,
+      FDBStreaming.Stream
+      FDBStreaming.Stream.Internal,
       FDBStreaming.TaskLease,
       FDBStreaming.TaskRegistry,
       FDBStreaming.Topic,
