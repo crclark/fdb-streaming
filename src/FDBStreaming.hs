@@ -209,8 +209,8 @@ watermarkSS = streamWatermarkSS
 -- times for the same input.
 benignIO :: (a -> IO (Maybe b)) -> Stream a -> Stream b
 benignIO g (Stream rc np wmSS stc streamName) =
-  build $ \rn pid ss n -> do
-    xs <- rc rn pid ss n
+  build $ \cfg rn pid ss n -> do
+    xs <- rc cfg rn pid ss n
     flip witherM xs $ \(mv, x) -> liftIO (g x) >>= \case
       Nothing -> return Nothing
       Just y -> return $ Just (mv, y)
@@ -678,7 +678,7 @@ setStreamWatermarkByTopic tc stream =
 streamFromTopic :: TopicConfig -> StreamName -> Stream ByteString
 streamFromTopic tc streamName =
   Stream
-  { streamReadAndCheckpoint = \rn pid _chkptSS n -> do
+  { streamReadAndCheckpoint = \_cfg rn pid _chkptSS n -> do
       msgs <- readNAndCheckpoint' tc pid rn n
       return $ fmap (\(vs, x) -> (Just vs, x)) msgs
   , streamMinReaderPartitions = Topic.numPartitions tc
@@ -959,7 +959,7 @@ readPartitionBatchExactlyOnce ::
   Transaction (Seq (Maybe (Versionstamp 'Complete), a))
 readPartitionBatchExactlyOnce cfg stream metrics rn pid n = do
   let checkpointSS = streamConsumerCheckpointSS (jobConfigSS cfg) stream rn
-  msgs <- streamReadAndCheckpoint stream rn pid checkpointSS n
+  msgs <- streamReadAndCheckpoint stream cfg rn pid checkpointSS n
   --TODO: the batch might only be empty because the user is filtering it.
   --We need to distinguish between reading from a caught-up topic and user
   --filtering.

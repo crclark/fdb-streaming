@@ -11,7 +11,7 @@ module FDBStreaming.Stream (
 ) where
 
 import Data.Maybe (isJust)
-import FDBStreaming.JobConfig (JobSubspace)
+import FDBStreaming.JobConfig (JobConfig, JobSubspace)
 import FDBStreaming.Topic
   ( PartitionId,
     ReaderName,
@@ -112,10 +112,15 @@ type StreamName = ByteString
 -- go incommunicado for a long time, then come back and try to write, after we
 -- decided it's dead. So for now, we'll just start the transaction, read, then
 -- checkpoint.
+
+-- TODO: don't the export the fields directly. Export a smart constructor
+-- that prevents the user from populating streamTopicConfig. Also exports
+-- accessors for the appropriate fields.
 data Stream a =
   Stream
   { streamReadAndCheckpoint
-      :: ReaderName
+      :: JobConfig
+      -> ReaderName
       -> PartitionId
       -> FDB.Subspace
       --TODO: Word16?
@@ -164,20 +169,20 @@ instance Functor Stream where
   fmap g Stream{..} =
     Stream
     { streamReadAndCheckpoint =
-        \rn pid ss n -> fmap (fmap g) <$> streamReadAndCheckpoint rn pid ss n
+        \cfg rn pid ss n ->
+          fmap (fmap g) <$> streamReadAndCheckpoint cfg rn pid ss n
     , ..
     }
 
 instance Filterable Stream where
-  mapMaybe g (Stream rc n wmSS stc streamName) =
+  mapMaybe g Stream{..} =
     Stream
-      (\rdNm pid ss batchSize
-       -> mapMaybe (\(mv, x) -> fmap (mv,) (g x)) <$> rc rdNm pid ss batchSize)
-      n
-      wmSS
-      stc
-      streamName
-
+    { streamReadAndCheckpoint =
+        \cfg rdNm pid ss batchSize
+          -> mapMaybe (\(mv, x) -> fmap (mv,) (g x))
+             <$> streamReadAndCheckpoint cfg rdNm pid ss batchSize
+    , ..
+    }
 
 -- | Returns the current watermark for the given stream, if it can be determined.
 getStreamWatermark :: Stream a -> Transaction (Maybe Watermark)
