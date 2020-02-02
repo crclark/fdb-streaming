@@ -186,6 +186,8 @@ still running the old version of the code?
 
 -}
 
+-- | The name of a step in the pipeline. A step can be thought of as a function
+-- that consumes a stream and writes to a stream, a table, or a side effect.
 type StepName = ByteString
 
 data GroupedBy k v

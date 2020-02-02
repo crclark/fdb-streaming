@@ -40,7 +40,7 @@ import FoundationDB.Versionstamp
   )
 import Data.Sequence (Seq ())
 import Data.Foldable (for_)
-import Data.Witherable (Filterable, mapMaybe)
+import Data.Witherable (Filterable, catMaybes, mapMaybe)
 import Data.Word (Word8)
 import Safe.Foldable (maximumMay)
 
@@ -127,9 +127,11 @@ customStream
   -> Integer
   -- ^ Minimum number of threads that must concurrently read from the stream
   -- in order to maintain real-time throughput.
-  -> Maybe (a -> Watermark)
+  -> Maybe (a -> Maybe Watermark)
   -- ^ A watermark function. It's recommended that you make watermarking
-  -- optional.
+  -- optional. If a given event cannot be watermarked (for example, if only
+  -- some events have timestamps), this function should return Nothing for that
+  -- event.
   -> StreamName
   -- ^ The unique name of this stream. This must be provided by the user.
   -> Stream a
@@ -141,7 +143,7 @@ customStream readBatch minThreads wmFn streamName =
                        (streamWatermarkSS stream))
                  $ \wmSS ->
                    for_
-                     (maximumMay (fmap (fromJust wmFn) msgs))
+                     (maximumMay $ catMaybes $ (fmap (fromJust wmFn) msgs))
                      $ \wm -> setWatermark wmSS wm
             return $ fmap (Nothing, ) msgs
         , streamMinReaderPartitions = minThreads
