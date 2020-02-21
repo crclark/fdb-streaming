@@ -55,11 +55,11 @@ packages:
     git: https://github.com/crclark/foundationdb-haskell.git
     pantry-tree:
       size: 2590
-      sha256: 1122a133eed8ea4eaa70c4a7d72d446320ce0d440bc9e128a13f95154e22ee2f
-    commit: a04d8891a60306f7c921a06de19d70c8a33d775b
+      sha256: f0b14e7f5cbc7672cf2e473b25a2ee812cb7e34247230625c37a8c9b7ca494ef
+    commit: 6285712cb112dcbc1e0976426a05169d91bc33cc
   original:
     git: https://github.com/crclark/foundationdb-haskell.git
-    commit: a04d8891a60306f7c921a06de19d70c8a33d775b
+    commit: 6285712cb112dcbc1e0976426a05169d91bc33cc
 snapshots:
 - completed:
     size: 497078

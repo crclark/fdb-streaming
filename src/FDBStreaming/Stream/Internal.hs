@@ -1,10 +1,13 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE RankNTypes #-}
 
 module FDBStreaming.Stream.Internal (
   Stream(..),
   StreamName,
+  StreamReadAndCheckpoint,
   isStreamWatermarked,
   streamConsumerCheckpointSS,
   getStreamWatermark,
@@ -48,6 +51,18 @@ import Safe.Foldable (maximumMay)
 -- unique.
 type StreamName = ByteString
 
+-- | Readable alias for the function that transactionally reads from a stream
+-- and checkpoints what it has read.
+type StreamReadAndCheckpoint a state =
+  JobConfig
+  -> ReaderName
+  -> PartitionId
+  -> FDB.Subspace
+  --TODO: Word16?
+  -> Word8
+  -> state
+  -> Transaction (Seq (Maybe (Versionstamp 'Complete), a))
+
 -- TODO: say we have a topology like
 --
 -- k <- kafkaInput
@@ -70,9 +85,11 @@ type StreamName = ByteString
 -- functionality of the leases to ensure that a slow process doesn't read a batch,
 -- go incommunicado for a long time, then come back and try to write, after we
 -- decided it's dead. So for now, we'll just start the transaction, read, then
--- checkpoint.
+-- checkpoint. A workaround would be to do one-time setup in setupState. That
+-- might be enough for all use cases. We shall see.
 
 data Stream a =
+  forall state.
   Stream
   { streamReadAndCheckpoint
       :: JobConfig
@@ -81,6 +98,7 @@ data Stream a =
       -> FDB.Subspace
       --TODO: Word16?
       -> Word8
+      -> state
       -> Transaction (Seq (Maybe (Versionstamp 'Complete), a))
     -- ^ Given the name of the step consuming the stream, the
     -- partition id of the worker consuming the stream, a subspace
@@ -105,6 +123,15 @@ data Stream a =
   , streamName :: StreamName
   -- ^ The unique name of this stream. This is used to persist checkpointing
   -- data in FoundationDB, so conflicts in these names are very, very bad.
+  , setUpState :: Transaction state
+  -- ^ Set up per-worker state needed by this stream reader. For example, this
+  -- could be a connection to a database. A stream reader worker's lifecycle
+  -- will call this once, then streamReadAndCheckpoint many times, then
+    -- 'destroyState' once. This lifecycle will be repeated many times.
+  , destroyState :: state -> IO ()
+  -- ^ Called once to destroy a worker's state as set up by 'setUpState'. Not
+  -- a transaction because we can't guarantee that we can run transactions if
+  -- the worker dies abnormally.
   }
 
 defaultWmSS :: StreamName -> JobSubspace -> WatermarkSS
@@ -118,6 +145,7 @@ customStream
       -> PartitionId
       -> FDB.Subspace
       -> Word8
+      -> state
       -> Transaction (Seq a))
   -- ^ Function that will be called to read a batch of records from the data
   -- source. Receives the configuration for the current job, the name and
@@ -134,11 +162,16 @@ customStream
   -- event.
   -> StreamName
   -- ^ The unique name of this stream. This must be provided by the user.
+  -> Transaction state
+  -- ^ Called once when a worker is starting up, to set up any state the worker
+  -- needs, such as a database connection.
+  -> (state -> IO ())
+  -- ^ Called to destroy the worker state.
   -> Stream a
-customStream readBatch minThreads wmFn streamName =
+customStream readBatch minThreads wmFn streamName setUp destroy =
   let stream = Stream
-        { streamReadAndCheckpoint = \cfg rn pid ss n -> do
-            msgs <- readBatch cfg rn pid ss n
+        { streamReadAndCheckpoint = \cfg rn pid ss n state -> do
+            msgs <- readBatch cfg rn pid ss n state
             for_ (fmap ($ jobConfigSS cfg)
                        (streamWatermarkSS stream))
                  $ \wmSS ->
@@ -152,6 +185,8 @@ customStream readBatch minThreads wmFn streamName =
             Just _  -> Just $ defaultWmSS streamName
         ,  streamTopicConfig = Nothing
         , streamName = streamName
+        , setUpState = setUp
+        , destroyState = destroy
         }
       in stream
 
@@ -173,8 +208,8 @@ instance Functor Stream where
   fmap g Stream{..} =
     Stream
     { streamReadAndCheckpoint =
-        \cfg rn pid ss n ->
-          fmap (fmap g) <$> streamReadAndCheckpoint cfg rn pid ss n
+        \cfg rn pid ss n state ->
+          fmap (fmap g) <$> streamReadAndCheckpoint cfg rn pid ss n state
     , ..
     }
 
@@ -182,9 +217,9 @@ instance Filterable Stream where
   mapMaybe g Stream{..} =
     Stream
     { streamReadAndCheckpoint =
-        \cfg rdNm pid ss batchSize
+        \cfg rdNm pid ss batchSize state
           -> mapMaybe (\(mv, x) -> fmap (mv,) (g x))
-             <$> streamReadAndCheckpoint cfg rdNm pid ss batchSize
+             <$> streamReadAndCheckpoint cfg rdNm pid ss batchSize state
     , ..
     }
 
