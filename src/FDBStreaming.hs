@@ -696,7 +696,7 @@ streamFromTopic tc streamName =
   , streamWatermarkSS = Nothing
   , streamTopicConfig = Just tc
   , streamName = streamName
-  , setUpState = return ()
+  , setUpState = \_ _ _ -> return ()
   , destroyState = const $ return ()
   }
 
@@ -824,10 +824,16 @@ instance MonadStream LeaseBasedStreamWorker where
       -- GHC limitation. In 8.6, let gives a very confusing error message about
       -- variables escaping their scopes. In 8.8, it gives a more helpful
       -- "my brain just exploded" message that says to use a case statement.
+      let checkpointSS = streamConsumerCheckpointSS
+                           (jobConfigSS cfg)
+                           streamProcessorInStream
+                           sn
       let job pid _stillValid _release =
             case streamProcessorInStream of
               Stream streamReadAndCheckpoint _ _ _ _ setUpState destroyState ->
-                bracket (runTransaction jobConfigDB setUpState) destroyState \state ->
+                bracket (runTransaction jobConfigDB $ setUpState sn pid checkpointSS)
+                        destroyState
+                        \state ->
                   doForSeconds (leaseDuration cfg)
                     $ void
                     $ throttleByErrors metrics sn
@@ -856,10 +862,20 @@ instance MonadStream LeaseBasedStreamWorker where
     metrics <- registerStepMetrics sn
     let lname = sn <> "0"
     let rname = sn <> "1"
+    let checkpointSSL = streamConsumerCheckpointSS
+                          (jobConfigSS cfg)
+                          inl
+                          lname
+    let checkpointSSR = streamConsumerCheckpointSS
+                          (jobConfigSS cfg)
+                          inr
+                          rname
     let ljob pid _stillValid _release =
           case inl of
               Stream streamReadAndCheckpoint _ _ _ _ setUpState destroyState ->
-                bracket (runTransaction jobConfigDB setUpState) destroyState \state ->
+                bracket (runTransaction jobConfigDB $ setUpState lname pid checkpointSSL)
+                        destroyState
+                        \state ->
                   doForSeconds (leaseDuration cfg)
                     $ void
                     $ throttleByErrors metrics sn
@@ -878,7 +894,9 @@ instance MonadStream LeaseBasedStreamWorker where
     let rjob pid _stillValid _release =
           case inr of
               Stream streamReadAndCheckpoint _ _ _ _ setUpState destroyState ->
-                bracket (runTransaction jobConfigDB setUpState) destroyState \state ->
+                bracket (runTransaction jobConfigDB $ setUpState rname pid checkpointSSR)
+                        destroyState
+                        \state ->
                   doForSeconds (leaseDuration cfg)
                     $ void
                     $ throttleByErrors metrics sn
@@ -918,10 +936,16 @@ instance MonadStream LeaseBasedStreamWorker where
       let table = getAggrTable cfg sn
       let (GroupedBy inStream _) = tableProcessorGroupedBy
       metrics <- registerStepMetrics sn
+      let checkpointSS = streamConsumerCheckpointSS
+                           (jobConfigSS cfg)
+                           inStream
+                           sn
       let job pid _stillValid _release =
             case inStream of
               Stream streamReadAndCheckpoint _ _ _ _ setUpState destroyState ->
-                bracket (runTransaction jobConfigDB setUpState) destroyState \state ->
+                bracket (runTransaction jobConfigDB $ setUpState sn pid checkpointSS)
+                        destroyState
+                        \state ->
                   doForSeconds (leaseDuration cfg)
                   $ void
                   $ throttleByErrors metrics sn
