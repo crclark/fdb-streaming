@@ -123,7 +123,7 @@ data Stream a =
   , streamName :: StreamName
   -- ^ The unique name of this stream. This is used to persist checkpointing
   -- data in FoundationDB, so conflicts in these names are very, very bad.
-  , setUpState :: (ReaderName -> PartitionId -> FDB.Subspace -> Transaction state)
+  , setUpState :: (JobConfig -> ReaderName -> PartitionId -> FDB.Subspace -> Transaction state)
   -- ^ Set up per-worker state needed by this stream reader. For example, this
   -- could be a connection to a database. A stream reader worker's lifecycle
   -- will call this once, then streamReadAndCheckpoint many times, then
@@ -164,7 +164,7 @@ customStream
   -- event.
   -> StreamName
   -- ^ The unique name of this stream. This must be provided by the user.
-  -> (ReaderName -> PartitionId -> FDB.Subspace -> Transaction state)
+  -> (JobConfig -> ReaderName -> PartitionId -> FDB.Subspace -> Transaction state)
   -- ^ Called once when a worker is starting up, to set up any state the worker
   -- needs, such as a database connection. Parameters passed to this function
   -- are the same as those passed to the batch read function.

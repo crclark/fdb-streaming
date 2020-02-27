@@ -696,7 +696,7 @@ streamFromTopic tc streamName =
   , streamWatermarkSS = Nothing
   , streamTopicConfig = Just tc
   , streamName = streamName
-  , setUpState = \_ _ _ -> return ()
+  , setUpState = \_ _ _ _ -> return ()
   , destroyState = const $ return ()
   }
 
@@ -831,7 +831,7 @@ instance MonadStream LeaseBasedStreamWorker where
       let job pid _stillValid _release =
             case streamProcessorInStream of
               Stream streamReadAndCheckpoint _ _ _ _ setUpState destroyState ->
-                bracket (runTransaction jobConfigDB $ setUpState sn pid checkpointSS)
+                bracket (runTransaction jobConfigDB $ setUpState cfg sn pid checkpointSS)
                         destroyState
                         \state ->
                   doForSeconds (leaseDuration cfg)
@@ -873,7 +873,7 @@ instance MonadStream LeaseBasedStreamWorker where
     let ljob pid _stillValid _release =
           case inl of
               Stream streamReadAndCheckpoint _ _ _ _ setUpState destroyState ->
-                bracket (runTransaction jobConfigDB $ setUpState lname pid checkpointSSL)
+                bracket (runTransaction jobConfigDB $ setUpState cfg lname pid checkpointSSL)
                         destroyState
                         \state ->
                   doForSeconds (leaseDuration cfg)
@@ -894,7 +894,7 @@ instance MonadStream LeaseBasedStreamWorker where
     let rjob pid _stillValid _release =
           case inr of
               Stream streamReadAndCheckpoint _ _ _ _ setUpState destroyState ->
-                bracket (runTransaction jobConfigDB $ setUpState rname pid checkpointSSR)
+                bracket (runTransaction jobConfigDB $ setUpState cfg rname pid checkpointSSR)
                         destroyState
                         \state ->
                   doForSeconds (leaseDuration cfg)
@@ -943,7 +943,7 @@ instance MonadStream LeaseBasedStreamWorker where
       let job pid _stillValid _release =
             case inStream of
               Stream streamReadAndCheckpoint _ _ _ _ setUpState destroyState ->
-                bracket (runTransaction jobConfigDB $ setUpState sn pid checkpointSS)
+                bracket (runTransaction jobConfigDB $ setUpState cfg sn pid checkpointSS)
                         destroyState
                         \state ->
                   doForSeconds (leaseDuration cfg)
