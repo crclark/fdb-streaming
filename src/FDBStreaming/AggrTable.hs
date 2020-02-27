@@ -484,6 +484,12 @@ instance PutIntLE Int64 where
   {-# INLINABLE getIntLE #-}
   getIntLE = getInt64le
 
+instance PutIntLE Int where
+  {-# INLINABLE putIntLE #-}
+  putIntLE = putInt64le . fromIntegral
+  {-# INLINABLE getIntLE #-}
+  getIntLE = fromIntegral <$> getInt64le
+
 instance PutIntLE a => TableSemigroup (Sum a) where
   mappendBatch table pid kvs =
     for_ kvs $ uncurry $ mappendAtomicVia (toStrict . runPut . putIntLE . getSum) Op.add table pid
