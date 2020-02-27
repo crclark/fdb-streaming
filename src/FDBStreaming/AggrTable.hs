@@ -309,6 +309,15 @@ instance TableKey Integer where
 
 instance OrdTableKey Integer
 
+instance TableKey Int where
+  toKeyBytes x = FDB.encodeTupleElems [FDB.Int $ fromIntegral x]
+  fromKeyBytes bs = case FDB.decodeTupleElems bs of
+    Left err -> error $ "Failed to decode Int TableKey: " ++ show err
+    Right [FDB.Int x] -> fromIntegral x
+    Right _ -> error $ "Expected Int when decoding TableKey"
+
+instance OrdTableKey Int
+
 instance TableKey Float where
   toKeyBytes x = FDB.encodeTupleElems [FDB.Float x]
   fromKeyBytes bs = case FDB.decodeTupleElems bs of
