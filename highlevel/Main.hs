@@ -310,7 +310,7 @@ topology incoming watermark = do
                             (\OrderDetails{orderID} -> orderID)
                             (\(oid, isGood) OrderDetails{details}
                               -> (oid, All $ isGood && goodDetails details))
-  grouped <- groupBy (pure . fst) finalJoin
+  let grouped = groupBy (pure . fst) finalJoin
   orderStatusTable <- aggregate "order_table" grouped snd
   return orderStatusTable
 

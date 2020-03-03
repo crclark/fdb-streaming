@@ -17,7 +17,8 @@
 {-# LANGUAGE TypeOperators #-}
 
 module FDBStreaming
-  ( MonadStream,
+  ( Message(..),
+    MonadStream,
     Stream(streamTopicConfig),
     isStreamWatermarked,
     getStreamWatermark,
@@ -614,19 +615,12 @@ oneToOneJoin' inl inr pl pr j =
         lstep
         rstep
 
--- NOTE: the reason that this is a separate constructor from StreamAggregate
--- is so that our helper functions can be combined more easily. It's easier to
--- work with and refactor code that looks like @count . groupBy id@ rather
--- than the less compositional @countBy id@. At least, that's what it looks
--- like at the time of this writing. Kafka Streams does it that way. If it
--- ends up not being worth it, simplify.
 -- TODO: implement one-to-many joins in terms of this?
 groupBy ::
-  (MonadStream m) =>
   (v -> [k]) ->
   Stream v ->
-  m (GroupedBy k v)
-groupBy k t = return (GroupedBy t k)
+  (GroupedBy k v)
+groupBy k t = GroupedBy t k
 
 aggregate ::
   (Message v, Ord k, AT.TableKey k, AT.TableSemigroup aggr, MonadStream m) =>
@@ -1027,10 +1021,9 @@ registerContinuousLeases cfg wkr = do
 
 -- TODO: what about truncating old data by timestamp?
 
--- | reads a batch of messages from a stream and checkpoints so that the same
--- value of 'ReaderName' is guaranteed to never receive the same messages again
--- in subsequent calls to this function.
-
+-- | Creates a reference to an existing aggregation table from outside of a
+-- 'MonadStream' action. This is used in order to read from the aggregation
+-- table from outside of the stream processing system.
 getAggrTable :: JobConfig -> StepName -> AT.AggrTable k v
 getAggrTable sc sn = AT.AggrTable {..}
   where
