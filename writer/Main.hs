@@ -36,7 +36,7 @@ writeWord64 tc x = do
 main :: IO ()
 main = withFoundationDB defaultOptions $ \db -> do
   let ss = subspace [Bytes "writetest"]
-  let tc = makeTopicConfig db ss "throughput_test"
+  let tc = makeTopicConfig ss "throughput_test"
   ProgramOpts{..} <- getRecord "Throughput test"
   let numWriters' = fromMaybe 1 numWriters
   let numMsgs'    = fromMaybe 100 numMsgs

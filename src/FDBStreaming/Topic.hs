@@ -7,6 +7,7 @@
 module FDBStreaming.Topic (
   TopicName,
   ReaderName,
+  readerSS,
   PartitionId,
   TopicConfig(..),
   makeTopicConfig,
@@ -87,8 +88,7 @@ type PartitionId = Integer
 -- being transferred to a new database, because versionstamps are only
 -- monotonically increasing for a given DB. We need an "incarnation" prefix
 -- before the versionstamp. See the record layer paper for more info.
-data TopicConfig = TopicConfig { topicConfigDB :: FDB.Database
-                               , topicSS :: FDB.Subspace
+data TopicConfig = TopicConfig { topicSS :: FDB.Subspace
                                -- ^ top-level container for all topics used by
                                -- this application.
                                , topicName :: TopicName
@@ -104,8 +104,8 @@ data TopicConfig = TopicConfig { topicConfigDB :: FDB.Database
                                -- subspace.
                                }
 
-makeTopicConfig :: FDB.Database -> FDB.Subspace -> TopicName -> TopicConfig
-makeTopicConfig topicConfigDB topicSS topicName = TopicConfig { .. }
+makeTopicConfig ::FDB.Subspace -> TopicName -> TopicConfig
+makeTopicConfig topicSS topicName = TopicConfig { .. }
  where
   topicCountKey = FDB.pack topicCountSS []
 
@@ -138,7 +138,7 @@ listExistingTopics db ss = runTransaction db $ go (FDB.pack ss [C.topics])
       Right (FDB.Int 0 : FDB.Bytes topicName : _) -> do
         let nextK = FDB.pack ss [C.topics, FDB.Bytes topicName] <> "0xff"
         rest <- go nextK
-        let conf = makeTopicConfig db ss topicName
+        let conf = makeTopicConfig ss topicName
         return (conf : rest)
       _ -> return []
 
@@ -203,12 +203,16 @@ writeTopic' tc@TopicConfig {..} p bss = do
 -- | Transactionally write a batch of messages to the given topic. The
 -- batch must be small enough to fit into a single FoundationDB transaction.
 -- DANGER: can only be called once per topic per transaction.
-writeTopic :: Traversable t => TopicConfig -> t ByteString -> IO ()
-writeTopic tc@TopicConfig {..} bss = do
+writeTopic :: Traversable t
+           => FDB.Database
+           -> TopicConfig
+           -> t ByteString
+           -> IO ()
+writeTopic db tc@TopicConfig {..} bss = do
   -- TODO: proper error handling
   guard (fromIntegral (length bss) < (maxBound :: Word16))
   p <- randPartition tc
-  FDB.runTransaction topicConfigDB $ writeTopic' tc p bss
+  FDB.runTransaction db $ writeTopic' tc p bss
 
 parseOutput
   :: TopicConfig
@@ -254,9 +258,9 @@ awaitTopicOrTimeout timeout futures =
     Right (Left  _) -> return Nothing -- TODO: handle errors better
     Right (Right p) -> return (Just p)
 
-watchTopic :: TopicConfig -> IO (Either FDB.Error PartitionId)
-watchTopic tc = do
-  ws <- runTransaction (topicConfigDB tc) (watchTopic' tc)
+watchTopic :: FDB.Database -> TopicConfig -> IO (Either FDB.Error PartitionId)
+watchTopic db tc = do
+  ws <- runTransaction db (watchTopic' tc)
   awaitTopic ws
 
 checkpoint'
@@ -342,10 +346,11 @@ readNAndCheckpoint' tc@TopicConfig {..} p rn n =
     _ -> return mempty
 
 readNAndCheckpoint
-  :: TopicConfig
+  :: FDB.Database
+  -> TopicConfig
   -> ReaderName
   -> Word8
   -> IO (Seq (Versionstamp 'Complete, ByteString))
-readNAndCheckpoint tc@TopicConfig {..} rn n = do
+readNAndCheckpoint db tc@TopicConfig {..} rn n = do
   p <- randPartition tc
-  FDB.runTransaction topicConfigDB (readNAndCheckpoint' tc p rn n)
+  FDB.runTransaction db (readNAndCheckpoint' tc p rn n)
