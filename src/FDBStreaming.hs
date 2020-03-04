@@ -16,6 +16,117 @@
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeOperators #-}
 
+-- | FDBStreaming is a poorly-named, work-in-progress, proof-of-concept library
+-- for large-scale processing of unbounded data sets and sources. It is inspired
+-- by both Kafka Streams and the Dataflow Model. It uses <https://www.foundationdb.org/ FoundationDB>
+-- for all data storage and worker coordination. It began as a project to try out
+-- FoundationDB. FoundationDB enables us to support several features which are
+-- not present in similar systems, and allowed FDBStreaming to be written with
+-- surprisingly little code.
+--
+-- = Features
+--
+-- * Fault-tolerant, stateless workers.
+-- * Durability provided by FoundationDB.
+-- * Exactly-once semantics.
+-- * Simple deployment like Kafka Streams -- deploy as many instances of a
+--   binary executable, wherever and however you want, and they will
+--   automatically distribute work amongst themselves.
+-- * Simple infrastructure dependency: requires only FoundationDB, which is
+--   used for both worker coordination and data storage.
+-- * Dataflow-style watermarks and triggers (triggers not yet implemented).
+-- * Distributed monoidal aggregations.
+-- * Distributed joins.
+--
+-- = (Ostensibly) differentiating features
+--
+-- * Serve aggregation results directly from worker instances
+--   and FoundationDB -- no separate output step to another database is required.
+-- * Secondary indices can be defined on data streams,
+--   allowing you to serve and look up individual records within the stream.
+-- * Unlike Kafka Streams, no tricky locality limitations on joins.
+-- * Easy extensibility to support additional distributed data structures,
+--   thanks to FoundationDB. Insert incoming data into priority queues, queues,
+--   spatial indices, hierarchical documents, tables, etc., with exactly-once
+--   semantics provided transparently.
+-- * Insert data into the stream directly with HTTP requests to workers; no
+--   separate data store required.
+-- * Small codebase.
+-- * Group and window by anything -- event time, processing time, color, etc.
+--   Unlike the Dataflow Model, event time is not a built-in concept, so complex
+--   use cases can be easier to express.
+--
+-- = Current Limitations
+--
+-- * Individual messages must be less than 100 kB in size.
+-- * At each processing step, processing an individual batch of messages must
+--   take less than five seconds.
+-- * When storing unbounded stream data in FoundationDB, FDBStreaming performance
+--   is bound by FoundationDB. Expect hundreds of thousands of messages per
+--   second. Maybe low millions at best. See <https://apple.github.io/foundationdb/performance.html FoundationDB's docs>
+--   for more information about how performance scales. However, if you are only
+--   storing monoidal aggregations in FoundationDB and reading data from another
+--   data source (Kafka, S3, etc.), or are otherwise aggressively filtering or
+--   shrinking the input data before it gets written to FoundationDB, you will
+--   probably be bound by the speed at which you can read from the data source.
+-- * No autoscaling -- the number of threads per 'StreamStep' must be specified
+--   by the user. Autoscaling will be implemented in the future.
+-- * No facilities for upgrading jobs with new code -- understanding what
+--   changes are safe currently requires some understanding of FDBStreaming
+--   internals. Guidelines and tools for identifying breaking changes will be
+--   provided in the future.
+--
+-- = Core concepts
+--
+-- Each FDBStreaming job consists of unbounded 'Stream's of data, which serve as
+-- input and output to 'StreamStep's, which map, filter, and otherwise transform
+-- their inputs. Lastly, 'StreamStep's can also group and window their inputs to
+-- perform aggregations, which are written to 'AggrTable's. For scalability
+-- reasons, aggregations must be commutative monoids. Many aggregations included
+-- out-of-the-box in FDBStreaming are implemented in terms of FoundationDB's
+-- atomic operations, which further improves performance.
+--
+-- 'Stream's are abstract representations of unbounded data sources. Internally,
+-- they are represented as instructions for how to ask for the next @n@ items in
+-- the stream, and how to checkpoint where we left off. Input 'Stream's can pull
+-- data from external data sources, while intermediate streams created by
+-- 'StreamStep's are persisted in FoundationDB in a 'Topic' data structure which
+-- provides an API roughly similar to Kafka's.
+--
+-- 'StreamStep's read data from 'Stream's in small batches, transform the batch,
+-- and write the results to another 'Stream' or 'AggrTable'. Each batch is
+-- processed in a single FoundationDB transaction, which is also used to
+-- checkpoint our position in the stream. Furthermore, for advanced use cases,
+-- the user can add any additional FoundationDB operations to the transaction.
+-- Transactions trivially enable end-to-end exactly-once semantics. The user may
+-- also perform arbitrary IO on each batch (the 'Transaction' monad is a
+-- 'MonadIO'), but must take care that such IO actions are idempotent.
+--
+-- 'AggrTable's can be thought of conceptually as @Monoid m => Map k m@. These
+-- tables are stored in FoundationDB. Many data processing and analytics
+-- questions can be framed in terms of monoidal aggregations, which these tables
+-- represent. The API for these tables provides the ability to look up individual
+-- values, as well as ranges of keys if the key type is ordered.
+--
+-- = Writing jobs
+--
+-- A stream processing job is expressed as a 'MonadStream' action. You should
+-- always write a polymorphic action; this is required because your action will
+-- be statically analyzed by multiple "interpreters" internally when you call
+-- 'runJob' on the action.
+--
+-- Here is an example of a simple word count action:
+--
+-- > wordCount :: Stream Text -> m (AggrTable Text)
+--
+-- The behavior of 'MonadStream''s bind operation is to declare the existence of
+-- a data structure in FoundationDB -- either a 'Stream' or an 'AggrTable'. Thus,
+-- you will find that each function that returns a 'MonadStream' action requires
+-- a unique 'StreamName' or 'StepName'. This unique name is used to prefix the
+-- keys in FoundationDB which store the state for the stream, table, and step.
+-- Use caution when abstracting over these actions -- if you call one in a loop,
+-- each call must be given a distinct name!
+
 module FDBStreaming
   ( Message(..),
     MonadStream,
@@ -34,7 +145,7 @@ module FDBStreaming
     aggregate,
     getAggrTable,
     benignIO,
-    runStream,
+    runJob,
     runPure,
 
     -- * watermarks and triggers
@@ -44,7 +155,8 @@ module FDBStreaming
 
     -- * Advanced Usage
     StreamStep (..),
-    topicWatermarkSS
+    topicWatermarkSS,
+    WatermarkBy
   )
 where
 
@@ -224,7 +336,7 @@ benignIO g (Stream rc np wmSS stc streamName setUp destroy) =
 
   where build x = Stream x np wmSS stc streamName  setUp destroy
 
--- | Type specifying how the output stream of a stream processor should be
+-- | Specifies how the output stream of a stream processor should be
 -- watermarked.
 data WatermarkBy a
   = -- | Watermark the output stream by taking the minimum checkpoint across
@@ -360,7 +472,7 @@ triggerBy f tbp@(TableProcessor{}) = TriggeringTableProcessor tbp f
 -- interface allows us to use a builder style to modify our stream processors
 -- at a distance, with functions like 'watermarkBy'.
 class Monad m => MonadStream m where
-  run :: (Message inMsg) => StepName -> StreamStep inMsg outMsg runResult -> m runResult
+  run :: StepName -> StreamStep inMsg outMsg runResult -> m runResult
 
 -- | Monad that traverses a stream DAG, building up a transaction that updates
 -- the watermarks for all streams that don't have custom watermarks defined.
@@ -538,7 +650,7 @@ produce sn f =
 
 -- | Produce a side effect at least once for each message in the stream.
 -- TODO: is this going to leave traces of an empty topic in FDB?
-atLeastOnce :: (Message a, MonadStream m) => StepName -> Stream a -> (a -> IO ()) -> m ()
+atLeastOnce :: (MonadStream m) => StepName -> Stream a -> (a -> IO ()) -> m ()
 atLeastOnce sn input f = void $ do
   run sn $
     StreamProcessor
@@ -554,7 +666,7 @@ atLeastOnce sn input f = void $ do
 -- MonadStream's responsibility, we have to repeat the implementation in each
 -- instance of that class, instead of doing it here once.
 pipe ::
-  (Message a, Message b, MonadStream m) =>
+  (Message b, MonadStream m) =>
   StepName ->
   Stream a ->
   (a -> IO (Maybe b)) ->
@@ -623,7 +735,7 @@ groupBy ::
 groupBy k t = GroupedBy t k
 
 aggregate ::
-  (Message v, Ord k, AT.TableKey k, AT.TableSemigroup aggr, MonadStream m) =>
+  (Ord k, AT.TableKey k, AT.TableSemigroup aggr, MonadStream m) =>
   StepName ->
   GroupedBy k v ->
   (v -> aggr) ->
@@ -1229,8 +1341,8 @@ logErrors ident =
         printf "%s on thread %s caught %s\n" ident (show tid) (show e)
     ]
 
-runStream :: JobConfig -> (forall m. MonadStream m => m a) -> IO ()
-runStream
+runJob :: JobConfig -> (forall m. MonadStream m => m a) -> IO ()
+runJob
   cfg@JobConfig {jobConfigDB, numStreamThreads, numPeriodicJobThreads}
   topology = do
     -- Run threads for continuously-running stream steps

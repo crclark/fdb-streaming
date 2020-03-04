@@ -1,4 +1,3 @@
-
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DerivingVia #-}
@@ -61,6 +60,7 @@ import           System.Random                  ( randomIO, randomRIO )
 import           Data.Maybe                     ( fromMaybe )
 import           Data.Store                     ( Store )
 import qualified Data.Store                    as Store
+import qualified Data.Text as Text
 import           Data.Functor.Identity (Identity(..))
 import           Foreign.C.Types (CTime(..))
 import           Data.Monoid (All (..))
@@ -384,9 +384,8 @@ mainLoop db ss Args{ generatorNumThreads
     printWatermarkLag db (topicWatermarkSS input) (AT.aggrTableWatermarkSS table)
     threadDelay 1000000
   if coerce streamRun
-     then runStream conf (topology input (coerce watermark))
+     then runJob conf (topology input (coerce watermark))
      else threadDelay maxBound
-
 
 cleanup :: Database -> Subspace -> IO ()
 cleanup db ss = catches (do

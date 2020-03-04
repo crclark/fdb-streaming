@@ -27,7 +27,8 @@ import GHC.Natural (Natural)
 -- TODO: error handling for bad parses? There is some benefit to throwing, in
 -- that users don't need to care about it so much. Which works fine until they
 -- write their own buggy instances.
--- TODO: Just use Store directly?
+-- TODO: Just use Store directly? Problem is that it literally doubles the
+-- number of dependencies!!
 
 -- | The class of all types that can be serialized and stored in FoundationDB.
 -- While you may use any serialization you please, you may want to choose
@@ -64,6 +65,8 @@ class Message a where
   toMessage :: a -> ByteString
 
   -- | Deserialize a message. Parse errors should just throw an exception.
+  -- Exceptions are caught and handled by the loop associated with each worker
+  -- thread.
   fromMessage :: ByteString -> a
 
 instance Message Void where
