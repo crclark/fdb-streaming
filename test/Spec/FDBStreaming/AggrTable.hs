@@ -33,15 +33,16 @@ import Test.QuickCheck.Instances.Text ()
 import Test.QuickCheck.Instances.UUID ()
 import Data.ByteString (ByteString)
 import Data.Data (Data)
+import Data.Either (fromRight)
 import GHC.Generics (Generic)
 import Data.Text (Text)
 import Data.UUID (UUID)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import Data.Monoid (Sum, All, Any)
+import Data.Persist (Persist)
+import qualified Data.Persist as Persist
 import Statistics.Monoid (MeanKBN, CalcMean, StatMonoid(..))
-import           Data.Store                     ( Store )
-import qualified Data.Store                    as Store
 import Data.Semigroup (Min(Min), Max(Max))
 import Data.Word
 import Data.Int
@@ -157,17 +158,17 @@ newtype Mean = Mean { unMean :: MeanKBN }
   deriving CalcMean via MeanKBN
 
 deriving instance Generic KBNSum
-deriving instance Store KBNSum
-deriving instance Store MeanKBN
-deriving instance Store Mean
+deriving instance Persist KBNSum
+deriving instance Persist MeanKBN
+deriving instance Persist Mean
 
 instance Real a => StatMonoid Mean a where
   addValue (Mean m) a = Mean (addValue m a)
   singletonMonoid a = Mean (singletonMonoid a)
 
 instance Message Mean where
-  toMessage = Store.encode
-  fromMessage = Store.decodeEx
+  toMessage = Persist.encode
+  fromMessage = fromRight (error "Failed to decode Mean") . Persist.decode
 
 instance TableSemigroup Mean where
   mappendBatch = mappendMessageBatch

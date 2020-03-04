@@ -13,15 +13,15 @@
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE BangPatterns #-}
+{-# OPTIONS_GHC -fno-warn-orphans #-}
 
 module Main where
 
 import           FDBStreaming
 import qualified FDBStreaming.AggrTable as AT
-import           FDBStreaming.Message
 import           FDBStreaming.Topic
 import           FDBStreaming.Watermark (Watermark(Watermark, watermarkUTCTime), WatermarkSS, getCurrentWatermark, setWatermark)
-
+import FDBStreaming.Util (millisSinceEpoch)
 import           Control.Monad
 import           Control.Monad.IO.Class (liftIO)
 import           Control.Concurrent
@@ -47,22 +47,16 @@ import           FoundationDB                  as FDB
 import           FoundationDB.Error
 import           FoundationDB.Layer.Subspace   as FDB
 import           FoundationDB.Layer.Tuple      as FDB
-import           Data.UnixTime                  ( UnixTime
-                                                , UnixDiffTime(..)
-                                                , getUnixTime
-                                                , diffUnixTime
-                                                )
+import Data.UUID as UUID
 import           Data.UUID                      ( UUID )
-import           Data.UUID.V4                  as UUID
+import           Data.UUID.V4                   as UUID
                                                 ( nextRandom )
 import           GHC.Generics                   ( Generic )
 import           System.Random                  ( randomIO, randomRIO )
 import           Data.Maybe                     ( fromMaybe )
-import           Data.Store                     ( Store )
-import qualified Data.Store                    as Store
-import qualified Data.Text as Text
+import           Data.Persist                     ( Persist )
+import qualified Data.Persist                    as Persist
 import           Data.Functor.Identity (Identity(..))
-import           Foreign.C.Types (CTime(..))
 import           Data.Monoid (All (..))
 import           System.Clock (Clock(Monotonic), getTime, toNanoSecs, diffTimeSpec)
 import qualified System.Metrics as Metrics
@@ -70,24 +64,26 @@ import           System.Metrics.Distribution (Distribution)
 import qualified System.Metrics.Distribution as Distribution
 import           System.Metrics.Gauge (Gauge)
 import qualified System.Metrics.Gauge as Gauge
-import           System.Random (randomRIO)
-import           System.Remote.Monitoring (forkServer, serverMetricStore)
 import System.Remote.Monitoring.Statsd (defaultStatsdOptions, forkStatsd)
 import           Text.Printf                    ( printf )
 import Options.Generic
+import Data.Int (Int64)
+import Data.Either (fromRight)
 
-newtype Timestamp = Timestamp { unTimestamp :: UnixTime }
-  deriving (Show, Eq, Ord, Generic)
-  deriving Store via (Identity UnixTime)
+newtype Timestamp = Timestamp { unTimestamp :: Int64 }
+  deriving (Show, Eq, Ord, Generic, Persist)
+
+instance Persist UUID where
+  put = Persist.put . UUID.toWords
+  get = (\(q,w,e,r) -> UUID.fromWords q w e r) <$> Persist.get
 
 newtype OrderID = OrderID { unOrderID :: UUID }
-  deriving (Show, Eq, Ord, Generic)
-  deriving Store via (Identity UUID)
+  deriving (Show, Eq, Ord, Generic, Persist)
   deriving AT.TableKey via UUID
 
 instance Message OrderID where
-  toMessage = Store.encode
-  fromMessage = Store.decodeEx
+  toMessage = Persist.encode
+  fromMessage = OrderID . fromRight (error "Failed to decode OrderID") . Persist.decode
 
 data Order = Order
   { placedAt :: Timestamp
@@ -95,15 +91,15 @@ data Order = Order
   , isFraud :: Bool
   , isInStock :: Bool
   , orderInstructions :: Text
-  } deriving (Show, Eq, Generic, Store)
+  } deriving (Show, Eq, Generic, Persist)
 
 instance Message Order where
-  toMessage = Store.encode
-  fromMessage = Store.decodeEx
+  toMessage = Persist.encode
+  fromMessage = fromRight (error "Failed to decode Order") . Persist.decode
 
 randOrder :: IO Order
 randOrder = do
-  placedAt  <- Timestamp <$> getUnixTime
+  placedAt  <- Timestamp . millisSinceEpoch <$> getCurrentTime
   orderID   <- OrderID <$> UUID.nextRandom
   isFraud   <- randomIO
   isInStock <- randomIO
@@ -113,11 +109,11 @@ randOrder = do
 data FraudResult = FraudResult
   { orderID :: OrderID
   , isFraud :: Bool
-  } deriving (Show, Eq, Generic, Store)
+  } deriving (Show, Eq, Generic, Persist)
 
 instance Message FraudResult where
-  toMessage = Store.encode
-  fromMessage = Store.decodeEx
+  toMessage = Persist.encode
+  fromMessage = fromRight (error "Failed to decode FraudResult") . Persist.decode
 
 -- TODO: use getField
 fraudOrderID :: FraudResult -> OrderID
@@ -130,11 +126,11 @@ isFraudulent Order{..} = FraudResult{..}
 data InStockResult = InStockResult
   { orderID ::  OrderID
   , isInStock :: Bool
-  } deriving (Show, Eq, Generic, Store)
+  } deriving (Show, Eq, Generic, Persist)
 
 instance Message InStockResult where
-  toMessage = Store.encode
-  fromMessage = Store.decodeEx
+  toMessage = Persist.encode
+  fromMessage = fromRight (error "failed to decode InStockResult") . Persist.decode
 
 invOrderID :: InStockResult -> OrderID
 invOrderID InStockResult{orderID} = orderID
@@ -145,11 +141,11 @@ inventoryCheck Order { .. } = InStockResult { .. }
 data OrderDetails = OrderDetails
   { orderID :: OrderID
   , details :: ByteString
-  } deriving (Show, Eq, Ord, Generic, Store)
+  } deriving (Show, Eq, Ord, Generic, Persist)
 
 instance Message OrderDetails where
-  toMessage = Store.encode
-  fromMessage = Store.decodeEx
+  toMessage = Persist.encode
+  fromMessage = fromRight (error "failed to decode OrderDetails") . Persist.decode
 
 randOrderDetails :: Order -> IO OrderDetails
 randOrderDetails Order { .. } = do
@@ -160,21 +156,13 @@ goodDetails :: ByteString -> Bool
 goodDetails bs = odd $ sum $ BS.unpack bs
 
 data LatencyStats = LatencyStats
-  { timeElapsed :: !UnixDiffTime
+  { timeElapsed :: !Int64
   , numFinished :: !Int
   } deriving (Show, Eq, Ord)
 
 instance Semigroup LatencyStats where
   (LatencyStats x1 y1) <> (LatencyStats x2 y2) =
     LatencyStats (x1 + x2) (y1 + y2)
-
-unixDiffTimeToMicroseconds :: UnixDiffTime -> Int
-unixDiffTimeToMicroseconds (UnixDiffTime (CTime secs) usecs) =
-  1000000 * (fromIntegral secs) + (fromIntegral usecs)
-
-unixDiffTimeToMilliseconds :: UnixDiffTime -> Double
-unixDiffTimeToMilliseconds (UnixDiffTime (CTime secs) usecs) =
-  1000.0 * (fromIntegral secs) + (fromIntegral usecs / 1000.0)
 
 withProbability :: Int -> IO () -> IO ()
 withProbability p f = do
@@ -183,22 +171,20 @@ withProbability p f = do
 
 awaitOrder
   :: Database
-  -> TopicConfig
   -> AT.AggrTable OrderID All
   -> TVar LatencyStats
   -> Distribution
   -> Gauge
   -> Order
   -> IO ()
-awaitOrder db orderTopic table stats latencyDist awaitGauge order@Order{orderID} = withProbability 1 $ catches (do
+awaitOrder db table stats latencyDist awaitGauge order@Order{orderID} = withProbability 1 $ catches (do
   Gauge.inc awaitGauge
   _ <- AT.getBlocking db table orderID
-  endTime <- getUnixTime
-  let diff = diffUnixTime endTime (unTimestamp $ placedAt order)
-  let statsDiff = LatencyStats diff 1
+  endTime <- millisSinceEpoch <$> getCurrentTime
+  let diffMillis = endTime - (unTimestamp $ placedAt order)
+  let statsDiff = LatencyStats diffMillis 1
   atomically $ modifyTVar' stats (<> statsDiff)
-  let diffMillis = unixDiffTimeToMilliseconds diff
-  Distribution.add latencyDist diffMillis
+  Distribution.add latencyDist (fromIntegral diffMillis)
   Gauge.dec awaitGauge
   )
   [ Handler (\(e :: Error) ->
@@ -207,7 +193,7 @@ awaitOrder db orderTopic table stats latencyDist awaitGauge order@Order{orderID}
                 putStrLn $ "Caught " ++ show e ++ " while awaiting table data!")
   ]
 
--- | Creates a random order, pushes it onto the given topic, awaits its
+-- | Pushes a batch of random orders onto the given topic, awaits its
 -- arrival in the given AggrTable, and updates the given latency statistics
 -- TVar.
 placeAndAwaitOrders :: Database
@@ -225,7 +211,7 @@ placeAndAwaitOrders db orderTopic table stats latencyDist awaitGauge batchSize s
   orders <- replicateM batchSize randOrder
   writeTopicNoRetry db orderTopic (map toMessage orders)
   when shouldWatch
-    $ forM_ orders $ awaitOrder db orderTopic table stats latencyDist awaitGauge
+    $ forM_ orders $ awaitOrder db table stats latencyDist awaitGauge
   )
   [ Handler (\case
                Error (MaxRetriesExceeded (CError NotCommitted)) ->
@@ -269,10 +255,8 @@ orderGeneratorLoop db topic table rps batchSize stats latencyDist awaitGauge sho
 
 latencyReportLoop :: TVar LatencyStats -> IO ()
 latencyReportLoop stats = do
-  LatencyStats{..} <- readTVarIO stats
-  let (UnixDiffTime (CTime secs) usecs) = timeElapsed
-  let totalMicroseconds = 1000000 * (fromIntegral secs) + (fromIntegral usecs) :: Integer
-  let avgMilliseconds = (totalMicroseconds `div` fromIntegral numFinished) `div` 1000
+  LatencyStats{timeElapsed, numFinished} <- readTVarIO stats
+  let avgMilliseconds = (timeElapsed `div` fromIntegral numFinished)
   putStrLn $ "Processed "
              ++ show numFinished
              ++ " orders with average latency of "
@@ -286,7 +270,7 @@ topology incoming watermark = do
   input <-if watermark then existingWatermarked incoming else existing incoming
   let fraudChecks = fmap isFraudulent input
   let invChecks = fmap inventoryCheck input
-  let details = benignIO (fmap Just . randOrderDetails) input
+  let dtls = benignIO (fmap Just . randOrderDetails) input
   fraudInvJoin <- oneToOneJoin "f_i_join"
                                fraudChecks
                                invChecks
@@ -297,7 +281,7 @@ topology incoming watermark = do
                                   -> (orderID, not isFraud && isInStock))
   finalJoin <- oneToOneJoin "final_join"
                             fraudInvJoin
-                            details
+                            dtls
                             fst
                             (\OrderDetails{orderID} -> orderID)
                             (\(oid, isGood) OrderDetails{details}
@@ -335,10 +319,11 @@ printWatermarkLag db root leaf = do
                                return (r,l)
   case res of
     Left err -> putStrLn $ "Caught " ++ show err ++ " while getting watermark stats"
-    Right (r,l) -> do
+    Right (Just r, Just l) -> do
       printf "Watermark of root is %s\n" $ show r
       printf "Watermark of leaf is %s\n" $ show l
-      printf "Watermark lag is %s\n" $ show (fmap round (diffUTCTime <$> (fmap watermarkUTCTime r) <*> (fmap watermarkUTCTime l)))
+      printf "Watermark lag is %s\n" $ show $ round $ diffUTCTime (watermarkUTCTime r) (watermarkUTCTime l)
+    _ -> return ()
 
 mainLoop :: Database -> Subspace -> Args Identity -> IO ()
 mainLoop db ss Args{ generatorNumThreads
@@ -353,7 +338,7 @@ mainLoop db ss Args{ generatorNumThreads
   metricsStore <- Metrics.newStore
   latencyDist <- Metrics.createDistribution "end_to_end_latency" metricsStore
   awaitedOrders <- Metrics.createGauge "waitingOrders" metricsStore
-  forkStatsd defaultStatsdOptions metricsStore
+  _ <- forkStatsd defaultStatsdOptions metricsStore
   let conf = JobConfig
              { jobConfigDB = db
              , jobConfigSS = ss
