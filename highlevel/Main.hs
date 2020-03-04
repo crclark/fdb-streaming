@@ -281,14 +281,6 @@ latencyReportLoop stats = do
   threadDelay 1000000
   latencyReportLoop stats
 
-instance Message Bool where
-  toMessage = Store.encode
-  fromMessage = Store.decodeEx
-
-instance Message All where
-  toMessage = Store.encode
-  fromMessage = Store.decodeEx
-
 topology :: (MonadStream m) => TopicConfig -> Bool -> m (AT.AggrTable OrderID All)
 topology incoming watermark = do
   input <-if watermark then existingWatermarked incoming else existing incoming
