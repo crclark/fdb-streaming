@@ -88,6 +88,7 @@ type StreamReadAndCheckpoint a state =
 -- checkpoint. A workaround would be to do one-time setup in setupState. That
 -- might be enough for all use cases. We shall see.
 
+-- | Represents an unbounded stream of messages of type @a@.
 data Stream a
   = forall state.
     Stream
@@ -137,7 +138,7 @@ data Stream a
       }
 
 defaultWmSS :: StreamName -> JobSubspace -> WatermarkSS
-defaultWmSS = undefined
+defaultWmSS sn ss = FDB.extend ss [C.topics, FDB.Bytes sn, C.customMeta, FDB.Bytes "wm"]
 
 -- | Helper function for defining custom data sources for other external
 -- databases.
@@ -216,6 +217,10 @@ streamConsumerCheckpointSS jobSS stream rn = case (streamTopic stream) of
 isStreamWatermarked :: Stream a -> Bool
 isStreamWatermarked = isJust . streamWatermarkSS
 
+-- | The functor instance for streams is lazy -- it will be computed by each
+-- step that consumes a stream. If the function is very expensive, it may be
+-- more efficient to use 'FDBStreaming.pipe' to write the result of the function
+-- to FoundationDB once, then have all downstream steps read from that.
 instance Functor Stream where
   fmap g Stream {..} =
     Stream
@@ -224,6 +229,8 @@ instance Functor Stream where
         ..
       }
 
+-- | Same caveat applies as for the Functor instance. All downstream steps will
+-- read all messages and run the filter logic.
 instance Filterable Stream where
   mapMaybe g Stream {..} =
     Stream
