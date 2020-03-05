@@ -56,7 +56,6 @@ library
       clock,
       unliftio,
       witherable,
-      uuid,
       time,
       safe
   default-language: Haskell2010

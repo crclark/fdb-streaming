@@ -69,6 +69,7 @@ import           Text.Printf                    ( printf )
 import Options.Generic
 import Data.Int (Int64)
 import Data.Either (fromRight)
+import qualified Data.Text as Text
 
 newtype Timestamp = Timestamp { unTimestamp :: Int64 }
   deriving (Show, Eq, Ord, Generic, Persist)
@@ -79,11 +80,14 @@ instance Persist UUID where
 
 newtype OrderID = OrderID { unOrderID :: UUID }
   deriving (Show, Eq, Ord, Generic, Persist)
-  deriving AT.TableKey via UUID
 
 instance Message OrderID where
   toMessage = Persist.encode
   fromMessage = OrderID . fromRight (error "Failed to decode OrderID") . Persist.decode
+
+instance AT.TableKey OrderID where
+  toKeyBytes = toMessage
+  fromKeyBytes = fromMessage
 
 data Order = Order
   { placedAt :: Timestamp
@@ -197,7 +201,7 @@ awaitOrder db table stats latencyDist awaitGauge order@Order{orderID} = withProb
 -- arrival in the given AggrTable, and updates the given latency statistics
 -- TVar.
 placeAndAwaitOrders :: Database
-                    -> TopicConfig
+                    -> Topic
                     -> AT.AggrTable OrderID All
                     -> TVar LatencyStats
                     -> Distribution
@@ -221,8 +225,8 @@ placeAndAwaitOrders db orderTopic table stats latencyDist awaitGauge batchSize s
                 putStrLn $ "Caught " ++ show e ++ " while writing to topic!")
   ]
 
-writeTopicNoRetry :: Traversable t => Database -> TopicConfig -> t ByteString -> IO ()
-writeTopicNoRetry db tc@TopicConfig {..} bss = do
+writeTopicNoRetry :: Traversable t => Database -> Topic -> t ByteString -> IO ()
+writeTopicNoRetry db tc@Topic {..} bss = do
   -- TODO: proper error handling
   guard (fromIntegral (length bss) < (maxBound :: Word16))
   p <- randPartition tc
@@ -235,7 +239,7 @@ writeTopicNoRetry db tc@TopicConfig {..} bss = do
 
 -- TODO: far too many params!
 orderGeneratorLoop :: Database
-                   -> TopicConfig
+                   -> Topic
                    -> AT.AggrTable OrderID All
                    -> Int
                    -- ^ requests per second
@@ -265,7 +269,7 @@ latencyReportLoop stats = do
   threadDelay 1000000
   latencyReportLoop stats
 
-topology :: (MonadStream m) => TopicConfig -> Bool -> m (AT.AggrTable OrderID All)
+topology :: (MonadStream m) => Topic -> Bool -> m (AT.AggrTable OrderID All)
 topology incoming watermark = do
   input <-if watermark then existingWatermarked incoming else existing incoming
   let fraudChecks = fmap isFraudulent input
@@ -348,7 +352,7 @@ mainLoop db ss Args{ generatorNumThreads
              , numStreamThreads = coerce numLeaseThreads
              , numPeriodicJobThreads = 1
              }
-  let input = makeTopicConfig ss "incoming_orders"
+  let input = makeTopic ss "incoming_orders"
   let table = getAggrTable conf "order_table"
   stats <- newTVarIO $ LatencyStats 0 1
   replicateM_ (coerce generatorNumThreads)
@@ -379,6 +383,9 @@ cleanup db ss = catches (do
   runTransactionWithConfig defaultConfig {timeout = 5000} db $ clearRange delBegin delEnd
   putStrLn "Cleanup successful")
   [Handler $ \(CError err) -> putStrLn $ "Caught " ++ show err ++ "while clearing subspace"]
+
+wordCount :: MonadStream m => Stream Text -> m (AT.AggrTable Text (Sum Int))
+wordCount txts = aggregate "counts" (groupBy Text.words txts) (const (Sum 1))
 
 data Args f = Args
   { subspaceName :: f ByteString

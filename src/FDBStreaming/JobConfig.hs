@@ -1,3 +1,4 @@
+-- | Contains the 'JobConfig' type.
 module FDBStreaming.JobConfig (
   JobConfig(..),
   JobSubspace
@@ -11,25 +12,35 @@ import qualified System.Metrics as Metrics
 -- | The top-level subspace that contains all state for a given streaming job.
 type JobSubspace = FDB.Subspace
 
--- TODO: other persistence backends
--- TODO: should probably rename to TopologyConfig
+-- | Specifies configuration for a single streaming job. This is passed to
+-- 'FDBStreaming.runJob'.
 data JobConfig
   = JobConfig
-      { jobConfigDB :: FDB.Database,
-        -- | subspace that will contain all state for the stream topology
+      { -- | The connection to FoundationDB. You can create a connection with
+        -- 'FDB.withFoundationDB' from the @foundationdb-haskell@ package.
+        jobConfigDB :: FDB.Database,
+        -- | Subspace that will contain all state for the stream topology. A
+        -- subspace is essentially a common prefix shared by a set of keys. See
+        -- FoundationDB's docs for more info.
         jobConfigSS :: JobSubspace,
+        -- | Optional metrics store from the @ekg-core@ package. If supplied,
+        -- the job will report metrics regarding messages processed.
         streamMetricsStore :: Maybe Metrics.Store,
-        -- | Number of messages to process per transaction per thread per partition
+        -- | Number of messages to process per transaction per worker thread.
+        -- The larger the messages being processed, the smaller this number
+        -- should be.
         msgsPerBatch :: Word8,
         -- | Length of time an individual worker should work on a single stage of the
         -- pipeline before stopping and trying to work on something else. Higher
-        -- values are more efficient in normal operation, but if enough machines fail,
+        -- values are more efficient in normal operation, but if machines fail,
         -- higher values can be a worst-case lower bound on end-to-end latency.
-        -- Only applies to pipelines run with the LeaseBasedStreamWorker monad.
         leaseDuration :: Int,
         -- | Number of threads to dedicate to running each step of your stream
-        -- topology. A good default is to set this to the number of cores you
-        -- have available.
+        -- topology. It's probably a good idea to set this to no more than 8.
+        -- Prefer running more instances of the executable, rather than one
+        -- instance with many threads -- the FoundationDB client library is
+        -- single-threaded, and can become a bottleneck if too many threads are
+        -- sharing it.
         numStreamThreads :: Int,
         -- | Number of threads to dedicate to periodic background jobs that are
         -- run by the stream processing system. This includes propagating

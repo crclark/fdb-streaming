@@ -61,6 +61,13 @@
 -- * Individual messages must be less than 100 kB in size.
 -- * At each processing step, processing an individual batch of messages must
 --   take less than five seconds.
+-- * Because the FoundationDB client library is single-threaded, running many
+--   instances of your job executable with a few worker threads per process
+--   often gives better performance than running a few instances with many
+--   threads per process.
+-- * End-to-end pipeline latency (time from when a message enters the pipeline
+--   to the time it flows to the end of the pipeline) is generally on the order
+--   of seconds.
 -- * When storing unbounded stream data in FoundationDB, FDBStreaming performance
 --   is bound by FoundationDB. Expect hundreds of thousands of messages per
 --   second. Maybe low millions at best. See <https://apple.github.io/foundationdb/performance.html FoundationDB's docs>
@@ -81,7 +88,7 @@
 -- Each FDBStreaming job consists of unbounded 'Stream's of data, which serve as
 -- input and output to 'StreamStep's, which map, filter, and otherwise transform
 -- their inputs. Lastly, 'StreamStep's can also group and window their inputs to
--- perform aggregations, which are written to 'AggrTable's. For scalability
+-- perform aggregations, which are written to 'AT.AggrTable's. For scalability
 -- reasons, aggregations must be commutative monoids. Many aggregations included
 -- out-of-the-box in FDBStreaming are implemented in terms of FoundationDB's
 -- atomic operations, which further improves performance.
@@ -94,7 +101,7 @@
 -- provides an API roughly similar to Kafka's.
 --
 -- 'StreamStep's read data from 'Stream's in small batches, transform the batch,
--- and write the results to another 'Stream' or 'AggrTable'. Each batch is
+-- and write the results to another 'Stream' or 'AT.AggrTable'. Each batch is
 -- processed in a single FoundationDB transaction, which is also used to
 -- checkpoint our position in the stream. Furthermore, for advanced use cases,
 -- the user can add any additional FoundationDB operations to the transaction.
@@ -102,7 +109,7 @@
 -- also perform arbitrary IO on each batch (the 'Transaction' monad is a
 -- 'MonadIO'), but must take care that such IO actions are idempotent.
 --
--- 'AggrTable's can be thought of conceptually as @Monoid m => Map k m@. These
+-- 'AT.AggrTable's can be thought of conceptually as @Monoid m => Map k m@. These
 -- tables are stored in FoundationDB. Many data processing and analytics
 -- questions can be framed in terms of monoidal aggregations, which these tables
 -- represent. The API for these tables provides the ability to look up individual
@@ -117,7 +124,32 @@
 --
 -- Here is an example of a simple word count action:
 --
--- > wordCount :: Stream Text -> m (AggrTable Text)
+-- > {-# LANGUAGE OverloadedStrings #-}
+-- > import Data.Text (Text)
+-- > import qualified Data.Text as Text
+-- > import FDBStreaming
+-- >
+-- > wordCount :: MonadStream m => Stream Text -> m (AggrTable Text (Sum Int))
+-- > wordCount txts = aggregate "counts" (groupBy Text.words txts) (const (Sum 1))
+--
+-- Given an existing stream of lines of text, we group the lines by the words
+-- they contain, then convert each line into 1 in the 'Sum' monoid.
+--
+-- do notation is used to create DAGs. For example, a simple pipeline that
+-- consumes tweets, collecting statistics on user tweet volume by date and total
+-- word counts might look something like this
+--
+-- > tweetPipeline :: MonadStream m => Stream Tweet -> m ()
+-- > tweetPipeline tweets = do
+-- >   -- 'fmap' is used to register lazy operations on streams. This has the
+-- >   -- benefit of avoiding uninteresting intermediate data in FoundationDB, but
+-- >   -- each downstream consumers of tweets' will compute 'preprocess' once per
+-- >   -- input tweet.
+-- >   let tweets' = fmap preprocess tweets
+-- >   let userDates = groupBy (\t -> [(user t, date t)]) tweets'
+-- >   userDateTable <- aggregate "userDates" userDates (const (Sum 1))
+-- >   counts <- wordCount (fmap text tweets')
+-- >   return ()
 --
 -- The behavior of 'MonadStream''s bind operation is to declare the existence of
 -- a data structure in FoundationDB -- either a 'Stream' or an 'AggrTable'. Thus,
@@ -128,33 +160,40 @@
 -- each call must be given a distinct name!
 
 module FDBStreaming
-  ( Message(..),
+  (
     MonadStream,
-    Stream(streamTopicConfig),
+    JobConfig (..),
+    runJob,
+    runPure,
+    -- * Streams
+    Stream(streamTopic),
     isStreamWatermarked,
     getStreamWatermark,
-    JobConfig (..),
+    StreamStep,
+    Message(..),
+    -- * Creating streams
     existing,
     existingWatermarked,
     produce,
     atLeastOnce,
     pipe,
     oneToOneJoin,
+    -- * Tables
+    AT.AggrTable,
     groupBy,
-    GroupedBy (..),
+    GroupedBy(..),
     aggregate,
     getAggrTable,
     benignIO,
-    runJob,
-    runPure,
 
-    -- * watermarks and triggers
+    -- * More complex usage
     run,
-    --triggerBy,
     watermarkBy,
+    pipe',
+    oneToOneJoin',
+    aggregate',
 
     -- * Advanced Usage
-    StreamStep (..),
     topicWatermarkSS,
     WatermarkBy
   )
@@ -195,7 +234,7 @@ import FDBStreaming.Joins
   )
 import FDBStreaming.Message (Message (fromMessage, toMessage))
 import FDBStreaming.TaskLease (TaskName (TaskName), secondsSinceEpoch)
-import FDBStreaming.Stream.Internal (Stream (Stream, streamWatermarkSS, streamReadAndCheckpoint, streamMinReaderPartitions, streamTopicConfig, streamName, setUpState, destroyState), StreamName, StreamReadAndCheckpoint, isStreamWatermarked, streamConsumerCheckpointSS, getStreamWatermark)
+import FDBStreaming.Stream.Internal (Stream (Stream, streamWatermarkSS, streamReadAndCheckpoint, streamMinReaderPartitions, streamTopic, streamName, setUpState, destroyState), StreamName, StreamReadAndCheckpoint, isStreamWatermarked, streamConsumerCheckpointSS, getStreamWatermark)
 import FDBStreaming.JobConfig(JobConfig(JobConfig, jobConfigDB, msgsPerBatch, numStreamThreads, numPeriodicJobThreads, streamMetricsStore, jobConfigSS, leaseDuration), JobSubspace)
 import FDBStreaming.TaskRegistry as TaskRegistry
   ( TaskRegistry,
@@ -206,9 +245,9 @@ import FDBStreaming.TaskRegistry as TaskRegistry
 import FDBStreaming.Topic
   ( PartitionId,
     ReaderName,
-    TopicConfig (topicCustomMetadataSS),
+    Topic (topicCustomMetadataSS),
     getCheckpoints,
-    makeTopicConfig,
+    makeTopic,
     randPartition,
     readNAndCheckpoint',
     writeTopic',
@@ -313,7 +352,7 @@ data GroupedBy k v
 
 -- | The watermark subspace for this topic. This can be used to manually get
 -- and set the watermark on a topic, outside of the stream processing system.
-topicWatermarkSS :: TopicConfig -> WatermarkSS
+topicWatermarkSS :: Topic -> WatermarkSS
 topicWatermarkSS = flip FDB.extend [FDB.Bytes "wm"] . topicCustomMetadataSS
 
 -- | Returns the subspace in which the given stream's watermarks are stored.
@@ -403,19 +442,19 @@ data StreamStep inMsg outMsg runResult where
     { stream2ProcessorInStreamL :: Stream a1,
       stream2ProcessorInStreamR :: Stream a2,
       stream2ProcessorWatermarkBy :: WatermarkBy b,
-      -- TODO: passing in the TopicConfig so that the step knows
+      -- TODO: passing in the Topic so that the step knows
       -- where to write its state. Probably all user-provided
       -- batch processing callbacks should take a subspace that they
       -- can use to write per-processor state. That way, deleting a
       -- processing step would be guaranteed to clean up everything
       -- the user created, too.
       stream2ProcessorRunBatchL ::
-        ( TopicConfig ->
+        ( Topic ->
           Seq (Maybe (Versionstamp 'Complete), a1) ->
           Transaction (Seq b)
         ),
       stream2ProcessorRunBatchR ::
-        ( TopicConfig ->
+        ( Topic ->
           Seq (Maybe (Versionstamp 'Complete), a2) ->
           Transaction (Seq b)
         )
@@ -471,7 +510,13 @@ triggerBy f tbp@(TableProcessor{}) = TriggeringTableProcessor tbp f
 -- compatibility checks, running with different strategies, etc. The record
 -- interface allows us to use a builder style to modify our stream processors
 -- at a distance, with functions like 'watermarkBy'.
+
+-- | A stream monad, whose actions represents a stream processing DAG.
 class Monad m => MonadStream m where
+  -- | Run a single named 'StreamStep', producing either a 'Stream' or an
+  -- 'AT.AggrTable'. This function is used in conjunction with the
+  -- 'pipe'', 'oneToOneJoin'', and 'aggregate'' functions, which return
+  -- 'StreamStep's.
   run :: StepName -> StreamStep inMsg outMsg runResult -> m runResult
 
 -- | Monad that traverses a stream DAG, building up a transaction that updates
@@ -529,7 +574,7 @@ instance MonadStream DefaultWatermarker where
     case ( isStepDefaultWatermarked step
          , watermarkSS jobConfigSS output
          , streamWatermarkSS streamProcessorInStream
-         , streamTopicConfig streamProcessorInStream) of
+         , streamTopic streamProcessorInStream) of
       (True, Just wmSS, Just _inWmSS, Just inTopic) ->
         watermarkNext (defaultWatermark [(inTopic, sn)] wmSS)
       _ -> return ()
@@ -541,9 +586,9 @@ instance MonadStream DefaultWatermarker where
     case ( isStepDefaultWatermarked step
          , watermarkSS jobConfigSS output
          , streamWatermarkSS stream2ProcessorInStreamL
-         , streamTopicConfig stream2ProcessorInStreamL
+         , streamTopic stream2ProcessorInStreamL
          , streamWatermarkSS stream2ProcessorInStreamR
-         , streamTopicConfig stream2ProcessorInStreamR) of
+         , streamTopic stream2ProcessorInStreamR) of
       (True, Just wmSS, Just _inWmSSL, Just inTopicL, Just _inWmSSR, Just inTopicR) ->
         watermarkNext
           $ defaultWatermark
@@ -560,7 +605,7 @@ instance MonadStream DefaultWatermarker where
     let inStream = groupedByInStream tableProcessorGroupedBy
     case ( isStepDefaultWatermarked step
          , AT.aggrTableWatermarkSS table
-         , streamTopicConfig inStream
+         , streamTopic inStream
          , streamWatermarkSS inStream) of
       (True, wmSS, Just inTopic, Just _inWMSS) ->
         watermarkNext
@@ -586,7 +631,7 @@ defaultWatermark ::
   -- | All parent input streams, paired with the name
   -- of the reader whose checkpoints we use to look up
   -- watermarks.
-  [(TopicConfig, ReaderName)] ->
+  [(Topic, ReaderName)] ->
   -- | The output stream we are watermarking
   WatermarkSS ->
   Transaction ()
@@ -611,7 +656,7 @@ defaultWatermark topicsAndReaders wmSS = do
 -- 'isWatermarked' to @True@ on the result if you know that the existing Stream
 -- has a watermark; this function doesn't have enough information to
 -- determine that itself.
-existing :: (Message a, MonadStream m) => TopicConfig -> m (Stream a)
+existing :: (Message a, MonadStream m) => Topic -> m (Stream a)
 existing tc =
   return
   $ fmap fromMessage
@@ -621,7 +666,7 @@ existing tc =
 -- | Read messages from an existing stream which is known to be watermarked.
 -- If the existing stream is not watermarked, watermarks will not be propagated
 -- downstream from this stream.
-existingWatermarked :: (Message a, MonadStream m) => TopicConfig -> m (Stream a)
+existingWatermarked :: (Message a, MonadStream m) => Topic -> m (Stream a)
 existingWatermarked tc =
   fmap (setStreamWatermarkByTopic tc) (existing tc)
 
@@ -659,12 +704,15 @@ atLeastOnce sn input f = void $ do
         streamProcessorProcessBatch = (mapM (\(_, x) -> liftIO $ f x))
       }
 
--- I think we can do so if we remove the DB from the topic config internals. Not
--- sure why it's there in the first place. Alternatively, maybe we should remove
--- the output stream from the processor record -- defer the responsibility of
--- creating it to the functions of the MonadStream class? OTOH, if we make it
--- MonadStream's responsibility, we have to repeat the implementation in each
--- instance of that class, instead of doing it here once.
+-- | Transforms the contents of a stream, outputting the results to a new Stream
+-- stored in FoundationDB. Return 'Nothing' to filter the stream.
+--
+-- While this function is versatile, it should be used sparingly. Each
+-- intermediate 'Stream' in FoundationDB has a significant cost in storage and
+-- performance. Prefer to use 'fmap' and 'benignIO' on 'Stream's when possible,
+-- as these functions register transformations that are applied lazily when the
+-- stream is processed by downstream 'StreamStep's, which avoids persisting
+-- uninteresting intermediate results to FoundationDB.
 pipe ::
   (Message b, MonadStream m) =>
   StepName ->
@@ -675,6 +723,8 @@ pipe sn input f =
   run sn $
     pipe' input f
 
+-- | Like 'pipe', but returns a 'StreamStep' operation that can be further
+-- customized before calling 'run' on it.
 pipe' ::
   Message b =>
   Stream a ->
@@ -693,6 +743,13 @@ pipe' input f =
 -- | Streaming one-to-one join. If the relationship is not actually one-to-one
 --   (i.e. the input join functions are not injective), some messages in the
 --   input streams could be lost.
+--
+-- If this step receives an item in one stream for a join key, but never receives
+-- an item in the other stream, the received item will never be emitted downstream.
+-- If this happens frequently, the space usage of this step in FoundationDB will
+-- slowly increase. In the worst case, all of the input data for one Stream will
+-- be stored in FoundationDB. In the future, we may allow this to be customized
+-- to delete data that hasn't been joined within a time limit.
 oneToOneJoin ::
   (Message a, Message b, Message c, Message d, MonadStream m) =>
   StepName ->
@@ -706,6 +763,8 @@ oneToOneJoin sn in1 in2 p1 p2 j =
   run sn $
     oneToOneJoin' in1 in2 p1 p2 j
 
+-- | Like 'oneToOneJoin', but returns a 'StreamStep', which can be further
+-- customized before being passed to 'run'.
 oneToOneJoin' ::
   (Message a, Message b, Message c, Message d) =>
   Stream a ->
@@ -728,12 +787,18 @@ oneToOneJoin' inl inr pl pr j =
         rstep
 
 -- TODO: implement one-to-many joins in terms of this?
+
+-- | Assigns each element of a stream to zero or more buckets. The contents of
+-- these buckets can be monoidally reduced by 'aggregate' and 'aggregate''.
 groupBy ::
   (v -> [k]) ->
   Stream v ->
   (GroupedBy k v)
 groupBy k t = GroupedBy t k
 
+-- | Given a grouped stream created by 'groupBy', convert all values in each
+-- bucket into a monoidal value, then monoidally combine them. The result is
+-- an 'AT.AggrTable' data structure in FoundationDB.
 aggregate ::
   (Ord k, AT.TableKey k, AT.TableSemigroup aggr, MonadStream m) =>
   StepName ->
@@ -744,6 +809,9 @@ aggregate sn groupedBy f =
   run sn $
     aggregate' groupedBy f
 
+-- | Like 'aggregate', but returns a 'StreamStep' that must be passed to 'run'.
+-- The 'StreamStep' can be passed to 'triggerBy' or 'watermarkBy' to further
+-- customize its runtime behavior.
 aggregate' ::
   (Ord k, AT.TableKey k, AT.TableSemigroup aggr) =>
   GroupedBy k v ->
@@ -759,9 +827,6 @@ aggregate' groupedBy@(GroupedBy input _) f =
 class HasStreamConfig m where
   getStreamConfig :: m JobConfig
 
--- TODO: having the DB and SS inside the TopicConfig really clumsifies the
--- interface for the builder-style streams, and also requires static analysis of
--- the DAG to have an FDB connection. Fix this.
 makeStream ::
   (Message b, HasStreamConfig m, Monad m) =>
   StepName ->
@@ -770,19 +835,19 @@ makeStream ::
   m (Stream b)
 makeStream stepName streamName step = do
   sc <- getStreamConfig
-  let streamTopicConfig = makeTopicConfig (jobConfigSS sc) stepName
+  let streamTopic = makeTopic (jobConfigSS sc) stepName
   return
     $ fmap fromMessage
     $ (if stepProducesWatermark step
-       then setStreamWatermarkByTopic streamTopicConfig
+       then setStreamWatermarkByTopic streamTopic
        else id)
-    $ streamFromTopic streamTopicConfig streamName
+    $ streamFromTopic streamTopic streamName
 
 -- | sets the watermark subspace to this stream to the watermark subspace of
--- the given topic. The given topic must be the topic in streamTopicConfig, and
+-- the given topic. The given topic must be the topic in streamTopic, and
 -- the step writing to the topic must actually have a watermarking function (or
 -- default watermark) set. Don't export this; too confusing for users.
-setStreamWatermarkByTopic :: TopicConfig -> Stream a -> Stream a
+setStreamWatermarkByTopic :: Topic -> Stream a -> Stream a
 setStreamWatermarkByTopic tc stream =
   stream { streamWatermarkSS = Just $ \_ -> topicWatermarkSS tc}
 
@@ -792,7 +857,7 @@ setStreamWatermarkByTopic tc stream =
 --
 -- You only need this function if you are trying to access a topic that was
 -- created by another pipeline.
-streamFromTopic :: TopicConfig -> StreamName -> Stream ByteString
+streamFromTopic :: Topic -> StreamName -> Stream ByteString
 streamFromTopic tc streamName =
   Stream
   { streamReadAndCheckpoint = \_cfg rn pid _chkptSS n _state -> do
@@ -800,7 +865,7 @@ streamFromTopic tc streamName =
       return $ fmap (\(vs, x) -> (Just vs, x)) msgs
   , streamMinReaderPartitions = Topic.numPartitions tc
   , streamWatermarkSS = Nothing
-  , streamTopicConfig = Just tc
+  , streamTopic = Just tc
   , streamName = streamName
   , setUpState = \_ _ _ _ -> return ()
   , destroyState = const $ return ()
@@ -885,15 +950,15 @@ outputStreamAndTopic
   :: (HasStreamConfig m, Message c, Monad m)
   => StepName
   -> StreamStep a b (Stream c)
-  -> m (Stream c, TopicConfig)
+  -> m (Stream c, Topic)
 outputStreamAndTopic stepName step = do
   sc <- getStreamConfig
-  let streamTopicConfig = makeTopicConfig (jobConfigSS sc) stepName
+  let streamTopic = makeTopic (jobConfigSS sc) stepName
   let stream = (if stepProducesWatermark step
-                then setStreamWatermarkByTopic streamTopicConfig
+                then setStreamWatermarkByTopic streamTopic
                 else id)
-                $ streamFromTopic streamTopicConfig stepName
-  return (fmap fromMessage stream, streamTopicConfig)
+                $ streamFromTopic streamTopic stepName
+  return (fmap fromMessage stream, streamTopic)
 
 instance MonadStream LeaseBasedStreamWorker where
   run
@@ -1203,7 +1268,7 @@ throttleByErrors metrics sn x =
 produceStep ::
   Message a =>
   Word8 ->
-  TopicConfig ->
+  Topic ->
   Transaction (Maybe a) ->
   -- | Number of incoming messages consumed, outgoing messages
   FDB.Transaction (Int, Seq a)
@@ -1223,7 +1288,7 @@ pipeStep ::
   Stream a ->
   (StreamReadAndCheckpoint a state) ->
   state ->
-  TopicConfig ->
+  Topic ->
   StepName ->
   (Seq (Maybe (Versionstamp 'Complete), a) -> Transaction (Seq b)) ->
   Maybe StreamEdgeMetrics ->
@@ -1259,7 +1324,7 @@ pipeStep
 oneToOneJoinStep ::
   forall a1 a2 b c.
   (Message a1, Message a2, Message c) =>
-  TopicConfig ->
+  Topic ->
   -- | Index of the stream being consumed. 0 for left side of
   -- join, 1 for right. This will be refactored to support
   -- n-way joins in the future.
@@ -1341,6 +1406,7 @@ logErrors ident =
         printf "%s on thread %s caught %s\n" ident (show tid) (show e)
     ]
 
+-- | Runs a stream processing job forever. Blocks indefinitely.
 runJob :: JobConfig -> (forall m. MonadStream m => m a) -> IO ()
 runJob
   cfg@JobConfig {jobConfigDB, numStreamThreads, numPeriodicJobThreads}

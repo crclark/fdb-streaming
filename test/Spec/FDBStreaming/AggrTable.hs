@@ -36,7 +36,6 @@ import Data.Data (Data)
 import Data.Either (fromRight)
 import GHC.Generics (Generic)
 import Data.Text (Text)
-import Data.UUID (UUID)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import Data.Monoid (Sum, All, Any)
@@ -86,8 +85,7 @@ ordTableKeyProps = describe "OrdTableKey" $ do
   it "works for Float" $ binaryProperty $ propOrdTableKey @Float
   it "works for Double" $ binaryProperty $ propOrdTableKey @Double
   it "works for Bool" $ binaryProperty $ propOrdTableKey @Bool
-  it "works for UUID" $ binaryProperty $ propOrdTableKey @UUID
-  it "works for 2-tuples" $ binaryProperty $ propOrdTableKey @(UUID, Double)
+  it "works for 2-tuples" $ binaryProperty $ propOrdTableKey @(Bool, Double)
 
 propMappendTable :: forall v. (Eq v, TableSemigroup v)
                  => Subspace

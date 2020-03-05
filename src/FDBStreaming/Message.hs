@@ -1,6 +1,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | A type class for serializing and deserializing stream messages.
 module FDBStreaming.Message
   ( Message (..),
   )
@@ -34,7 +35,7 @@ import GHC.Natural (Natural)
 -- While you may use any serialization you please, you may want to choose
 -- something that allows for maximal forward and backward compatibility when
 -- adding new fields to existing data types, such as protocol buffers. If that
--- is not a concern, the 'store' library is a good choice.
+-- is not a concern, the @store@ library is a good choice.
 --
 -- Remember that individual message size is limited by FoundationDB to 100 kB.
 -- For this reason, we don't provide instances for collection types by default.
