@@ -3,6 +3,7 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 module FDBStreaming.Stream.Internal
   ( Stream (..),
@@ -130,7 +131,7 @@ data Stream a
         -- 'destroyState' once. This lifecycle will be repeated many times.
         -- Parameters passed to this function
         -- are the same as those passed to the batch read function.
-        setUpState :: (JobConfig -> ReaderName -> PartitionId -> FDB.Subspace -> Transaction state),
+        setUpState :: JobConfig -> ReaderName -> PartitionId -> FDB.Subspace -> Transaction state,
         -- | Called once to destroy a worker's state as set up by 'setUpState'. Not
         -- a transaction because we can't guarantee that we can run transactions if
         -- the worker dies abnormally.
@@ -203,7 +204,7 @@ streamConsumerCheckpointSS ::
   Stream a ->
   ReaderName ->
   FDB.Subspace
-streamConsumerCheckpointSS jobSS stream rn = case (streamTopic stream) of
+streamConsumerCheckpointSS jobSS stream rn = case streamTopic stream of
   Nothing ->
     FDB.extend
       jobSS

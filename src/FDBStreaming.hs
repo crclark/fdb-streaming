@@ -223,7 +223,6 @@ import Data.Sequence (Seq ())
 import qualified Data.Sequence as Seq
 import Data.Text.Encoding (decodeUtf8)
 import Data.Traversable (for)
-import Data.Void (Void)
 import Data.Witherable (catMaybes, witherM)
 import Data.Word (Word8)
 import qualified FDBStreaming.AggrTable as AT
@@ -414,7 +413,7 @@ data TriggerBy --TODO: decide what this needs to be
 -- TODO: think more about what type params we actually need.
 -- Do we need both outMsg and runResult? Do we need inMsg, or
 -- instead should we have inStream?
-data StreamStep inMsg outMsg runResult where
+data StreamStep outMsg runResult where
   -- | A step that writes to a topic. This would usually be used for testing and
   -- such, since it doesn't have any checkpointing mechanism.
   WriteOnlyProcessor ::
@@ -422,8 +421,7 @@ data StreamStep inMsg outMsg runResult where
     { writeOnlyWatermarkBy :: WatermarkBy a,
       writeOnlyProduce :: Transaction (Maybe a)
     } ->
-    StreamStep Void a
-      (Stream a)
+    StreamStep a (Stream a)
   StreamProcessor ::
     Message b =>
     { streamProcessorInStream :: Stream a,
@@ -432,8 +430,7 @@ data StreamStep inMsg outMsg runResult where
         Seq (Maybe (Versionstamp 'Complete), a) ->
         Transaction (Seq b)
     } ->
-    StreamStep a b
-      (Stream b)
+    StreamStep b (Stream b)
   -- TODO: the tuple input here is kind of a lie. It would
   -- be the user's job to tie them together into pairs, like we
   -- do with the 1-to-1 join logic.
@@ -459,8 +456,7 @@ data StreamStep inMsg outMsg runResult where
           Transaction (Seq b)
         )
     } ->
-    StreamStep (a1, a2) b
-      (Stream b)
+    StreamStep b (Stream b)
   TableProcessor ::
     (Ord k, AT.TableKey k, AT.TableSemigroup aggr) =>
     { tableProcessorGroupedBy :: GroupedBy k v,
@@ -475,22 +471,21 @@ data StreamStep inMsg outMsg runResult where
       tableProcessorWatermarkBy :: WatermarkBy (k, aggr),
       tableProcessorTriggerBy :: Maybe TriggerBy
     } ->
-    StreamStep v (k, aggr)
-      (AT.AggrTable k aggr)
+    StreamStep (k, aggr) (AT.AggrTable k aggr)
 
-stepWatermarkBy :: StreamStep inMsg outMsg runResult -> WatermarkBy outMsg
+stepWatermarkBy :: StreamStep outMsg runResult -> WatermarkBy outMsg
 stepWatermarkBy WriteOnlyProcessor {..} = writeOnlyWatermarkBy
 stepWatermarkBy StreamProcessor {..} = streamProcessorWatermarkBy
 stepWatermarkBy Stream2Processor {..} = stream2ProcessorWatermarkBy
 stepWatermarkBy TableProcessor {..} = tableProcessorWatermarkBy
 
-stepProducesWatermark :: StreamStep inMsg outMsg runResult -> Bool
+stepProducesWatermark :: StreamStep outMsg runResult -> Bool
 stepProducesWatermark = producesWatermark . stepWatermarkBy
 
-isStepDefaultWatermarked :: StreamStep a b r -> Bool
+isStepDefaultWatermarked :: StreamStep b r -> Bool
 isStepDefaultWatermarked = isDefaultWatermark . stepWatermarkBy
 
-watermarkBy :: (b -> Transaction Watermark) -> StreamStep a b r -> StreamStep a b r
+watermarkBy :: (b -> Transaction Watermark) -> StreamStep b r -> StreamStep b r
 watermarkBy f (WriteOnlyProcessor _ x) = WriteOnlyProcessor (CustomWatermark f) x
 watermarkBy f (StreamProcessor input _ p) = StreamProcessor input (CustomWatermark f) p
 watermarkBy f (Stream2Processor inl inr _ pl pr) = Stream2Processor inl inr (CustomWatermark f) pl pr
@@ -517,7 +512,7 @@ class Monad m => MonadStream m where
   -- 'AT.AggrTable'. This function is used in conjunction with the
   -- 'pipe'', 'oneToOneJoin'', and 'aggregate'' functions, which return
   -- 'StreamStep's.
-  run :: StepName -> StreamStep inMsg outMsg runResult -> m runResult
+  run :: StepName -> StreamStep outMsg runResult -> m runResult
 
 -- | Monad that traverses a stream DAG, building up a transaction that updates
 -- the watermarks for all streams that don't have custom watermarks defined.
@@ -729,7 +724,7 @@ pipe' ::
   Message b =>
   Stream a ->
   (a -> IO (Maybe b)) ->
-  StreamStep a b (Stream b)
+  StreamStep b (Stream b)
 pipe' input f =
   StreamProcessor
     { streamProcessorInStream = input,
@@ -772,7 +767,7 @@ oneToOneJoin' ::
   (a -> c) ->
   (b -> c) ->
   (a -> b -> d) ->
-  StreamStep (a, b) d (Stream d)
+  StreamStep d (Stream d)
 oneToOneJoin' inl inr pl pr j =
   let lstep = \cfg -> oneToOneJoinStep cfg 0 pl j
       rstep = \cfg -> oneToOneJoinStep cfg 1 pr (flip j)
@@ -816,7 +811,7 @@ aggregate' ::
   (Ord k, AT.TableKey k, AT.TableSemigroup aggr) =>
   GroupedBy k v ->
   (v -> aggr) ->
-  StreamStep v (k, aggr) (AT.AggrTable k aggr)
+  StreamStep (k, aggr) (AT.AggrTable k aggr)
 aggregate' groupedBy@(GroupedBy input _) f =
   TableProcessor
     groupedBy
@@ -831,7 +826,7 @@ makeStream ::
   (Message b, HasStreamConfig m, Monad m) =>
   StepName ->
   StreamName ->
-  StreamStep a b r ->
+  StreamStep b r ->
   m (Stream b)
 makeStream stepName streamName step = do
   sc <- getStreamConfig
@@ -949,7 +944,7 @@ runCustomWatermark _ t = t
 outputStreamAndTopic
   :: (HasStreamConfig m, Message c, Monad m)
   => StepName
-  -> StreamStep a b (Stream c)
+  -> StreamStep b (Stream c)
   -> m (Stream c, Topic)
 outputStreamAndTopic stepName step = do
   sc <- getStreamConfig
