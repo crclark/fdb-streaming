@@ -4,7 +4,7 @@ module FDBStreaming.JobConfig (
   JobSubspace
 ) where
 
-import Data.Word (Word8)
+import Data.Word (Word8, Word16)
 import qualified FoundationDB as FDB
 import qualified FoundationDB.Layer.Subspace as FDB
 import qualified System.Metrics as Metrics
@@ -28,8 +28,8 @@ data JobConfig
         streamMetricsStore :: Maybe Metrics.Store,
         -- | Number of messages to process per transaction per worker thread.
         -- The larger the messages being processed, the smaller this number
-        -- should be.
-        msgsPerBatch :: Word8,
+        -- should be. This can be overridden on a per-step basis. TODO: reference
+        msgsPerBatch :: Word16,
         -- | Length of time an individual worker should work on a single stage of the
         -- pipeline before stopping and trying to work on something else. Higher
         -- values are more efficient in normal operation, but if machines fail,
@@ -46,5 +46,12 @@ data JobConfig
         -- run by the stream processing system. This includes propagating
         -- watermarks, cleaning up old data, etc. A good default is one thread
         -- -- the thread will be mostly idle.
-        numPeriodicJobThreads :: Int
+        numPeriodicJobThreads :: Int,
+        -- | Default number of partitions per stream and table. In streams, the
+        -- number of concurrent readers equals the number of partitions, so more
+        -- partitions means more throughput at the expense of more worker threads.
+        -- In tables, the number of concurrent writers is bounded by the number of
+        -- partitions, but having fewer writers won't significantly affect
+        -- pipeline timeliness.
+        defaultNumPartitions :: Word8
       }

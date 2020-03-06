@@ -79,7 +79,7 @@ import qualified FoundationDB.Versionstamp as FDB
 -- functions 'getRow' and 'getRowRange' do this for you.
 data AggrTable k v = AggrTable {
   aggrTableSS :: SS.Subspace
-  , aggrTableNumPartitions :: Integer
+  , aggrTableNumPartitions :: Word8
   } deriving (Eq, Show)
 
 -- | The subspace where we store watermarks for an aggregation table.
@@ -131,7 +131,7 @@ setVia :: TableKey k
        -> v
        -> FDB.Transaction ()
 setVia f t pid k v = do
-  let kbs = SS.pack (aggrTableSS t) [FDB.Int pid, FDB.Bytes (toKeyBytes k)]
+  let kbs = SS.pack (aggrTableSS t) [FDB.Int (fromIntegral pid), FDB.Bytes (toKeyBytes k)]
   let vbs = f v
   FDB.set kbs vbs
 
@@ -143,7 +143,7 @@ getVia :: TableKey k
        -> k
        -> FDB.Transaction (FDB.Future (Maybe v))
 getVia f t pid k = do
-  let kbs = SS.pack (aggrTableSS t) [FDB.Int pid, FDB.Bytes (toKeyBytes k)]
+  let kbs = SS.pack (aggrTableSS t) [FDB.Int (fromIntegral pid), FDB.Bytes (toKeyBytes k)]
   fmap (fmap f) <$> FDB.get kbs
 
 -- | Helper function to define 'TableSemigroup.mappendBatch' easily.
@@ -156,7 +156,7 @@ mappendAtomicVia :: TableKey k
                  -> v
                  -> FDB.Transaction ()
 mappendAtomicVia f op t pid k v = do
-  let kbs = SS.pack (aggrTableSS t) [FDB.Int pid, FDB.Bytes (toKeyBytes k)]
+  let kbs = SS.pack (aggrTableSS t) [FDB.Int (fromIntegral pid), FDB.Bytes (toKeyBytes k)]
   let vbs = f v
   FDB.atomicOp kbs (op vbs)
 
@@ -218,8 +218,8 @@ getTableRangeVia :: (Ord k, OrdTableKey k)
                  -> (ByteString -> v)
                  -> FDB.Transaction (Map k v)
 getTableRangeVia table pid start end parse = do
- let startK = SS.pack (aggrTableSS table) [FDB.Int pid, FDB.Bytes (toKeyBytes start)]
- let endK = SS.pack (aggrTableSS table) [FDB.Int pid, FDB.Bytes (toKeyBytes end)]
+ let startK = SS.pack (aggrTableSS table) [FDB.Int (fromIntegral pid), FDB.Bytes (toKeyBytes start)]
+ let endK = SS.pack (aggrTableSS table) [FDB.Int (fromIntegral pid), FDB.Bytes (toKeyBytes end)]
  let range = FDB.keyRangeInclusive startK endK
  let unwrapOuterBytes bs = case SS.unpack (aggrTableSS table) bs of
        Left err -> error $ "Error decoding table key in getTableRangeVia: " ++ show err
@@ -249,7 +249,7 @@ getBlocking db at k = do
                $ forM [0..(aggrTableNumPartitions at - 1)]
                $ \pid -> do
                  let kbs = SS.pack (aggrTableSS at)
-                                   [FDB.Int pid, FDB.Bytes (toKeyBytes k)]
+                                   [FDB.Int (fromIntegral pid), FDB.Bytes (toKeyBytes k)]
                  FDB.watch kbs
     Just v -> return (Right v)
   case result of
@@ -265,7 +265,8 @@ getBlocking db at k = do
 -- | Look up the value in a table for a given key.
 getRow :: (TableKey k, TableSemigroup v) => AggrTable k v -> k -> FDB.Transaction (Maybe v)
 getRow table k = do
-  futs <- forM [0..(aggrTableNumPartitions table - 1)] $ \pid -> get table pid k
+  futs <- forM [0..(aggrTableNumPartitions table - 1)]
+               $ \pid -> get table pid k
   fold <$> traverse FDB.await futs
 
 -- | For ordered keys, looks up a range of key-values in a table.
@@ -277,8 +278,8 @@ getRowRange :: (Ord k, OrdTableKey k, RangeAccessibleTable v, TableSemigroup v)
             -- ^ End of the range, inclusive
             -> FDB.Transaction (Map k v)
 getRowRange table start end = do
-  maps <- forM [0..(aggrTableNumPartitions table - 1)] $ \pid ->
-    getTableRange table pid start end
+  maps <- forM [0..(aggrTableNumPartitions table - 1)]
+               $ \pid -> getTableRange table pid start end
   return $ unionsWith (<>) maps
 
 instance TableKey ByteString where

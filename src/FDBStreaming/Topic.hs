@@ -88,7 +88,7 @@ type ReaderName = ByteString
 -- checkpoint, the checkpoint is highly contended. By splitting a topic into a
 -- separate partitions, readers are able to maintain a separate checkpoint per
 -- partition, and reads scale better.
-type PartitionId = Integer
+type PartitionId = Word8
 
 -- TODO: consider switching to the directory layer so the subspace strings
 -- are shorter
@@ -119,7 +119,7 @@ data Topic
         partitionCountKey :: PartitionId -> ByteString,
         -- | Number of partitions in this topic. In the future, this will be
         -- stored in FoundationDB and allowed to dynamically grow.
-        numPartitions :: Integer,
+        numPartitions :: Word8,
         -- | A subspace for application-specific metadata
         -- to be used by users of this topic. Nothing in
         -- this module will read or write to this
@@ -130,18 +130,26 @@ data Topic
 -- | Create a new topic, contained within the given subspace and with the given
 -- name. You may reuse the same subspace for any number of topics -- each topic
 -- will be stored in a separate subspace below it.
-makeTopic :: FDB.Subspace -> TopicName -> Topic
-makeTopic topicSS topicName = Topic {..}
+makeTopic :: FDB.Subspace
+          -- ^ Top-level subspace containing all topics used by this application.
+          -> TopicName
+          -- ^ Name of the topic. Must be unique to the given subspace.
+          -> Word8
+          -- ^ Number of partitions in this topic. The number of partitions
+          -- bounds the number of consumers that may concurrently read from this
+          -- topic.
+          -> Topic
+makeTopic topicSS topicName p = Topic {..}
   where
     topicCountKey = FDB.pack topicCountSS []
-    partitionMsgsSS i = FDB.extend msgsSS [FDB.Int i]
-    partitionCountKey i = FDB.pack topicCountSS [FDB.Int i]
+    partitionMsgsSS i = FDB.extend msgsSS [FDB.Int (fromIntegral i)]
+    partitionCountKey i = FDB.pack topicCountSS [FDB.Int (fromIntegral i)]
     msgsSS = FDB.extend topicSS [C.topics, FDB.Bytes topicName, C.messages]
     topicCountSS =
       FDB.extend
         topicSS
         [C.topics, FDB.Bytes topicName, C.metaCount]
-    numPartitions = 2 -- TODO: make configurable
+    numPartitions = p
     topicCustomMetadataSS =
       FDB.extend topicSS [C.topics, FDB.Bytes topicName, C.customMeta]
 
@@ -151,6 +159,11 @@ randPartition Topic {..} = randomRIO (0, numPartitions - 1)
 -- TODO: not efficient from either a Haskell or FDB perspective.
 -- | Returns all topics that currently exist in the given subspace. This function
 -- is not particularly efficient and shouldn't be used too heavily.
+--
+-- DANGER: For debugging purposes only. The number of partitions per topic is
+-- not currently stored in FoundationDB -- it's only known from your code. Thus,
+-- the returned Topic values have incorrect partition counts. This will be
+-- fixed in the future. https://github.com/crclark/fdb-streaming/issues/3
 listExistingTopics :: FDB.Database -> FDB.Subspace -> IO [Topic]
 listExistingTopics db ss = runTransaction db $ go (FDB.pack ss [C.topics])
   where
@@ -161,7 +174,7 @@ listExistingTopics db ss = runTransaction db $ go (FDB.pack ss [C.topics])
         Right (FDB.Int 0 : FDB.Bytes topicName : _) -> do
           let nextK = FDB.pack ss [C.topics, FDB.Bytes topicName] <> "0xff"
           rest <- go nextK
-          let conf = makeTopic ss topicName
+          let conf = makeTopic ss topicName 1
           return (conf : rest)
         _ -> return []
 
@@ -202,7 +215,8 @@ readerCheckpointSS :: Topic -> ReaderName -> FDB.Subspace
 readerCheckpointSS tc rn = FDB.extend (readerSS tc rn) [C.checkpoint]
 
 readerCheckpointKey :: Topic -> PartitionId -> ReaderName -> ByteString
-readerCheckpointKey tc i rn = FDB.pack (readerCheckpointSS tc rn) [FDB.Int i]
+readerCheckpointKey tc i rn =
+  FDB.pack (readerCheckpointSS tc rn) [FDB.Int (fromIntegral i)]
 
 -- TODO: make idempotent to deal with CommitUnknownResult
 
@@ -358,7 +372,7 @@ readNPastCheckpoint ::
   Topic ->
   PartitionId ->
   ReaderName ->
-  Word8 ->
+  Word16 ->
   Transaction (Seq (Versionstamp 'Complete, ByteString))
 readNPastCheckpoint tc p rn n = do
   cpvs <- getCheckpoint' tc p rn
@@ -384,7 +398,7 @@ readNAndCheckpoint' ::
   Topic ->
   PartitionId ->
   ReaderName ->
-  Word8 ->
+  Word16 ->
   Transaction (Seq (Versionstamp 'Complete, ByteString))
 readNAndCheckpoint' tc@Topic {..} p rn n =
   readNPastCheckpoint tc p rn n >>= \case
@@ -399,7 +413,7 @@ readNAndCheckpoint ::
   FDB.Database ->
   Topic ->
   ReaderName ->
-  Word8 ->
+  Word16 ->
   IO (Seq (Versionstamp 'Complete, ByteString))
 readNAndCheckpoint db tc@Topic {..} rn n = do
   p <- randPartition tc

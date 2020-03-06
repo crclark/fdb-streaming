@@ -21,7 +21,7 @@ import Data.Foldable (for_)
 import Data.Maybe (fromJust, isJust)
 import Data.Sequence (Seq ())
 import Data.Witherable (Filterable, catMaybes, mapMaybe)
-import Data.Word (Word8)
+import Data.Word (Word16)
 import FDBStreaming.JobConfig (JobConfig (jobConfigSS), JobSubspace)
 import FDBStreaming.Topic
   ( PartitionId,
@@ -59,8 +59,7 @@ type StreamReadAndCheckpoint a state =
   ReaderName ->
   PartitionId ->
   FDB.Subspace ->
-  --TODO: Word16?
-  Word8 ->
+  Word16 ->
   state ->
   Transaction (Seq (Maybe (Versionstamp 'Complete), a))
 
@@ -106,8 +105,7 @@ data Stream a
           ReaderName ->
           PartitionId ->
           FDB.Subspace ->
-          --TODO: Word16?
-          Word8 ->
+          Word16 ->
           state ->
           Transaction (Seq (Maybe (Versionstamp 'Complete), a)),
         -- | The minimum number of threads that must concurrently read from
@@ -153,7 +151,7 @@ customStream ::
     ReaderName ->
     PartitionId ->
     FDB.Subspace ->
-    Word8 ->
+    Word16 ->
     state ->
     Transaction (Seq a)
   ) ->

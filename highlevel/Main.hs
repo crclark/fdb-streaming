@@ -153,7 +153,11 @@ instance Message OrderDetails where
 
 randOrderDetails :: Order -> IO OrderDetails
 randOrderDetails Order { .. } = do
-  details <- BS.random 500
+  -- TODO: This was a bottleneck because we were creating a Gen on each call.
+  -- Switch from random to randomGen.
+  -- It called withSystemRandom, whose docs warn
+  -- "This is a somewhat expensive function, and is intended to be called only occasionally"
+  details <- return "hi"
   return OrderDetails { .. }
 
 goodDetails :: ByteString -> Bool
@@ -338,7 +342,8 @@ mainLoop db ss Args{ generatorNumThreads
                    , printTopicStats
                    , batchSize
                    , numLeaseThreads
-                   , watermark } = do
+                   , watermark
+                   , numPartitions } = do
   metricsStore <- Metrics.newStore
   latencyDist <- Metrics.createDistribution "end_to_end_latency" metricsStore
   awaitedOrders <- Metrics.createGauge "waitingOrders" metricsStore
@@ -351,9 +356,10 @@ mainLoop db ss Args{ generatorNumThreads
              , leaseDuration = 10
              , numStreamThreads = coerce numLeaseThreads
              , numPeriodicJobThreads = 1
+             , defaultNumPartitions = 2
              }
-  let input = makeTopic ss "incoming_orders"
-  let table = getAggrTable conf "order_table"
+  let input = makeTopic ss "incoming_orders" (coerce numPartitions)
+  let table = getAggrTable conf "order_table" (coerce numPartitions)
   stats <- newTVarIO $ LatencyStats 0 1
   replicateM_ (coerce generatorNumThreads)
     $ forkIO $ orderGeneratorLoop db
@@ -396,9 +402,10 @@ data Args f = Args
   , streamRun :: f Bool
   , cleanupFirst :: f Bool
   , printTopicStats :: f Bool
-  , batchSize :: f Word8
+  , batchSize :: f Word16
   , numLeaseThreads :: f Int
   , watermark :: f Bool
+  , numPartitions :: f Word8
   }
   deriving (Generic)
 
@@ -420,6 +427,7 @@ applyDefaults Args{..} = Args
   , batchSize = dflt 50 batchSize
   , numLeaseThreads = dflt 12 numLeaseThreads
   , watermark = dflt False watermark
+  , numPartitions = dflt 2 numPartitions
   }
 
   where dflt d x = Identity $ fromMaybe d x
