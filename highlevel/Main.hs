@@ -36,6 +36,7 @@ import           Control.Exception              ( catches
                                                 , Handler(..)
                                                 , SomeException
                                                 )
+import Control.Logger.Simple (LogLevel(LogDebug))
 import           Data.List                      ( sortOn )
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -357,6 +358,7 @@ mainLoop db ss Args{ generatorNumThreads
              , numStreamThreads = coerce numLeaseThreads
              , numPeriodicJobThreads = 1
              , defaultNumPartitions = 2
+             , logLevel =LogDebug
              }
   let input = makeTopic ss "incoming_orders" (coerce numPartitions)
   let table = getAggrTable conf "order_table" (coerce numPartitions)
