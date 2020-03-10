@@ -36,7 +36,7 @@ import Control.Concurrent.Async
     race,
     waitAny,
   )
-import Control.Monad (forM, guard, void)
+import Control.Monad (void)
 import Data.Binary.Get
   ( getWord64le,
     runGet,
@@ -52,6 +52,7 @@ import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Maybe (fromMaybe)
 import Data.Sequence (Seq ((:|>)))
+import Data.Traversable (for)
 import Data.Word
   ( Word16,
     Word64,
@@ -114,11 +115,9 @@ data Topic
         -- this application.
         topicSS :: FDB.Subspace,
         topicName :: TopicName,
-        -- | Key containing the count of items in the topic, as a little endian
-        -- integer.
-        topicCountKey :: ByteString,
         -- | Returns the subspace containing messages for a given partition.
         partitionMsgsSS :: PartitionId -> FDB.Subspace,
+        -- | Key containing the count of messages for a given partition.
         partitionCountKey :: PartitionId -> ByteString,
         -- | Number of partitions in this topic. In the future, this will be
         -- stored in FoundationDB and allowed to dynamically grow.
@@ -144,7 +143,6 @@ makeTopic :: FDB.Subspace
           -> Topic
 makeTopic topicSS topicName p = Topic {..}
   where
-    topicCountKey = FDB.pack topicCountSS []
     partitionMsgsSS i = FDB.extend msgsSS [FDB.Int (fromIntegral i)]
     partitionCountKey i = FDB.pack topicCountSS [FDB.Int (fromIntegral i)]
     msgsSS = FDB.extend topicSS [C.topics, FDB.Bytes topicName, C.messages]
@@ -181,18 +179,17 @@ listExistingTopics db ss = runTransaction db $ go (FDB.pack ss [C.topics])
           return (conf : rest)
         _ -> return []
 
--- | Increments the count of messages in a given topic.
-incrTopicCountBy :: Topic -> Word64 -> Transaction ()
-incrTopicCountBy topic n = do
-  let k = topicCountKey topic
-  let bs = runPut $ putWord64le n
-  FDB.atomicOp k (Op.add $ toStrict bs)
+getPartitionCountF :: Topic -> PartitionId -> Transaction (FDB.Future Word64)
+getPartitionCountF topic i = do
+  let k = partitionCountKey topic i
+  fmap (maybe 0 (runGet getWord64le . fromStrict)) <$> FDB.get k
 
 getTopicCount :: Topic -> Transaction Word64
 getTopicCount topic = do
-  let k = topicCountKey topic
-  bs <- fromMaybe zeroLE <$> (FDB.get k >>= await)
-  return $ (runGet getWord64le . fromStrict) bs
+  fs <- for [0 .. numPartitions topic - 1] (getPartitionCountF topic)
+  cs <- traverse await fs
+  return (sum cs)
+
 
 -- | Increments the count of messages in a given topic partition.
 incrPartitionCountBy :: Topic -> PartitionId -> Word64 -> Transaction ()
@@ -234,7 +231,6 @@ writeTopic' ::
   Transaction ()
 writeTopic' topic@Topic {..} p bss = do
   incrPartitionCountBy topic p (fromIntegral $ length bss)
-  incrTopicCountBy topic (fromIntegral $ length bss)
   void $ foldlM go 1 bss
   where
     go !i bs = do
@@ -254,8 +250,6 @@ writeTopic ::
   t ByteString ->
   IO ()
 writeTopic db topic@Topic {..} bss = do
-  -- TODO: proper error handling
-  guard (fromIntegral (length bss) < (maxBound :: Word16))
   p <- randPartition topic
   FDB.runTransaction db $ writeTopic' topic p bss
 
@@ -292,7 +286,7 @@ watchPartition topic pid = watch (partitionCountKey topic pid)
 -- not seem to fire promptly enough to maintain real time throughput. However,
 -- other advanced use cases may find this useful.
 watchTopic' :: Topic -> Transaction TopicWatch
-watchTopic' tc = fmap TopicWatch $ forM [0 .. numPartitions tc - 1] $ \pid ->
+watchTopic' tc = fmap TopicWatch $ for [0 .. numPartitions tc - 1] $ \pid ->
   fmap (const pid) <$> watch (partitionCountKey tc pid)
 
 -- | For use with the return value of 'watchTopic''. Must be called from outside
@@ -427,7 +421,7 @@ getEntireTopic ::
   Topic ->
   Transaction (Map PartitionId (Seq (Versionstamp 'Complete, ByteString)))
 getEntireTopic topic@Topic {..} = do
-  partitions <- forM [0 .. numPartitions - 1] $ \pid -> do
+  partitions <- for [0 .. numPartitions - 1] $ \pid -> do
     let begin = FDB.pack (partitionMsgsSS pid) [FDB.CompleteVS minBound]
     let end = prefixRangeEnd $ FDB.subspaceKey (partitionMsgsSS pid)
     let r = Range
