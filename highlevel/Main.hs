@@ -40,6 +40,8 @@ import Control.Logger.Simple (LogLevel(LogDebug))
 import           Data.List                      ( sortOn )
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as BL
+import qualified Data.ByteString.Builder as Build
 import qualified Data.ByteString.Random.MWC as BS
 import           Data.Coerce                    ( coerce )
 import           Data.Time.Clock                ( diffUTCTime, getCurrentTime )
@@ -108,7 +110,7 @@ randOrder = do
   orderID   <- OrderID <$> UUID.nextRandom
   isFraud   <- randomIO
   isInStock <- randomIO
-  let orderInstructions = "This is a bunch of bytes containing text, to bulk up the total message size. Hwæt! Wé Gárdena      in géardagum þéodcyninga      þrym gefrúnon Oft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatumOft Scyld Scéfing      sceaþena þréatum"
+  let orderInstructions = "This is some text, in order to simulate a larger message."
   return Order { .. }
 
 data FraudResult = FraudResult

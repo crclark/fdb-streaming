@@ -1,18 +1,13 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
 
-import Control.Exception (finally)
-import Test.Hspec
 import FoundationDB
 import FoundationDB.Layer.Subspace
 import FoundationDB.Layer.Tuple
-import FoundationDB.Versionstamp
-
-import Spec.FDBStreaming.TaskLease
 import Spec.FDBStreaming.AggrTable (tableProps)
+import Spec.FDBStreaming.TaskLease
 import Spec.FDBStreaming.Watermark (watermarks)
-
-import FDBStreaming.Topic
+import Test.Tasty
 
 testSS :: Subspace
 testSS = subspace [Bytes "fdbstreaming-test"]
@@ -20,20 +15,18 @@ testSS = subspace [Bytes "fdbstreaming-test"]
 cleanup :: Database -> IO ()
 cleanup db = do
   let (begin, end) = rangeKeys $ subspaceRange testSS
-  runTransactionWithConfig defaultConfig {timeout=5000} db $ clearRange begin end
+  runTransactionWithConfig defaultConfig {timeout = 5000} db $ clearRange begin end
+
+allTests :: Database -> TestTree
+allTests db =
+  testGroup
+    "Tests"
+    [ leaseProps testSS db,
+      tableProps testSS db,
+      watermarks testSS db
+    ]
 
 main :: IO ()
-main = withFoundationDB defaultOptions $
-  \db -> flip finally (cleanup db)
-         $ hspec
-         $ before_ (cleanup db)
-         $ do
-    describe "leases" $
-      -- TODO: still some lingering bugs with the state machine tester, where
-      -- it tries to generate sequences of commands that are impossible to
-      -- carry out (like locking a task before creating it).
-      --it "works" (smProp db)
-      leaseProps testSS db
-    describe "aggregation tables" $
-      tableProps testSS db
-    describe "watermarks" $ watermarks testSS db
+main = withFoundationDB defaultOptions $ \db -> do
+  defaultMain $ allTests db
+  cleanup db

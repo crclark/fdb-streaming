@@ -215,6 +215,7 @@ module FDBStreaming
     -- * Advanced Usage
     topicWatermarkSS,
     WatermarkBy,
+    streamFromTopic
   )
 where
 
@@ -947,7 +948,7 @@ setStreamWatermarkByTopic tc stream =
 -- 'setStreamWatermarkByTopic' on the result.
 --
 -- You only need this function if you are trying to access a topic that was
--- created by another pipeline.
+-- created by another pipeline, or created manually.
 streamFromTopic :: Topic -> StreamName -> Stream ByteString
 streamFromTopic tc streamName =
   Stream

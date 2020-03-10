@@ -3,6 +3,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE TupleSections #-}
 
 module FDBStreaming.Topic
   ( TopicName,
@@ -25,6 +26,7 @@ module FDBStreaming.Topic
     watchTopic,
     watchTopic',
     awaitTopicOrTimeout,
+    getEntireTopic
   )
 where
 
@@ -46,6 +48,8 @@ import Data.Binary.Put
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (fromStrict, toStrict)
 import Data.Foldable (foldlM)
+import Data.Map (Map)
+import qualified Data.Map as Map
 import Data.Maybe (fromMaybe)
 import Data.Sequence (Seq ((:|>)))
 import Data.Word
@@ -53,7 +57,6 @@ import Data.Word
     Word64,
     Word8,
   )
--- TODO: move prefixRangeEnd out of Advanced usage section.
 
 import qualified FDBStreaming.Topic.Constants as C
 import qualified FoundationDB as FDB
@@ -180,27 +183,27 @@ listExistingTopics db ss = runTransaction db $ go (FDB.pack ss [C.topics])
 
 -- | Increments the count of messages in a given topic.
 incrTopicCountBy :: Topic -> Word64 -> Transaction ()
-incrTopicCountBy conf n = do
-  let k = topicCountKey conf
+incrTopicCountBy topic n = do
+  let k = topicCountKey topic
   let bs = runPut $ putWord64le n
   FDB.atomicOp k (Op.add $ toStrict bs)
 
 getTopicCount :: Topic -> Transaction Word64
-getTopicCount conf = do
-  let k = topicCountKey conf
+getTopicCount topic = do
+  let k = topicCountKey topic
   bs <- fromMaybe zeroLE <$> (FDB.get k >>= await)
   return $ (runGet getWord64le . fromStrict) bs
 
 -- | Increments the count of messages in a given topic partition.
 incrPartitionCountBy :: Topic -> PartitionId -> Word64 -> Transaction ()
-incrPartitionCountBy conf pid n = do
-  let k = partitionCountKey conf pid
+incrPartitionCountBy topic pid n = do
+  let k = partitionCountKey topic pid
   let bs = runPut $ putWord64le n
   FDB.atomicOp k (Op.add $ toStrict bs)
 
 getPartitionCount :: Topic -> PartitionId -> Transaction Word64
-getPartitionCount conf i = do
-  let k = partitionCountKey conf i
+getPartitionCount topic i = do
+  let k = partitionCountKey topic i
   bs <- fromMaybe zeroLE <$> (FDB.get k >>= await)
   return $ (runGet getWord64le . fromStrict) bs
 
@@ -212,11 +215,11 @@ readerSS Topic {..} rn =
 
 -- | The subspace containing checkpoints for a given topic consumer.
 readerCheckpointSS :: Topic -> ReaderName -> FDB.Subspace
-readerCheckpointSS tc rn = FDB.extend (readerSS tc rn) [C.checkpoint]
+readerCheckpointSS topic rn = FDB.extend (readerSS topic rn) [C.checkpoint]
 
 readerCheckpointKey :: Topic -> PartitionId -> ReaderName -> ByteString
-readerCheckpointKey tc i rn =
-  FDB.pack (readerCheckpointSS tc rn) [FDB.Int (fromIntegral i)]
+readerCheckpointKey topic i rn =
+  FDB.pack (readerCheckpointSS topic rn) [FDB.Int (fromIntegral i)]
 
 -- TODO: make idempotent to deal with CommitUnknownResult
 
@@ -229,9 +232,9 @@ writeTopic' ::
   PartitionId ->
   t ByteString ->
   Transaction ()
-writeTopic' tc@Topic {..} p bss = do
-  incrPartitionCountBy tc p (fromIntegral $ length bss)
-  incrTopicCountBy tc (fromIntegral $ length bss)
+writeTopic' topic@Topic {..} p bss = do
+  incrPartitionCountBy topic p (fromIntegral $ length bss)
+  incrTopicCountBy topic (fromIntegral $ length bss)
   void $ foldlM go 1 bss
   where
     go !i bs = do
@@ -244,18 +247,17 @@ writeTopic' tc@Topic {..} p bss = do
 
 -- | Transactionally write a batch of messages to the given topic. The
 -- batch must be small enough to fit into a single FoundationDB transaction.
--- DANGER: can only be called once per topic per transaction.
 writeTopic ::
   Traversable t =>
   FDB.Database ->
   Topic ->
   t ByteString ->
   IO ()
-writeTopic db tc@Topic {..} bss = do
+writeTopic db topic@Topic {..} bss = do
   -- TODO: proper error handling
   guard (fromIntegral (length bss) < (maxBound :: Word16))
-  p <- randPartition tc
-  FDB.runTransaction db $ writeTopic' tc p bss
+  p <- randPartition topic
+  FDB.runTransaction db $ writeTopic' topic p bss
 
 parseOutput ::
   Topic ->
@@ -276,7 +278,7 @@ newtype TopicWatch = TopicWatch {unTopicWatch :: [FutureIO PartitionId]}
 -- not seem to fire promptly enough to maintain real time throughput. However,
 -- other advanced use cases may find this useful.
 watchPartition :: Topic -> PartitionId -> Transaction (FutureIO ())
-watchPartition tc pid = watch (partitionCountKey tc pid)
+watchPartition topic pid = watch (partitionCountKey topic pid)
 
 -- | Returns a watch for each partition of the given topic.
 -- Caveats:
@@ -316,8 +318,8 @@ awaitTopicOrTimeout timeout futures =
 -- not seem to fire promptly enough to maintain real time throughput. However,
 -- other advanced use cases may find this useful.
 watchTopic :: FDB.Database -> Topic -> IO (Either FDB.Error PartitionId)
-watchTopic db tc = do
-  ws <- runTransaction db (watchTopic' tc)
+watchTopic db topic = do
+  ws <- runTransaction db (watchTopic' topic)
   awaitTopic ws
 
 checkpoint' ::
@@ -326,8 +328,8 @@ checkpoint' ::
   ReaderName ->
   Versionstamp 'Complete ->
   Transaction ()
-checkpoint' tc p rn vs = do
-  let k = readerCheckpointKey tc p rn
+checkpoint' topic p rn vs = do
+  let k = readerCheckpointKey topic p rn
   let v = encodeVersionstamp vs
   FDB.atomicOp k (Op.byteMax v)
 
@@ -344,8 +346,8 @@ getCheckpoint' ::
   PartitionId ->
   ReaderName ->
   Transaction (Versionstamp 'Complete)
-getCheckpoint' tc p rn = do
-  let cpk = readerCheckpointKey tc p rn
+getCheckpoint' topic p rn = do
+  let cpk = readerCheckpointKey topic p rn
   bs <- FDB.get cpk >>= await
   case decodeCheckpoint <$> bs of
     Just vs -> return vs
@@ -356,8 +358,8 @@ getCheckpoints ::
   Topic ->
   ReaderName ->
   Transaction (FDB.Future (Seq (Versionstamp 'Complete)))
-getCheckpoints tc rn = do
-  let ss = readerCheckpointSS tc rn
+getCheckpoints topic rn = do
+  let ss = readerCheckpointSS topic rn
   let ssRange = FDB.subspaceRange ss
   rangeResult <- FDB.getRange' ssRange FDB.StreamingModeWantAll
   return
@@ -374,17 +376,17 @@ readNPastCheckpoint ::
   ReaderName ->
   Word16 ->
   Transaction (Seq (Versionstamp 'Complete, ByteString))
-readNPastCheckpoint tc p rn n = do
-  cpvs <- getCheckpoint' tc p rn
-  let begin = FDB.pack (partitionMsgsSS tc p) [FDB.CompleteVS cpvs]
-  let end = prefixRangeEnd $ FDB.subspaceKey (partitionMsgsSS tc p)
+readNPastCheckpoint topic p rn n = do
+  cpvs <- getCheckpoint' topic p rn
+  let begin = FDB.pack (partitionMsgsSS topic p) [FDB.CompleteVS cpvs]
+  let end = prefixRangeEnd $ FDB.subspaceKey (partitionMsgsSS topic p)
   let r = Range
         { rangeBegin = FirstGreaterThan begin,
           rangeEnd = FirstGreaterOrEq end,
           rangeLimit = Just (fromIntegral n),
           rangeReverse = False
         }
-  fmap (parseOutput tc p) <$> withSnapshot (FDB.getEntireRange r)
+  fmap (parseOutput topic p) <$> withSnapshot (FDB.getEntireRange r)
 
 -- TODO: would be useful to have a version of this that returns a watch if
 -- there are no new messages.
@@ -400,10 +402,10 @@ readNAndCheckpoint' ::
   ReaderName ->
   Word16 ->
   Transaction (Seq (Versionstamp 'Complete, ByteString))
-readNAndCheckpoint' tc@Topic {..} p rn n =
-  readNPastCheckpoint tc p rn n >>= \case
+readNAndCheckpoint' topic@Topic {..} p rn n =
+  readNPastCheckpoint topic p rn n >>= \case
     x@(_ :|> (vs, _)) -> do
-      checkpoint' tc p rn vs
+      checkpoint' topic p rn vs
       return x
     _ -> return mempty
 
@@ -415,6 +417,24 @@ readNAndCheckpoint ::
   ReaderName ->
   Word16 ->
   IO (Seq (Versionstamp 'Complete, ByteString))
-readNAndCheckpoint db tc@Topic {..} rn n = do
-  p <- randPartition tc
-  FDB.runTransaction db (readNAndCheckpoint' tc p rn n)
+readNAndCheckpoint db topic@Topic {..} rn n = do
+  p <- randPartition topic
+  FDB.runTransaction db (readNAndCheckpoint' topic p rn n)
+
+-- | Gets all data from the given topic. For debugging and testing purposes.
+-- This will try to load the entire topic into memory.
+getEntireTopic ::
+  Topic ->
+  Transaction (Map PartitionId (Seq (Versionstamp 'Complete, ByteString)))
+getEntireTopic topic@Topic {..} = do
+  partitions <- forM [0 .. numPartitions - 1] $ \pid -> do
+    let begin = FDB.pack (partitionMsgsSS pid) [FDB.CompleteVS minBound]
+    let end = prefixRangeEnd $ FDB.subspaceKey (partitionMsgsSS pid)
+    let r = Range
+          { rangeBegin = FirstGreaterThan begin,
+            rangeEnd = FirstGreaterOrEq end,
+            rangeLimit = Nothing,
+            rangeReverse = False
+          }
+    (pid,) . fmap (parseOutput topic pid) <$> FDB.getEntireRange r
+  return $ Map.fromList partitions
