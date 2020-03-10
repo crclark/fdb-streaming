@@ -7,6 +7,7 @@ import FoundationDB.Layer.Tuple
 import Spec.FDBStreaming.AggrTable (tableProps)
 import Spec.FDBStreaming.TaskLease
 import Spec.FDBStreaming.Watermark (watermarks)
+import Spec.FDBStreaming.Topic (topicTests)
 import Test.Tasty
 
 testSS :: Subspace
@@ -23,10 +24,12 @@ allTests db =
     "Tests"
     [ leaseProps testSS db,
       tableProps testSS db,
-      watermarks testSS db
+      watermarks testSS db,
+      topicTests testSS db
     ]
 
 main :: IO ()
 main = withFoundationDB defaultOptions $ \db -> do
+  cleanup db
   defaultMain $ allTests db
   cleanup db
