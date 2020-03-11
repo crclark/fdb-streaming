@@ -33,6 +33,7 @@ library
       FDBStreaming.JobConfig
       FDBStreaming.Joins,
       FDBStreaming.Util,
+      FDBStreaming.Util.BatchWriter,
       FDBStreaming.Watermark
   other-modules:
       Paths_fdb_streaming
@@ -59,7 +60,8 @@ library
       witherable,
       time,
       safe,
-      simple-logger
+      simple-logger,
+      stm
   default-language: Haskell2010
 
 executable fdb-streaming-highlevel
@@ -108,6 +110,7 @@ test-suite fdb-streaming-test
       Spec.FDBStreaming.AggrTable
       Spec.FDBStreaming.Watermark
       Spec.FDBStreaming.Util
+      Spec.FDBStreaming.Util.BatchWriter
       Spec.FDBStreaming.Topic
   hs-source-dirs:
       test
