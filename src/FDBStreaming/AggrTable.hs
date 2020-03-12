@@ -61,8 +61,6 @@ import qualified Data.Map.Strict as Map
 import Data.Monoid (Sum(Sum, getSum), All(All, getAll), Any(Any, getAny))
 import Data.Semigroup (Max(Max, getMax), Min(Min, getMin))
 import Data.Text (Text)
-import Data.UUID (UUID)
-import qualified Data.UUID as UUID
 import Data.Word (Word8, Word16, Word32, Word64)
 
 import FDBStreaming.Message(Message (fromMessage, toMessage))
@@ -81,9 +79,10 @@ import qualified FoundationDB.Versionstamp as FDB
 -- functions 'getRow' and 'getRowRange' do this for you.
 data AggrTable k v = AggrTable {
   aggrTableSS :: SS.Subspace
-  , aggrTableNumPartitions :: Integer
+  , aggrTableNumPartitions :: Word8
   } deriving (Eq, Show)
 
+-- | The subspace where we store watermarks for an aggregation table.
 aggrTableWatermarkSS :: AggrTable k v -> SS.Subspace
 aggrTableWatermarkSS = flip SS.extend [FDB.Bytes "wm"] . aggrTableSS
 
@@ -94,13 +93,11 @@ aggrTableWatermarkSS = flip SS.extend [FDB.Bytes "wm"] . aggrTableSS
 -- the type. For the 'Message' class, we don't require any ordering of the
 -- serialized representation, which may admit for more efficient serialization
 -- in some cases.
---
--- Instances are provided for some types.
 class TableKey a where
   toKeyBytes :: a -> ByteString
   fromKeyBytes :: ByteString -> a
 
--- | An additional tag to place on types that satisfy
+-- | An additional predicate for types that satisfy
 -- @compare x y == compare (toKeyBytes x) (toKeyBytes y)@
 class TableKey a => OrdTableKey a
 
@@ -134,10 +131,11 @@ setVia :: TableKey k
        -> v
        -> FDB.Transaction ()
 setVia f t pid k v = do
-  let kbs = SS.pack (aggrTableSS t) [FDB.Int pid, FDB.Bytes (toKeyBytes k)]
+  let kbs = SS.pack (aggrTableSS t) [FDB.Int (fromIntegral pid), FDB.Bytes (toKeyBytes k)]
   let vbs = f v
   FDB.set kbs vbs
 
+-- | Helper function to define 'TableSemigroup.get' easily.
 getVia :: TableKey k
        => (ByteString -> v)
        -> AggrTable k v
@@ -145,9 +143,10 @@ getVia :: TableKey k
        -> k
        -> FDB.Transaction (FDB.Future (Maybe v))
 getVia f t pid k = do
-  let kbs = SS.pack (aggrTableSS t) [FDB.Int pid, FDB.Bytes (toKeyBytes k)]
+  let kbs = SS.pack (aggrTableSS t) [FDB.Int (fromIntegral pid), FDB.Bytes (toKeyBytes k)]
   fmap (fmap f) <$> FDB.get kbs
 
+-- | Helper function to define 'TableSemigroup.mappendBatch' easily.
 mappendAtomicVia :: TableKey k
                  => (v -> ByteString)
                  -> (ByteString -> Op.MutationType)
@@ -157,14 +156,14 @@ mappendAtomicVia :: TableKey k
                  -> v
                  -> FDB.Transaction ()
 mappendAtomicVia f op t pid k v = do
-  let kbs = SS.pack (aggrTableSS t) [FDB.Int pid, FDB.Bytes (toKeyBytes k)]
+  let kbs = SS.pack (aggrTableSS t) [FDB.Int (fromIntegral pid), FDB.Bytes (toKeyBytes k)]
   let vbs = f v
   FDB.atomicOp kbs (op vbs)
 
 -- | Helper to easily define an instance of 'TableSemigroup' for types that
 -- implement 'Message'. This is less efficient than using FDB atomic ops, but
 -- works with more types. 'v' should be a type that is guaranteed to have a
--- bounded serialized size in your use case -- at most, a few megabytes. If this
+-- bounded serialized size in your use case -- at most, 100 kB. If this
 -- is not the case, the pipeline could become permanently stuck, because
 -- individual transactions could exceed FoundationDB's per-transaction limits.
 -- For unbounded monoidal values such as sets, lists, etc., see TODO.
@@ -219,8 +218,8 @@ getTableRangeVia :: (Ord k, OrdTableKey k)
                  -> (ByteString -> v)
                  -> FDB.Transaction (Map k v)
 getTableRangeVia table pid start end parse = do
- let startK = SS.pack (aggrTableSS table) [FDB.Int pid, FDB.Bytes (toKeyBytes start)]
- let endK = SS.pack (aggrTableSS table) [FDB.Int pid, FDB.Bytes (toKeyBytes end)]
+ let startK = SS.pack (aggrTableSS table) [FDB.Int (fromIntegral pid), FDB.Bytes (toKeyBytes start)]
+ let endK = SS.pack (aggrTableSS table) [FDB.Int (fromIntegral pid), FDB.Bytes (toKeyBytes end)]
  let range = FDB.keyRangeInclusive startK endK
  let unwrapOuterBytes bs = case SS.unpack (aggrTableSS table) bs of
        Left err -> error $ "Error decoding table key in getTableRangeVia: " ++ show err
@@ -250,7 +249,7 @@ getBlocking db at k = do
                $ forM [0..(aggrTableNumPartitions at - 1)]
                $ \pid -> do
                  let kbs = SS.pack (aggrTableSS at)
-                                   [FDB.Int pid, FDB.Bytes (toKeyBytes k)]
+                                   [FDB.Int (fromIntegral pid), FDB.Bytes (toKeyBytes k)]
                  FDB.watch kbs
     Just v -> return (Right v)
   case result of
@@ -263,11 +262,14 @@ getBlocking db at k = do
                     $ \(_e :: AsyncCancelled) -> FDB.cancelFutureIO w
       waitAnyCancel asyncs >> getBlocking db at k
 
+-- | Look up the value in a table for a given key.
 getRow :: (TableKey k, TableSemigroup v) => AggrTable k v -> k -> FDB.Transaction (Maybe v)
 getRow table k = do
-  futs <- forM [0..(aggrTableNumPartitions table - 1)] $ \pid -> get table pid k
+  futs <- forM [0..(aggrTableNumPartitions table - 1)]
+               $ \pid -> get table pid k
   fold <$> traverse FDB.await futs
 
+-- | For ordered keys, looks up a range of key-values in a table.
 getRowRange :: (Ord k, OrdTableKey k, RangeAccessibleTable v, TableSemigroup v)
             => AggrTable k v
             -> k
@@ -276,8 +278,8 @@ getRowRange :: (Ord k, OrdTableKey k, RangeAccessibleTable v, TableSemigroup v)
             -- ^ End of the range, inclusive
             -> FDB.Transaction (Map k v)
 getRowRange table start end = do
-  maps <- forM [0..(aggrTableNumPartitions table - 1)] $ \pid ->
-    getTableRange table pid start end
+  maps <- forM [0..(aggrTableNumPartitions table - 1)]
+               $ \pid -> getTableRange table pid start end
   return $ unionsWith (<>) maps
 
 instance TableKey ByteString where
@@ -344,16 +346,6 @@ instance TableKey Bool where
     Right _ -> error "Expected Bool when decoding TableKey"
 
 instance OrdTableKey Bool
-
-instance TableKey UUID where
-  toKeyBytes x = FDB.encodeTupleElems [FDB.UUID w1 w2 w3 w4]
-    where (w1, w2, w3, w4) = UUID.toWords x
-  fromKeyBytes bs = case FDB.decodeTupleElems bs of
-    Left err -> error $ "Failed to decode UUID TableKey: " ++ show err
-    Right [FDB.UUID w1 w2 w3 w4] -> UUID.fromWords w1 w2 w3 w4
-    Right _ -> error "Expected UUID when decoding TableKey"
-
-instance OrdTableKey UUID
 
 instance TableKey (FDB.Versionstamp 'FDB.Complete) where
   toKeyBytes x = FDB.encodeTupleElems [FDB.CompleteVS x]
@@ -498,7 +490,7 @@ instance PutIntLE a => TableSemigroup (Sum a) where
 
 instance PutIntLE a => RangeAccessibleTable (Sum a) where
   getTableRange table pid start end =
-    getTableRangeVia table pid start end (Sum .runGet getIntLE . fromStrict)
+    getTableRangeVia table pid start end (Sum . runGet getIntLE . fromStrict)
 
 intToTupleBytes :: Integral a => a -> ByteString
 intToTupleBytes x = FDB.encodeTupleElems [FDB.Int (toInteger x)]

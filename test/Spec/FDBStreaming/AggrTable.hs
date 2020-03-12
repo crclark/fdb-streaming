@@ -24,7 +24,8 @@ import FoundationDB (Database, runTransaction)
 import qualified FoundationDB as FDB
 import FoundationDB.Layer.Subspace (Subspace, extend)
 import  qualified FoundationDB.Layer.Tuple as FDB
-import Test.Hspec (SpecWith, describe, it)
+import Test.Tasty
+import qualified Test.Tasty.QuickCheck as QC
 import Test.QuickCheck ((===), Arbitrary, Property, property)
 import Test.QuickCheck.Monadic (monadicIO, run)
 import Test.QuickCheck.Monadic as Monadic
@@ -33,19 +34,20 @@ import Test.QuickCheck.Instances.Text ()
 import Test.QuickCheck.Instances.UUID ()
 import Data.ByteString (ByteString)
 import Data.Data (Data)
+import Data.Either (fromRight)
 import GHC.Generics (Generic)
 import Data.Text (Text)
-import Data.UUID (UUID)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import Data.Monoid (Sum, All, Any)
+import Data.Persist (Persist)
+import qualified Data.Persist as Persist
 import Statistics.Monoid (MeanKBN, CalcMean, StatMonoid(..))
-import           Data.Store                     ( Store )
-import qualified Data.Store                    as Store
 import Data.Semigroup (Min(Min), Max(Max))
 import Data.Word
 import Data.Int
 import Numeric.Sum (KBNSum(..))
+import Spec.FDBStreaming.Util (extendRand)
 
 deriving via Double instance Arbitrary (Max Double)
 
@@ -77,16 +79,16 @@ propOrdTableKey :: (Ord k, OrdTableKey k) => k -> k -> Property
 propOrdTableKey k l =
   compare k l === compare (toKeyBytes k) (toKeyBytes l)
 
-ordTableKeyProps :: SpecWith ()
-ordTableKeyProps = describe "OrdTableKey" $ do
-  it "works for ByteString" $ binaryProperty $ propOrdTableKey @ByteString
-  it "works for Text" $ binaryProperty $ propOrdTableKey @Text
-  it "works for Integer" $ binaryProperty $ propOrdTableKey @Integer
-  it "works for Float" $ binaryProperty $ propOrdTableKey @Float
-  it "works for Double" $ binaryProperty $ propOrdTableKey @Double
-  it "works for Bool" $ binaryProperty $ propOrdTableKey @Bool
-  it "works for UUID" $ binaryProperty $ propOrdTableKey @UUID
-  it "works for 2-tuples" $ binaryProperty $ propOrdTableKey @(UUID, Double)
+ordTableKeyProps :: TestTree
+ordTableKeyProps = testGroup "OrdTableKey"
+  [ QC.testProperty "works for ByteString" $ binaryProperty $ propOrdTableKey @ByteString
+  , QC.testProperty "works for Text" $ binaryProperty $ propOrdTableKey @Text
+  , QC.testProperty "works for Integer" $ binaryProperty $ propOrdTableKey @Integer
+  , QC.testProperty "works for Float" $ binaryProperty $ propOrdTableKey @Float
+  , QC.testProperty "works for Double" $ binaryProperty $ propOrdTableKey @Double
+  , QC.testProperty "works for Bool" $ binaryProperty $ propOrdTableKey @Bool
+  , QC.testProperty "works for 2-tuples" $ binaryProperty $ propOrdTableKey @(Bool, Double)
+  ]
 
 propMappendTable :: forall v. (Eq v, TableSemigroup v)
                  => Subspace
@@ -96,7 +98,8 @@ propMappendTable :: forall v. (Eq v, TableSemigroup v)
                  -> v
                  -> Property
 propMappendTable ss db tableName v1 v2 = monadicIO $ do
-  let table = AggrTable (extend ss [FDB.Bytes tableName]) 2 :: AggrTable Bool v
+  ss' <- run $ extendRand ss
+  let table = AggrTable (extend ss' [FDB.Bytes tableName]) 2 :: AggrTable Bool v
   let k = True
   run $ runTransaction db $ AT.set table 0 k v1
   run $ runTransaction db $ mappendBatch table 0 [(k, v2)]
@@ -108,19 +111,20 @@ propMappendTable ss db tableName v1 v2 = monadicIO $ do
   (Just v4) <- run $ runTransaction db $ AT.getRow table k
   Monadic.assert (v4 == v1 <> v2 <> v1)
 
-mappendTableProps :: Subspace -> Database -> SpecWith ()
-mappendTableProps testSS db = describe "mappendTable" $ do
-  it "Works for (Sum Word32)" $ ternaryProperty (propMappendTable testSS db :: ByteString -> Sum Word32 -> Sum Word32 -> Property)
-  it "Works for (Sum Int64)" $ ternaryProperty (propMappendTable testSS db :: ByteString -> Sum Int64 -> Sum Int64 -> Property)
-  it "Works for (Max Double)" $ ternaryProperty (propMappendTable testSS db :: ByteString -> Max Double -> Max Double -> Property)
-  it "Works for (Max Int32)" $ ternaryProperty (propMappendTable testSS db :: ByteString -> Max Int32 -> Max Int32 -> Property)
-  it "Works for (Max Int64)" $ ternaryProperty (propMappendTable testSS db :: ByteString -> Max Int64 -> Max Int64 -> Property)
-  it "Works for (Max Word32)" $ ternaryProperty (propMappendTable testSS db :: ByteString -> Max Word32 -> Max Word32 -> Property)
-  it "Works for (Min Float)" $ ternaryProperty (propMappendTable testSS db :: ByteString -> Min Float -> Min Float -> Property)
-  it "Works for (Min Int32)" $ ternaryProperty (propMappendTable testSS db :: ByteString -> Min Int32 -> Min Int32 -> Property)
-  it "Works for (Min Word32)" $ ternaryProperty (propMappendTable testSS db :: ByteString -> Min Word32 -> Min Word32 -> Property)
-  it "Works for Any" $ ternaryProperty (propMappendTable testSS db :: ByteString -> Any -> Any -> Property)
-  it "Works for All" $ ternaryProperty (propMappendTable testSS db :: ByteString -> All -> All -> Property)
+mappendTableProps :: Subspace -> Database -> TestTree
+mappendTableProps testSS db = testGroup "mappendTable"
+  [ QC.testProperty "Works for (Sum Word32)" $ ternaryProperty (propMappendTable testSS db :: ByteString -> Sum Word32 -> Sum Word32 -> Property)
+  , QC.testProperty "Works for (Sum Int64)" $ ternaryProperty (propMappendTable testSS db :: ByteString -> Sum Int64 -> Sum Int64 -> Property)
+  , QC.testProperty "Works for (Max Double)" $ ternaryProperty (propMappendTable testSS db :: ByteString -> Max Double -> Max Double -> Property)
+  , QC.testProperty "Works for (Max Int32)" $ ternaryProperty (propMappendTable testSS db :: ByteString -> Max Int32 -> Max Int32 -> Property)
+  , QC.testProperty "Works for (Max Int64)" $ ternaryProperty (propMappendTable testSS db :: ByteString -> Max Int64 -> Max Int64 -> Property)
+  , QC.testProperty "Works for (Max Word32)" $ ternaryProperty (propMappendTable testSS db :: ByteString -> Max Word32 -> Max Word32 -> Property)
+  , QC.testProperty "Works for (Min Float)" $ ternaryProperty (propMappendTable testSS db :: ByteString -> Min Float -> Min Float -> Property)
+  , QC.testProperty "Works for (Min Int32)" $ ternaryProperty (propMappendTable testSS db :: ByteString -> Min Int32 -> Min Int32 -> Property)
+  , QC.testProperty "Works for (Min Word32)" $ ternaryProperty (propMappendTable testSS db :: ByteString -> Min Word32 -> Min Word32 -> Property)
+  , QC.testProperty "Works for Any" $ ternaryProperty (propMappendTable testSS db :: ByteString -> Any -> Any -> Property)
+  , QC.testProperty "Works for All" $ ternaryProperty (propMappendTable testSS db :: ByteString -> All -> All -> Property)
+  ]
 
 propTableRange :: forall v . (TableSemigroup v, RangeAccessibleTable v, Eq v)
                => Subspace
@@ -129,7 +133,8 @@ propTableRange :: forall v . (TableSemigroup v, RangeAccessibleTable v, Eq v)
                -> v
                -> Property
 propTableRange ss db tableName v = monadicIO $ do
-  let table = AggrTable (extend ss [FDB.Bytes tableName]) 2 :: AggrTable Integer v
+  ss' <- run $ extendRand ss
+  let table = AggrTable (extend ss' [FDB.Bytes tableName]) 2 :: AggrTable Integer v
   forM_ [0..10] $ \i -> run $ runTransaction db $ AT.set table 0 i v
   result <- run $ runTransaction db $ AT.getTableRange table 0 0 10
   let expected = Map.fromList [(i,v) | i <- [0..10]]
@@ -141,14 +146,15 @@ propTableRange ss db tableName v = monadicIO $ do
   let expected2 = Map.fromList [(i, v <> v) | i <- [0..10]]
   Monadic.assert (result2 == expected2)
 
-tableRangeProps :: Subspace -> Database -> SpecWith ()
-tableRangeProps testSS db = describe "getTableRange" $ do
-  it "Works for (Sum Word32)" $ binaryProperty (propTableRange testSS db :: ByteString -> Sum Word32 -> Property)
-  it "Works for (Sum Int32)" $ binaryProperty (propTableRange testSS db :: ByteString -> Sum Int32 -> Property)
-  it "Works for Any" $ binaryProperty (propTableRange testSS db :: ByteString -> Any -> Property)
-  it "Works for All" $ binaryProperty (propTableRange testSS db :: ByteString -> All -> Property)
-  it "Works for (Max Double)" $ binaryProperty (propTableRange testSS db :: ByteString -> Max Double -> Property)
-  it "Works for (Min Int64)" $ binaryProperty (propTableRange testSS db :: ByteString -> Min Int64 -> Property)
+tableRangeProps :: Subspace -> Database -> TestTree
+tableRangeProps testSS db = testGroup "getTableRange"
+  [ QC.testProperty "Works for (Sum Word32)" $ binaryProperty (propTableRange testSS db :: ByteString -> Sum Word32 -> Property)
+  , QC.testProperty "Works for (Sum Int32)" $ binaryProperty (propTableRange testSS db :: ByteString -> Sum Int32 -> Property)
+  , QC.testProperty "Works for Any" $ binaryProperty (propTableRange testSS db :: ByteString -> Any -> Property)
+  , QC.testProperty "Works for All" $ binaryProperty (propTableRange testSS db :: ByteString -> All -> Property)
+  , QC.testProperty "Works for (Max Double)" $ binaryProperty (propTableRange testSS db :: ByteString -> Max Double -> Property)
+  , QC.testProperty "Works for (Min Int64)" $ binaryProperty (propTableRange testSS db :: ByteString -> Min Int64 -> Property)
+  ]
 
 newtype Mean = Mean { unMean :: MeanKBN }
   deriving (Eq, Data, Show, Generic)
@@ -157,17 +163,17 @@ newtype Mean = Mean { unMean :: MeanKBN }
   deriving CalcMean via MeanKBN
 
 deriving instance Generic KBNSum
-deriving instance Store KBNSum
-deriving instance Store MeanKBN
-deriving instance Store Mean
+deriving instance Persist KBNSum
+deriving instance Persist MeanKBN
+deriving instance Persist Mean
 
 instance Real a => StatMonoid Mean a where
   addValue (Mean m) a = Mean (addValue m a)
   singletonMonoid a = Mean (singletonMonoid a)
 
 instance Message Mean where
-  toMessage = Store.encode
-  fromMessage = Store.decodeEx
+  toMessage = Persist.encode
+  fromMessage = fromRight (error "Failed to decode Mean") . Persist.decode
 
 instance TableSemigroup Mean where
   mappendBatch = mappendMessageBatch
@@ -176,7 +182,8 @@ instance TableSemigroup Mean where
 
 propNonAtomicSemigroup :: Real v => Subspace -> Database -> ByteString -> [v] -> Property
 propNonAtomicSemigroup ss db tableName vs = monadicIO $ do
-  let table = AggrTable (extend ss [FDB.Bytes tableName]) 2 :: AggrTable () Mean
+  ss' <- run $ extendRand ss
+  let table = AggrTable (extend ss' [FDB.Bytes tableName]) 2 :: AggrTable () Mean
   let kvs = map (\v -> ((), singletonMonoid v)) vs
   run $ runTransaction db $ mappendBatch table 0 kvs
   run $ runTransaction db $ mappendBatch table 1 kvs
@@ -187,13 +194,15 @@ propNonAtomicSemigroup ss db tableName vs = monadicIO $ do
     run $ putStrLn $ "got: " ++ show result
   Monadic.assert (expectedResult == (result :: Mean))
 
-nonAtomicSemigroupProps :: Subspace -> Database -> SpecWith ()
-nonAtomicSemigroupProps testSS db = describe "non-atomic table helper functions" $ do
-  it "Works for Kahan Mean" $ binaryProperty (propNonAtomicSemigroup testSS db :: ByteString -> [Integer] -> Property)
+nonAtomicSemigroupProps :: Subspace -> Database -> TestTree
+nonAtomicSemigroupProps testSS db = testGroup "non-atomic table helper functions"
+  [QC.testProperty "Works for Kahan Mean" $ binaryProperty (propNonAtomicSemigroup testSS db :: ByteString -> [Integer] -> Property)
+  ]
 
-tableProps :: Subspace -> Database -> SpecWith ()
-tableProps testSS db = do
-  nonAtomicSemigroupProps testSS db
-  ordTableKeyProps
-  mappendTableProps testSS db
-  tableRangeProps testSS db
+tableProps :: Subspace -> Database -> TestTree
+tableProps testSS db = testGroup "AggrTable"
+  [ nonAtomicSemigroupProps testSS db
+  , ordTableKeyProps
+  , mappendTableProps testSS db
+  , tableRangeProps testSS db
+  ]
