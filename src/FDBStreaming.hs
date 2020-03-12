@@ -69,8 +69,8 @@
 --   to the time it flows to the end of the pipeline) is generally on the order
 --   of seconds.
 -- * When storing unbounded stream data in FoundationDB, FDBStreaming performance
---   is bound by FoundationDB. Expect hundreds of thousands of messages per
---   second. Maybe low millions at best. See <https://apple.github.io/foundationdb/performance.html FoundationDB's docs>
+--   is bound by FoundationDB. Expect tens to low hundreds of thousands of messages per
+--   second for the 'Topic' data structure, and perhaps millions for the 'AggrTable' structure. See <https://apple.github.io/foundationdb/performance.html FoundationDB's docs>
 --   for more information about how performance scales. However, if you are only
 --   storing monoidal aggregations in FoundationDB and reading data from another
 --   data source (Kafka, S3, etc.), or are otherwise aggressively filtering or
