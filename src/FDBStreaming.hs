@@ -142,7 +142,8 @@
 -- > tweetPipeline :: MonadStream m => Stream Tweet -> m ()
 -- > tweetPipeline tweets = do
 -- >   -- 'fmap' is used to register lazy operations on streams. This has the
--- >   -- benefit of avoiding uninteresting intermediate data in FoundationDB, but
+-- >   -- benefit of avoiding the storage of uninteresting intermediate data in
+-- >   -- FoundationDB, but
 -- >   -- each downstream consumers of tweets' will compute 'preprocess' once per
 -- >   -- input tweet.
 -- >   let tweets' = fmap preprocess tweets
@@ -274,6 +275,7 @@ import FDBStreaming.Topic
   )
 import qualified FDBStreaming.Topic as Topic
 import qualified FDBStreaming.Topic.Constants as C
+import FDBStreaming.Util (logErrors)
 import FDBStreaming.Watermark
   ( Watermark,
     WatermarkSS,
@@ -1526,15 +1528,6 @@ aggregateStep
     let kvs = Seq.fromList [(k, toAggr v) | v <- toList msgs, k <- toKeys v]
     AT.mappendBatch table pid kvs
     return (length msgs, kvs)
-
-logErrors :: String -> IO () -> IO ()
-logErrors ident =
-  flip
-    catches
-    [ Handler \(e :: SomeException) -> do
-        tid <- myThreadId
-        logError (showText ident <> " on thread " <> showText tid <> " caught " <> showText e)
-    ]
 
 -- | Runs a stream processing job forever. Blocks indefinitely.
 runJob :: JobConfig -> (forall m. MonadStream m => m a) -> IO ()

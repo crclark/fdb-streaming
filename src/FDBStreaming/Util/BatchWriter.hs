@@ -32,6 +32,7 @@ module FDBStreaming.Util.BatchWriter (
 import Data.Either (partitionEithers)
 import Data.Traversable (for)
 import Data.Foldable (for_)
+import Data.Int (Int64)
 import Control.Monad (forever)
 import Control.Monad.IO.Class (liftIO)
 import qualified FoundationDB as FDB
@@ -44,10 +45,11 @@ import Control.Concurrent.STM.TMVar (TMVar, putTMVar, newEmptyTMVarIO, takeTMVar
 import Data.ByteString (ByteString)
 import Data.Maybe (fromMaybe, maybe)
 import System.Clock (Clock(Monotonic), getTime, toNanoSecs, diffTimeSpec)
+import FDBStreaming.Util (currMillisSinceEpoch, logErrors, withOneIn)
 
 -- | The result of a batch write request.
 data BatchWriteResult =
-  -- | The write succeeded
+  -- | The write succeeded.
   Success
   -- | The write was not made, because a write with the same idempotency key
   -- was already committed in the past.
@@ -101,11 +103,31 @@ data BatchWriterConfig = BatchWriterConfig
   , maxQueueSize :: Word
     -- | Maximum number of writes to commit in one batch.
   , maxBatchSize :: Word
+    -- | Minimum number of seconds to store an idempotency key after it has
+    -- first been seen. Set this so that it is unlikely or impossible that your
+    -- application will send duplicate writes this many seconds apart. Larger
+    -- values will increase the storage used in FoundationDB for idempotency
+    -- keys.
+    --
+    -- Note: To ensure that the implementation is scalable and efficient, keys
+    -- may be remembered for longer than this time period in practice. This
+    -- setting is a lower bound.
+    --
+    -- Warning: changing this value for a 'BatchWriter' that has already been
+    -- running in a given subspace will cause all past idempotency keys to be
+    -- forgotten.
+  , minIdempotencyMemoryDurationSeconds :: Word
+    -- | Probabilistically attempt to delete idempotency keys in FDB older than
+    -- minIdempotencyMemoryDurationSeconds approximately every
+    -- idempotencyCleanupPeriod batches.
+  , idempotencyCleanupPeriod :: Word
   } deriving (Eq, Show)
 
 defaultBatchWriterConfig :: BatchWriterConfig
-defaultBatchWriterConfig = BatchWriterConfig 300 10_000 1000 500
+defaultBatchWriterConfig = BatchWriterConfig 300 10_000 1000 500 (60*60*24) 500
 
+-- | Handle to an asynchronous thread that periodically commits batches of
+-- writes to FoundationDB.
 data BatchWriter a = BatchWriter
   { batchWriterConfig :: BatchWriterConfig
   , queue :: TBQueue (BatchWriteSpec a)
@@ -121,12 +143,48 @@ batchWriterAsync = _batchWriterAsync
 -- | Left -> new. Right -> already written.
 type IdemCheck a = Either (BatchWriteSpec a) (BatchWriteSpec a)
 
-pushIdemCheck :: FDB.Subspace
+mkIdemSS :: FDB.Subspace -> Int64 -> FDB.Subspace
+mkIdemSS ss i = FDB.extend ss [FDB.Bytes "id", FDB.Int (fromIntegral i)]
+
+idemSlot :: BatchWriterConfig -> Int64 -> IO Int64
+idemSlot BatchWriterConfig{minIdempotencyMemoryDurationSeconds} n = do
+  t <- currMillisSinceEpoch
+  let d = fromIntegral minIdempotencyMemoryDurationSeconds
+  let slot = t - (t `mod` d) + n*d
+  return slot
+
+lastIdemSS :: BatchWriterConfig -> FDB.Subspace -> IO FDB.Subspace
+lastIdemSS cfg ss = do
+  slot <- idemSlot cfg (-1)
+  return (mkIdemSS ss slot)
+
+currIdemSS :: BatchWriterConfig -> FDB.Subspace -> IO FDB.Subspace
+currIdemSS cfg ss = do
+  slot <- idemSlot cfg 0
+  return (mkIdemSS ss slot)
+
+nextIdemSS :: BatchWriterConfig -> FDB.Subspace -> IO FDB.Subspace
+nextIdemSS cfg ss = do
+  slot <- idemSlot cfg 1
+  return (mkIdemSS ss slot)
+
+cleanupOldIdemKeys :: BatchWriterConfig -> FDB.Subspace -> FDB.Transaction ()
+cleanupOldIdemKeys cfg ss = do
+  let totalRange = FDB.subspaceRange ss
+  lastSS <- liftIO $ lastIdemSS cfg ss
+  let lastSlotRange = FDB.subspaceRange lastSS
+  kBeginF <- FDB.getKey (FDB.rangeBegin totalRange)
+  kEnd <- FDB.getKey (FDB.rangeEnd lastSlotRange) >>= FDB.await
+  kBegin <- FDB.await kBeginF
+  FDB.clearRange kBegin kEnd
+
+pushIdemCheck :: BatchWriterConfig
+              -> FDB.Subspace
               -> TBQueue (FDB.Future (IdemCheck a))
               -> BatchWriteSpec a
               -> FDB.Transaction ()
-pushIdemCheck ss q w = do
-  let ss' = FDB.extend ss [FDB.Bytes "id"]
+pushIdemCheck cfg ss q w = do
+  ss' <- liftIO $ currIdemSS cfg ss
   let k = FDB.pack ss' [FDB.Bytes $ idempotencyKey (batchWriteSpec w)]
   res <- FDB.get k
   liftIO
@@ -134,10 +192,14 @@ pushIdemCheck ss q w = do
     $ writeTBQueue q
     $ fmap (maybe (Left w) (const $ Right w)) res
 
-writeIdemKeys :: FDB.Subspace -> [BatchWriteSpec a] -> FDB.Transaction ()
-writeIdemKeys ss xs = do
-  let ss' = FDB.extend ss [FDB.Bytes "id"]
-  for_ xs $ \x -> do
+writeIdemKeys :: BatchWriterConfig
+              -> FDB.Subspace
+              -> [BatchWriteSpec a]
+              -> FDB.Transaction ()
+writeIdemKeys cfg ss xs = do
+  ssCurr <- liftIO $ currIdemSS cfg ss
+  ssNext <- liftIO $ nextIdemSS cfg ss
+  for_ xs $ \x -> for_ [ssCurr, ssNext] $ \ss' -> do
     let k = FDB.pack ss' [FDB.Bytes $ idempotencyKey (batchWriteSpec x)]
     FDB.set k ""
 
@@ -147,9 +209,6 @@ getIdemLookupResults q = do
   xs <- liftIO $ atomically $ flushTBQueue q
   xs' <- for xs FDB.await
   return $ partitionEithers xs'
-
--- TODO: exceptions could theoretically kill the batch writer, causing further
--- writes to hang forever. That would be a bummer.
 
 -- | General outline of how this works: create a transaction, then start pulling
 -- items from the queue of write requests in a loop. For each 'BatchWrite'
@@ -169,13 +228,18 @@ batchWriterLoop :: FDB.Database
                 -> FDB.Subspace
                 -> ([a] -> FDB.Transaction ())
                 -> IO ()
-batchWriterLoop db BatchWriterConfig{..} inQ ss f = forever $ do
+batchWriterLoop db cfg@BatchWriterConfig{..} inQ ss f = forever $ logErrors ("batch writer: " ++ show ss) $ do
+  -- Before anything else, try to clean up old keys
+  withOneIn idempotencyCleanupPeriod
+    $ FDB.runTransaction db
+    $ cleanupOldIdemKeys cfg ss
+
   -- stores pending idempotency key lookup futures.
   idemLookups <- newTBQueueIO (fromIntegral maxBatchSize)
   -- stores all items received in this iteration.
   allRcvd <- newTBQueueIO (fromIntegral maxBatchSize)
   startTime <- getTime Monotonic
-  res <- FDB.runTransactionWithConfig' cfg db (go startTime 0 0 idemLookups allRcvd)
+  res <- FDB.runTransactionWithConfig' tCfg db (go startTime 0 0 idemLookups allRcvd)
   case res of
     Left err -> do
       xs <- atomically $ flushTBQueue allRcvd
@@ -191,14 +255,14 @@ batchWriterLoop db BatchWriterConfig{..} inQ ss f = forever $ do
         then do
           (toWrite, alreadyWritten) <- getIdemLookupResults idemLookups
           f (fmap (batchWriteItem . batchWriteSpec) toWrite)
-          writeIdemKeys ss toWrite
+          writeIdemKeys cfg ss toWrite
           return (toWrite, alreadyWritten)
         else
           liftIO (atomically $ tryReadTBQueue inQ) >>= \case
             Nothing ->
               go startTime currBytes currBatchSize idemLookups allRcvd
             Just x -> do
-              pushIdemCheck ss idemLookups x
+              pushIdemCheck cfg ss idemLookups x
               liftIO $ atomically $ writeTBQueue allRcvd x
               go startTime
                  (currBytes + fromMaybe 0 (writeSizeHint (batchWriteSpec x)))
@@ -215,7 +279,7 @@ batchWriterLoop db BatchWriterConfig{..} inQ ss f = forever $ do
               || currBytes >= maxBatchBytes
               || currBatchSize >= maxBatchSize)
 
-    cfg = FDB.TransactionConfig
+    tCfg = FDB.TransactionConfig
             { -- Not idempotent because of the side effects of reading/writing
               -- queues. The idempotence of this entire process happens at a
               -- higher level of abstraction.
