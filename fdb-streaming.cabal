@@ -25,6 +25,7 @@ library
       FDBStreaming.Message,
       FDBStreaming.Stream
       FDBStreaming.Stream.Internal,
+      FDBStreaming.StreamStep.Internal,
       FDBStreaming.TaskLease,
       FDBStreaming.TaskRegistry,
       FDBStreaming.Testing,
