@@ -294,9 +294,10 @@ topology input = do
   orderStatusTable <- aggregate "order_table" grouped snd
   return orderStatusTable
 
-printStats :: Database -> Subspace -> IO ()
-printStats db ss = catches (do
-  tcs <- listExistingTopics db ss
+printStats :: Database -> Subspace -> Word8 -> IO ()
+printStats db ss numPartitions = catches (do
+  tcs <- map (\t -> (t :: Topic) {numPartitions = numPartitions})
+         <$> listExistingTopics db ss
   ts  <- forConcurrently tcs $ \tc -> do
     beforeT <- getTime Monotonic
     before <- runTransaction db $ withSnapshot $ getTopicCount tc
@@ -382,7 +383,7 @@ mainLoop db ss Args{ generatorNumThreads
                                 (coerce generatorWatchResults)
   void $ forkIO $ latencyReportLoop stats
   forkIO $ forever $ do
-    when (coerce printTopicStats) $ printStats db ss
+    when (coerce printTopicStats) $ printStats db ss (coerce numPartitions)
     threadDelay 1000000
   forkIO $ forever $ do
     printWatermarkLag db (topicWatermarkSS $ fromJust $ streamTopic input) (AT.aggrTableWatermarkSS table)
