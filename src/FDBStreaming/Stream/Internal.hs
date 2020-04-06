@@ -13,6 +13,8 @@ module FDBStreaming.Stream.Internal
     streamConsumerCheckpointSS,
     getStreamWatermark,
     customStream,
+    setStreamWatermarkByTopic,
+    streamFromTopic
   )
 where
 
@@ -26,7 +28,7 @@ import FDBStreaming.JobConfig (JobConfig (jobConfigSS), JobSubspace)
 import FDBStreaming.Topic
   ( PartitionId,
     ReaderName,
-    Topic,
+    Topic
   )
 import qualified FDBStreaming.Topic as Topic
 import qualified FDBStreaming.Topic.Constants as C
@@ -35,6 +37,7 @@ import FDBStreaming.Watermark
     WatermarkSS,
     getCurrentWatermark,
     setWatermark,
+    topicWatermarkSS
   )
 import FoundationDB as FDB
   ( Transaction,
@@ -244,3 +247,34 @@ getStreamWatermark :: JobSubspace -> Stream a -> Transaction (Maybe Watermark)
 getStreamWatermark jobSS stream = case streamWatermarkSS stream of
   Nothing -> return Nothing
   Just wmSS -> getCurrentWatermark (wmSS jobSS) >>= await
+
+-- | sets the watermark subspace to this stream to the watermark subspace of
+-- streamTopic. The
+-- step writing to the topic must actually have a watermarking function (or
+-- default watermark) set. Don't export this; too confusing for users.
+setStreamWatermarkByTopic :: Stream a -> Stream a
+setStreamWatermarkByTopic stream =
+  case streamTopic stream of
+    Just tc ->
+      stream {streamWatermarkSS = Just $ \_ -> topicWatermarkSS tc}
+    Nothing -> error "setStreamWatermarkByTopic: stream is not a topic"
+
+-- | Create a stream from a topic. Assumes the topic is not watermarked. If it
+-- is and you want to propagate watermarks downstream, the caller must call
+-- 'setStreamWatermarkByTopic' on the result.
+--
+-- You only need this function if you are trying to access a topic that was
+-- created by another pipeline, or created manually.
+streamFromTopic :: Topic -> StreamName -> Stream ByteString
+streamFromTopic tc streamName =
+  Stream
+    { streamReadAndCheckpoint = \_cfg rn pid _chkptSS n _state -> do
+        msgs <- Topic.readNAndCheckpoint' tc pid rn n
+        return $ fmap (\(vs, x) -> (Just vs, x)) msgs,
+      streamMinReaderPartitions = fromIntegral $ Topic.numPartitions tc,
+      streamWatermarkSS = Nothing,
+      streamTopic = Just tc,
+      streamName = streamName,
+      setUpState = \_ _ _ _ -> return (),
+      destroyState = const $ return ()
+    }

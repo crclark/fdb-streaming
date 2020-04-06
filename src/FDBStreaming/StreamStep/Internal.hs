@@ -12,7 +12,12 @@ import FDBStreaming.Message(Message)
 import FDBStreaming.Stream.Internal(Stream)
 import FDBStreaming.Topic (Topic)
 import qualified FDBStreaming.AggrTable as AT
-import FDBStreaming.Watermark (Watermark)
+import FDBStreaming.Watermark
+  ( Watermark,
+    WatermarkBy(CustomWatermark),
+    producesWatermark,
+    isDefaultWatermark
+  )
 
 import Data.ByteString (ByteString)
 import Data.Sequence (Seq)
@@ -37,7 +42,8 @@ data StreamStepConfig
   = StreamStepConfig
       { -- | Specifies how many partitions the output stream or table should have.
         -- This determines how many threads downstream steps will need in order to
-        -- consume the output. This overrides the default value
+        -- consume the output. This overrides the default value specified in
+        -- 'JobConfig'.
         stepOutputPartitions :: Maybe Word8,
         stepBatchSize :: Maybe Word16
       }
@@ -47,6 +53,9 @@ defaultStreamStepConfig :: StreamStepConfig
 defaultStreamStepConfig = StreamStepConfig Nothing Nothing
 
 data StreamStep outMsg runResult where
+  -- TODO: can WriteOnly be merged with Stream by making instream optional? Or
+  -- by creating a fake Stream that always returns ()?
+  -- Do something similar for the table processor?
   -- | A step that writes to a topic. This would usually be used for testing and
   -- such, since it doesn't have any checkpointing mechanism.
   WriteOnlyProcessor ::
@@ -61,6 +70,11 @@ data StreamStep outMsg runResult where
     Message b =>
     { streamProcessorInStream :: Stream a,
       streamProcessorWatermarkBy :: WatermarkBy b,
+      --TODO: we should probably move all the logic in 'pipeStep' into
+      -- this function, with a default value of StreamProcessor for 'pipe'. Then
+      -- add a function to compose more behavior onto this function. There's no
+      -- reason I can see that pipeStep and this callback both need to exist.
+      -- Same with the other constructors.
       streamProcessorProcessBatch ::
         Seq (Maybe (Versionstamp 'Complete), a) ->
         Transaction (Seq b),
@@ -70,12 +84,14 @@ data StreamStep outMsg runResult where
       (Stream b)
   -- TODO: we don't really need this case. oneToOneJoin could just internally
   -- create two StreamProcessors and the user would never know the difference.
+  -- Well, almost. 'oneToOneJoin'' returns this StreamStep so the user can
+  -- watermark it and so forth.
   Stream2Processor ::
     Message b =>
     { stream2ProcessorInStreamL :: Stream a1,
       stream2ProcessorInStreamR :: Stream a2,
       stream2ProcessorWatermarkBy :: WatermarkBy b,
-      -- TODO: passing in the Topic so that the step knows
+      -- TODO: passing in the output Topic so that the step knows
       -- where to write its state. Probably all user-provided
       -- batch processing callbacks should take a subspace that they
       -- can use to write per-processor state. That way, deleting a
@@ -172,39 +188,5 @@ triggerBy :: ((Versionstamp 'Complete, v, [k]) -> Transaction [(k,aggr)])
           -> StreamStep v (k, aggr) (AT.AggrTable k aggr)
 triggerBy f tbp@(TableProcessor{}) = TriggeringTableProcessor tbp f
 -}
-
--- | Specifies how the output stream of a stream processor should be
--- watermarked.
-data WatermarkBy a
-  = -- | Watermark the output stream by taking the minimum checkpoint across
-    -- all partitions of all input streams, getting the watermark of all those
-    -- streams as of those checkpoints, and persisting that as the watermark at
-    -- the current database version. Because this logic is somewhat expensive,
-    -- it is not run transactionally with the stream processor's core logic.
-    -- Instead, it is executed periodically.
-    DefaultWatermark
-  | -- | A function that assigns a watermark to the output of a stream processor.
-    --
-    -- This function will be called on only one output event for each batch of events
-    -- processed.
-    --
-    -- If this function returns a watermark that is less than the watermark it
-    -- returned on a previous invocation for the stream, its output will be
-    -- ignored, because watermarks must be monotonically increasing.
-    --
-    -- This watermark will be applied transactionally with each batch processed.
-    CustomWatermark (a -> Transaction Watermark)
-  | -- | Do not watermark the output stream. This can be used for batch inputs,
-    -- or in cases where there are no concerns about the completeness of data
-    -- in aggregation tables. Naturally, this option is most performant.
-    NoWatermark
-
-producesWatermark :: WatermarkBy a -> Bool
-producesWatermark NoWatermark = False
-producesWatermark _ = True
-
-isDefaultWatermark :: WatermarkBy a -> Bool
-isDefaultWatermark DefaultWatermark = True
-isDefaultWatermark _ = False
 
 data TriggerBy --TODO: decide what this needs to be

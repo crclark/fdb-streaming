@@ -237,7 +237,6 @@ import qualified Control.Monad.Reader as Reader
 import Control.Monad.Reader (MonadReader, ReaderT)
 import qualified Control.Monad.State.Strict as State
 import Control.Monad.State.Strict (MonadState, StateT)
-import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BS8
 import Data.Foldable (for_, toList)
 import Data.Maybe (fromMaybe)
@@ -255,7 +254,15 @@ import FDBStreaming.Joins
     write1to1JoinData,
   )
 import FDBStreaming.Message (Message (fromMessage, toMessage))
-import FDBStreaming.Stream.Internal (Stream (Stream, destroyState, setUpState, streamMinReaderPartitions, streamName, streamReadAndCheckpoint, streamTopic, streamWatermarkSS), StreamName, StreamReadAndCheckpoint, getStreamWatermark, isStreamWatermarked, streamConsumerCheckpointSS)
+import FDBStreaming.Stream.Internal
+  (Stream (Stream, streamMinReaderPartitions, streamTopic, streamWatermarkSS),
+   StreamName,
+   StreamReadAndCheckpoint,
+   getStreamWatermark,
+   isStreamWatermarked,
+   streamConsumerCheckpointSS,
+   streamFromTopic,
+   setStreamWatermarkByTopic)
 import FDBStreaming.StreamStep.Internal
   ( StreamStep(WriteOnlyProcessor,
                StreamProcessor,
@@ -291,7 +298,6 @@ import FDBStreaming.StreamStep.Internal
     StepName,
     GroupedBy(GroupedBy),
     groupedByInStream,
-    WatermarkBy(DefaultWatermark, CustomWatermark, NoWatermark),
     isStepDefaultWatermarked)
 import FDBStreaming.TaskLease (TaskName (TaskName), secondsSinceEpoch)
 import FDBStreaming.TaskRegistry as TaskRegistry
@@ -307,7 +313,6 @@ import FDBStreaming.Topic
     getCheckpoints,
     makeTopic,
     randPartition,
-    readNAndCheckpoint',
     writeTopic',
   )
 import qualified FDBStreaming.Topic as Topic
@@ -315,8 +320,10 @@ import qualified FDBStreaming.Topic.Constants as C
 import FDBStreaming.Util (logErrors)
 import FDBStreaming.Watermark
   ( WatermarkSS,
+    WatermarkBy(DefaultWatermark, CustomWatermark, NoWatermark),
     getWatermark,
     setWatermark,
+    topicWatermarkSS
   )
 import qualified FoundationDB as FDB
 import FoundationDB (Transaction, await, withSnapshot)
@@ -408,11 +415,6 @@ with the existing DB? What happens if I do a rolling deployment, so some are
 still running the old version of the code?
 
 -}
-
--- | The watermark subspace for this topic. This can be used to manually get
--- and set the watermark on a topic, outside of the stream processing system.
-topicWatermarkSS :: Topic -> WatermarkSS
-topicWatermarkSS = flip FDB.extend [FDB.Bytes "wm"] . topicCustomMetadataSS
 
 -- | Returns the subspace in which the given stream's watermarks are stored.
 watermarkSS :: JobSubspace -> Stream a -> Maybe WatermarkSS
@@ -602,7 +604,7 @@ existing tc =
 -- downstream from this stream.
 existingWatermarked :: (Message a, MonadStream m) => Topic -> m (Stream a)
 existingWatermarked tc =
-  fmap (setStreamWatermarkByTopic tc) (existing tc)
+  fmap setStreamWatermarkByTopic (existing tc)
 
 -- TODO: if this handler type took a batch at a time,
 -- it would be easier to optimize -- imagine if it were to
@@ -781,38 +783,10 @@ makeStream stepName streamName step = do
   return
     $ fmap fromMessage
     $ ( if stepProducesWatermark step
-          then setStreamWatermarkByTopic streamTopic
+          then setStreamWatermarkByTopic
           else id
       )
     $ streamFromTopic streamTopic streamName
-
--- | sets the watermark subspace to this stream to the watermark subspace of
--- the given topic. The given topic must be the topic in streamTopic, and
--- the step writing to the topic must actually have a watermarking function (or
--- default watermark) set. Don't export this; too confusing for users.
-setStreamWatermarkByTopic :: Topic -> Stream a -> Stream a
-setStreamWatermarkByTopic tc stream =
-  stream {streamWatermarkSS = Just $ \_ -> topicWatermarkSS tc}
-
--- | Create a stream from a topic. Assumes the topic is not watermarked. If it
--- is and you want to propagate watermarks downstream, the caller must call
--- 'setStreamWatermarkByTopic' on the result.
---
--- You only need this function if you are trying to access a topic that was
--- created by another pipeline, or created manually.
-streamFromTopic :: Topic -> StreamName -> Stream ByteString
-streamFromTopic tc streamName =
-  Stream
-    { streamReadAndCheckpoint = \_cfg rn pid _chkptSS n _state -> do
-        msgs <- readNAndCheckpoint' tc pid rn n
-        return $ fmap (\(vs, x) -> (Just vs, x)) msgs,
-      streamMinReaderPartitions = (fromIntegral $ Topic.numPartitions tc),
-      streamWatermarkSS = Nothing,
-      streamTopic = Just tc,
-      streamName = streamName,
-      setUpState = \_ _ _ _ -> return (),
-      destroyState = const $ return ()
-    }
 
 forEachPartition :: Monad m => Stream a -> (PartitionId -> m ()) -> m ()
 forEachPartition s = for_ [0 .. fromIntegral $ streamMinReaderPartitions s - 1]
@@ -880,14 +854,14 @@ doForSeconds n f = do
 mkTaskName :: StepName -> PartitionId -> TaskName
 mkTaskName sn pid = TaskName $ BS8.pack (show sn ++ "_" ++ show pid)
 
-runCustomWatermark :: WatermarkBy a -> Transaction (Int, Seq a) -> Transaction (Int, Seq a)
-runCustomWatermark (CustomWatermark f) t = do
+runCustomWatermark :: WatermarkSS -> WatermarkBy a -> Transaction (Int, Seq a) -> Transaction (Int, Seq a)
+runCustomWatermark wmSS (CustomWatermark f) t = do
   (n, xs) <- t
   case xs of
-    (_ Seq.:|> x) -> void $ f x
+    (_ Seq.:|> x) -> f x >>= setWatermark wmSS
     _ -> return ()
   return (n, xs)
-runCustomWatermark _ t = t
+runCustomWatermark _ _ t = t
 
 outputStreamAndTopic ::
   (HasJobConfig m, Message c, Monad m) =>
@@ -903,7 +877,7 @@ outputStreamAndTopic stepName step = do
           (getStepNumPartitions jc (getStepConfig step))
   let stream =
         ( if stepProducesWatermark step
-            then setStreamWatermarkByTopic streamTopic
+            then setStreamWatermarkByTopic
             else id
         )
           $ streamFromTopic streamTopic stepName
@@ -925,7 +899,7 @@ instance MonadStream LeaseBasedStreamWorker where
               $ void
               $ throttleByErrors metrics sn
               $ runStreamTxn jobConfigDB
-              $ runCustomWatermark writeOnlyWatermarkBy
+              $ runCustomWatermark (topicWatermarkSS outTopic) writeOnlyWatermarkBy
               $ produceStep (getMsgsPerBatch cfg writeOnlyStreamStepConfig) outTopic writeOnlyProduce
       liftIO
         $ runStreamTxn jobConfigDB
@@ -962,7 +936,7 @@ instance MonadStream LeaseBasedStreamWorker where
                       $ void
                       $ throttleByErrors metrics sn
                       $ runStreamTxn jobConfigDB
-                      $ runCustomWatermark streamProcessorWatermarkBy
+                      $ runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy
                       $ pipeStep
                         cfg
                         streamProcessorStreamStepConfig
@@ -1008,7 +982,7 @@ instance MonadStream LeaseBasedStreamWorker where
                     $ void
                     $ throttleByErrors metrics sn
                     $ runStreamTxn jobConfigDB
-                    $ runCustomWatermark watermarker
+                    $ runCustomWatermark (topicWatermarkSS outTopic) watermarker
                     $ pipeStep
                       cfg
                       stepCfg
@@ -1031,7 +1005,7 @@ instance MonadStream LeaseBasedStreamWorker where
                     $ void
                     $ throttleByErrors metrics sn
                     $ runStreamTxn jobConfigDB
-                    $ runCustomWatermark watermarker
+                    $ runCustomWatermark (topicWatermarkSS outTopic) watermarker
                     $ pipeStep
                       cfg
                       stepCfg
@@ -1088,7 +1062,7 @@ instance MonadStream LeaseBasedStreamWorker where
                       $ void
                       $ throttleByErrors metrics sn
                       $ runStreamTxn jobConfigDB
-                      $ runCustomWatermark tableProcessorWatermarkBy
+                      $ runCustomWatermark (AT.aggrTableWatermarkSS table) tableProcessorWatermarkBy
                       $ aggregateStep
                         cfg
                         tableProcessorStreamStepConfig
@@ -1248,12 +1222,12 @@ produceStep ::
   Transaction (Maybe a) ->
   -- | Number of incoming messages consumed, outgoing messages
   FDB.Transaction (Int, Seq a)
-produceStep batchSize outCfg step = do
+produceStep batchSize topic step = do
   -- TODO: this keeps spinning even if the producer is done and will never
   -- produce again.
   xs <- catMaybes <$> Seq.replicateM (fromIntegral batchSize) step
-  p' <- liftIO $ randPartition outCfg
-  writeTopic' outCfg p' (fmap toMessage xs)
+  p' <- liftIO $ randPartition topic
+  writeTopic' topic p' (fmap toMessage xs)
   return (0, xs)
 
 -- | Returns number of messages consumed from upstream, and

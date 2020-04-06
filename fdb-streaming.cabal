@@ -35,7 +35,8 @@ library
       FDBStreaming.Joins,
       FDBStreaming.Util,
       FDBStreaming.Util.BatchWriter,
-      FDBStreaming.Watermark
+      FDBStreaming.Watermark,
+      FDBStreaming.Push
   other-modules:
       Paths_fdb_streaming
   hs-source-dirs:

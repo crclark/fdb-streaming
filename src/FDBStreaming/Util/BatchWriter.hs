@@ -23,6 +23,7 @@ module FDBStreaming.Util.BatchWriter (
   BatchWriter,
   BatchWrite(..),
   BatchWriteResult(..),
+  isFailed,
   batchWriter,
   batchWriterAsync,
   defaultBatchWriterConfig,
@@ -63,6 +64,11 @@ data BatchWriteResult =
   -- The underlying error is returned.
   | Failed FDB.Error
   deriving (Eq, Show)
+
+isFailed :: BatchWriteResult -> Bool
+isFailed FailedQueueFull = True
+isFailed (Failed _) = True
+isFailed _ = False
 
 data BatchWrite a = BatchWrite
   { -- | Must be unique to this write. If not unique, only the first write will
