@@ -1,3 +1,4 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DerivingVia #-}
@@ -13,19 +14,23 @@
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE OverloadedLabels #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
 module Main where
 
+import GHC.Records
 import           FDBStreaming
 import qualified FDBStreaming.AggrTable as AT
 import           FDBStreaming.Topic
-import           FDBStreaming.Watermark (Watermark(Watermark, watermarkUTCTime), WatermarkSS, getCurrentWatermark, setWatermark)
+import           FDBStreaming.Watermark (Watermark(Watermark, watermarkUTCTime), WatermarkSS, getCurrentWatermark)
+import qualified FDBStreaming.Util.BatchWriter as BW
+import qualified FDBStreaming.Push as Push
 import FDBStreaming.Util (millisSinceEpoch)
 import           Control.Monad
 import           Control.Monad.IO.Class (liftIO)
 import           Control.Concurrent
-import           Control.Concurrent.Async       ( forConcurrently )
+import           Control.Concurrent.Async       ( async, wait, forConcurrently )
 import           Control.Concurrent.STM         ( TVar
                                                 , readTVarIO
                                                 , atomically
@@ -40,9 +45,6 @@ import Control.Logger.Simple (LogLevel(LogDebug))
 import           Data.List                      ( sortOn )
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import qualified Data.ByteString.Lazy as BL
-import qualified Data.ByteString.Builder as Build
-import qualified Data.ByteString.Random.MWC as BS
 import           Data.Coerce                    ( coerce )
 import           Data.Time.Clock                ( diffUTCTime, getCurrentTime )
 import           Data.Word                      ( Word16, Word8 )
@@ -50,13 +52,14 @@ import           FoundationDB                  as FDB
 import           FoundationDB.Error
 import           FoundationDB.Layer.Subspace   as FDB
 import           FoundationDB.Layer.Tuple      as FDB
+import Data.Foldable (for_)
 import Data.UUID as UUID
 import           Data.UUID                      ( UUID )
 import           Data.UUID.V4                   as UUID
                                                 ( nextRandom )
 import           GHC.Generics                   ( Generic )
 import           System.Random                  ( randomIO, randomRIO )
-import           Data.Maybe                     ( fromMaybe )
+import           Data.Maybe                     ( fromMaybe, fromJust )
 import           Data.Persist                     ( Persist )
 import qualified Data.Persist                    as Persist
 import           Data.Functor.Identity (Identity(..))
@@ -208,7 +211,7 @@ awaitOrder db table stats latencyDist awaitGauge order@Order{orderID} = withProb
 -- arrival in the given AggrTable, and updates the given latency statistics
 -- TVar.
 placeAndAwaitOrders :: Database
-                    -> Topic
+                    -> BW.BatchWriter Order
                     -> AT.AggrTable OrderID All
                     -> TVar LatencyStats
                     -> Distribution
@@ -218,9 +221,12 @@ placeAndAwaitOrders :: Database
                     -> Bool
                     -- ^ whether to watch orders to measure end_to_end_latency
                     -> IO ()
-placeAndAwaitOrders db orderTopic table stats latencyDist awaitGauge batchSize shouldWatch = catches ( do
+placeAndAwaitOrders db bw table stats latencyDist awaitGauge batchSize shouldWatch = catches ( do
   orders <- replicateM batchSize randOrder
-  writeTopicNoRetry db orderTopic (map toMessage orders)
+  writeAsyncs <- forM orders $ \order -> async $ BW.write bw $ BW.BatchWrite (toMessage (getField @"orderID" order)) Nothing order
+  for_ writeAsyncs $ \a -> do
+    res <- wait a
+    when (BW.isFailed res) $ putStrLn $ "Failed write: " ++ show res
   when shouldWatch
     $ forM_ orders $ awaitOrder db table stats latencyDist awaitGauge
   )
@@ -232,21 +238,9 @@ placeAndAwaitOrders db orderTopic table stats latencyDist awaitGauge batchSize s
                 putStrLn $ "Caught " ++ show e ++ " while writing to topic!")
   ]
 
-writeTopicNoRetry :: Traversable t => Database -> Topic -> t ByteString -> IO ()
-writeTopicNoRetry db tc@Topic {..} bss = do
-  -- TODO: proper error handling
-  guard (fromIntegral (length bss) < (maxBound :: Word16))
-  p <- randPartition tc
-  FDB.runTransactionWithConfig
-    defaultConfig { maxRetries = 0 }
-    db
-    $ do currTime <- liftIO getCurrentTime
-         setWatermark (topicWatermarkSS tc) (Watermark currTime)
-         writeTopic' tc p bss
-
 -- TODO: far too many params!
 orderGeneratorLoop :: Database
-                   -> Topic
+                   -> BW.BatchWriter Order
                    -> AT.AggrTable OrderID All
                    -> Int
                    -- ^ requests per second
@@ -258,11 +252,11 @@ orderGeneratorLoop :: Database
                    -> Bool
                    -- ^ whether to watch orders to measure end-to-end latency
                    -> IO ()
-orderGeneratorLoop db topic table rps batchSize stats latencyDist awaitGauge shouldWatch = do
+orderGeneratorLoop db bw table rps batchSize stats latencyDist awaitGauge shouldWatch = do
   let delay = 1000000 `div` (rps `div` batchSize)
-  void $ forkIO $ placeAndAwaitOrders db topic table stats latencyDist awaitGauge batchSize shouldWatch
+  void $ forkIO $ placeAndAwaitOrders db bw table stats latencyDist awaitGauge batchSize shouldWatch
   threadDelay delay
-  orderGeneratorLoop db topic table rps batchSize stats latencyDist awaitGauge shouldWatch
+  orderGeneratorLoop db bw table rps batchSize stats latencyDist awaitGauge shouldWatch
 
 latencyReportLoop :: TVar LatencyStats -> IO ()
 latencyReportLoop stats = do
@@ -276,9 +270,8 @@ latencyReportLoop stats = do
   threadDelay 1000000
   latencyReportLoop stats
 
-topology :: (MonadStream m) => Topic -> Bool -> m (AT.AggrTable OrderID All)
-topology incoming watermark = do
-  input <-if watermark then existingWatermarked incoming else existing incoming
+topology :: (MonadStream m) => Stream Order -> m (AT.AggrTable OrderID All)
+topology input = do
   let fraudChecks = fmap isFraudulent input
   let invChecks = fmap inventoryCheck input
   let dtls = benignIO (fmap Just . randOrderDetails) input
@@ -301,9 +294,10 @@ topology incoming watermark = do
   orderStatusTable <- aggregate "order_table" grouped snd
   return orderStatusTable
 
-printStats :: Database -> Subspace -> IO ()
-printStats db ss = catches (do
-  tcs <- listExistingTopics db ss
+printStats :: Database -> Subspace -> Word8 -> IO ()
+printStats db ss numPartitions = catches (do
+  tcs <- map (\t -> (t :: Topic) {numPartitions = numPartitions})
+         <$> listExistingTopics db ss
   ts  <- forConcurrently tcs $ \tc -> do
     beforeT <- getTime Monotonic
     before <- runTransaction db $ withSnapshot $ getTopicCount tc
@@ -359,31 +353,43 @@ mainLoop db ss Args{ generatorNumThreads
              , leaseDuration = 10
              , numStreamThreads = coerce numLeaseThreads
              , numPeriodicJobThreads = 1
-             , defaultNumPartitions = 2
-             , logLevel =LogDebug
+             , defaultNumPartitions = coerce numPartitions
+             , logLevel = LogDebug
              }
-  let input = makeTopic ss "incoming_orders" (coerce numPartitions)
+  let pconf = Push.PushStreamConfig
+                (Just $ \_ -> liftIO getCurrentTime >>= return . Watermark)
+                (Just $ fromIntegral @Word8 $ coerce numPartitions)
+                (Just $ fromIntegral @Int $ coerce generatorBatchSize)
+  let bwconf = BW.BatchWriterConfig
+               { BW.desiredMaxLatencyMillis = 2000
+               , BW.maxBatchBytes = 10000
+               , BW.maxQueueSize = 3000
+               , BW.maxBatchSize = (fromIntegral @Int $ coerce generatorBatchSize)
+               , BW.minIdempotencyMemoryDurationSeconds = 600
+               , BW.idempotencyCleanupPeriod = 100
+               }
+  (input, bws) <- Push.runPushStream conf "incoming_orders" pconf bwconf (fromIntegral @Int $ coerce generatorNumThreads)
   let table = getAggrTable conf "order_table" (coerce numPartitions)
   stats <- newTVarIO $ LatencyStats 0 1
-  replicateM_ (coerce generatorNumThreads)
-    $ forkIO $ orderGeneratorLoop db
-                                  input
-                                  table
-                                  (coerce generatorMsgsPerSecond)
-                                  (coerce generatorBatchSize)
-                                  stats
-                                  latencyDist
-                                  awaitedOrders
-                                  (coerce generatorWatchResults)
+  forM_ bws $ \bw ->
+    forkIO $ orderGeneratorLoop db
+                                bw
+                                table
+                                (coerce generatorMsgsPerSecond)
+                                (coerce generatorBatchSize)
+                                stats
+                                latencyDist
+                                awaitedOrders
+                                (coerce generatorWatchResults)
   void $ forkIO $ latencyReportLoop stats
   forkIO $ forever $ do
-    when (coerce printTopicStats) $ printStats db ss
+    when (coerce printTopicStats) $ printStats db ss (coerce numPartitions)
     threadDelay 1000000
   forkIO $ forever $ do
-    printWatermarkLag db (topicWatermarkSS input) (AT.aggrTableWatermarkSS table)
+    printWatermarkLag db (topicWatermarkSS $ fromJust $ streamTopic input) (AT.aggrTableWatermarkSS table)
     threadDelay 1000000
   if coerce streamRun
-     then runJob conf (topology input (coerce watermark))
+     then runJob conf (topology input)
      else threadDelay maxBound
 
 cleanup :: Database -> Subspace -> IO ()

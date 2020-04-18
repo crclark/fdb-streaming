@@ -15,7 +15,7 @@ import qualified Data.UUID as UUID
 import qualified Data.UUID.V4 as UUID
 import FDBStreaming.Topic (getTopicCount, makeTopic, writeTopic')
 import qualified FDBStreaming.Util.BatchWriter as BW
-import FoundationDB (Database, runTransaction)
+import FoundationDB (runTransaction)
 import qualified FoundationDB as FDB
 import qualified FoundationDB.Error as FDB
 import qualified FoundationDB.Layer.Subspace as FDB
@@ -79,12 +79,28 @@ batchSize testSS db = testCase "maxBatchSize" $ do
   pendingX <- isPending x
   pendingY <- isPending y
   assertBool "first two writes pending" (pendingX && pendingY)
-  z <- async $ newWrite >>= BW.write bw
+  _ <- async $ newWrite >>= BW.write bw
   threadDelay 1000000
   pendingX' <- isPending x
-  assertBool "No longer pending after 3rd write" (not pendingX')
+  assertBool "Batch was committed after third write received" (not pendingX')
   c <- runTransaction db $ getTopicCount topic
   c @?= 3
+
+idempotencyKeyTimeout :: FDB.Subspace -> FDB.Database -> TestTree
+idempotencyKeyTimeout testSS db = testCase "minIdempotencyMemoryDurationSeconds" $ do
+  bwSS <- extendRand testSS
+  tSS <- extendRand testSS
+  let topic = makeTopic tSS "test" 1
+  let f = writeTopic' topic 0
+  let cfg = BW.defaultBatchWriterConfig {BW.minIdempotencyMemoryDurationSeconds = 1}
+  bw <- BW.batchWriter cfg db bwSS f
+  x <- newWrite
+  res <- BW.write bw x
+  res @?= BW.Success
+  -- Wait for longer than memory duration, and we can write the same value again
+  threadDelay 3000000
+  res3 <- BW.write bw x
+  res3 @?= BW.Success
 
 batchWriterTests :: FDB.Subspace -> FDB.Database -> TestTree
 batchWriterTests testSS db =
@@ -92,5 +108,6 @@ batchWriterTests testSS db =
     "BatchWriter"
     [ canceledTxn testSS db,
       writeSuccess testSS db,
-      batchSize testSS db
+      batchSize testSS db,
+      idempotencyKeyTimeout testSS db
     ]
