@@ -132,6 +132,15 @@
 --
 --TODO: delete the above brainstorming and replace with real docs once we decide
 -- what to do.
+
+-- | Utilities for pushing data into a stream from outside the stream
+-- processing pipeline. This can to be used to insert incoming data from
+-- HTTP requests, for example.
+--
+-- In order to make inserts from outside the system idempotent (which is
+-- necessary to avoid duplicated writes if we receive CommitUnknownResult
+-- errors), this module's interface uses 'BatchWriter's, which allow you to
+-- specify an idempotencyKey for each item you insert.
 module FDBStreaming.Push
   ( PushStreamConfig (..),
     runPushStream,
@@ -155,6 +164,8 @@ import FoundationDB (Transaction)
 import qualified FoundationDB.Layer.Subspace as FDB
 import qualified FoundationDB.Layer.Tuple as FDB
 
+-- | Specifies the configuration of a stream that will be populated by pushing
+-- messages to it from outside the pipeline system.
 data PushStreamConfig inMsg
   = PushStreamConfig
       { pushStreamWatermarkBy :: Maybe (inMsg -> Transaction Watermark),
@@ -166,6 +177,10 @@ data PushStreamConfig inMsg
 defaultPushStreamConfig :: PushStreamConfig a
 defaultPushStreamConfig = PushStreamConfig Nothing Nothing Nothing
 
+-- | Set up a stream that messages can be pushed to from outside the pipeline.
+-- Returns the stream and a set of BatchWriters for writing to it. The stream
+-- can be passed into a 'MonadStream' action to serve as a root of a pipeline
+-- DAG.
 runPushStream ::
   Message inMsg =>
   -- | Job configuration. Must match the JobConfig of whatever
@@ -208,3 +223,5 @@ runPushStream' ::
   IO (Stream inMsg, BatchWriter inMsg)
 runPushStream' jc sn =
   fmap head <$> runPushStream jc sn defaultPushStreamConfig defaultBatchWriterConfig 1
+
+-- TODO: pushAggrTable interface.
