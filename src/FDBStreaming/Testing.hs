@@ -11,7 +11,7 @@ import Data.Traversable (for)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async, cancel)
 import FDBStreaming (MonadStream, Stream, runJob, streamFromTopic, runPure)
-import FDBStreaming.Topic (Topic(topicName), makeTopic, writeTopic, TopicName, listExistingTopics, getTopicCount)
+import FDBStreaming.Topic (Topic(topicName), makeTopic, writeTopicIO, TopicName, listExistingTopics, getTopicCount)
 import FDBStreaming.Message (Message (fromMessage, toMessage))
 import qualified FDBStreaming.JobConfig as JC
 import qualified Data.Map as Map
@@ -22,6 +22,8 @@ import qualified Control.Logger.Simple as Log
 
 topicCounts :: FDB.Database -> JC.JobSubspace -> IO (Map TopicName Int)
 topicCounts db ss = do
+  --TODO: this is now broken, because we don't know how many partitions the
+  --topics have.
   tcs <- listExistingTopics db ss
   FDB.runTransaction db $ fmap Map.fromList $ for tcs $ \tc -> do
     c <- getTopicCount tc
@@ -46,7 +48,7 @@ testOnInput :: (Message a, Traversable t)
 testOnInput cfg xs topology = do
   -- TODO: what if user has already named a stream "test_input_stream"?
   let inTopic = makeTopic (JC.jobConfigSS cfg) "test_input_stream" 2
-  writeTopic (JC.jobConfigDB cfg) inTopic (fmap toMessage xs)
+  writeTopicIO (JC.jobConfigDB cfg) inTopic (fmap toMessage xs)
   let strm = fromMessage <$> streamFromTopic inTopic "test_input_stream"
   job <- async $ runJob cfg (topology strm)
   -- TODO: this is probably incredibly brittle.

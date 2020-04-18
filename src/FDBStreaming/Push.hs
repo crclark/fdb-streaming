@@ -157,7 +157,7 @@ import qualified FDBStreaming.JobConfig as JC
 import FDBStreaming.Message (Message (fromMessage, toMessage))
 import FDBStreaming.Stream (Stream, StreamName)
 import FDBStreaming.Stream.Internal (streamFromTopic, setStreamWatermarkByTopic)
-import FDBStreaming.Topic (makeTopic, randPartition, topicCustomMetadataSS, writeTopic')
+import FDBStreaming.Topic (makeTopic, randPartition, topicCustomMetadataSS, writeTopic)
 import FDBStreaming.Util.BatchWriter (BatchWriter, BatchWriterConfig, batchWriter, defaultBatchWriterConfig)
 import FDBStreaming.Watermark (Watermark, setWatermark, topicWatermarkSS)
 import FoundationDB (Transaction)
@@ -210,7 +210,7 @@ runPushStream jc sn ps bwc bn = do
             setWatermark (topicWatermarkSS topic) w
           _ -> return ()
         pid <- liftIO $ randPartition topic
-        writeTopic' topic pid (fmap toMessage xs)
+        writeTopic topic pid (fmap toMessage xs)
   let bwSS = FDB.extend (topicCustomMetadataSS topic) [FDB.Bytes "pbw"]
   writers <- replicateM (fromIntegral bn) $ batchWriter bwc (JC.jobConfigDB jc) bwSS writeBatch
   return (fmap fromMessage stream, writers)

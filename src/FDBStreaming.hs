@@ -313,7 +313,7 @@ import FDBStreaming.Topic
     getCheckpoints,
     makeTopic,
     randPartition,
-    writeTopic',
+    writeTopic,
   )
 import qualified FDBStreaming.Topic as Topic
 import qualified FDBStreaming.Topic.Constants as C
@@ -1227,7 +1227,7 @@ produceStep batchSize topic step = do
   -- produce again.
   xs <- catMaybes <$> Seq.replicateM (fromIntegral batchSize) step
   p' <- liftIO $ randPartition topic
-  writeTopic' topic p' (fmap toMessage xs)
+  writeTopic topic p' (fmap toMessage xs)
   return (0, xs)
 
 -- | Returns number of messages consumed from upstream, and
@@ -1270,7 +1270,7 @@ pipeStep
     ys <- transformBatch inMsgs
     let outMsgs = fmap toMessage ys
     p' <- liftIO $ randPartition outCfg
-    writeTopic' outCfg p' outMsgs
+    writeTopic outCfg p' outMsgs
     return (length inMsgs, ys)
 
 oneToOneJoinStep ::

@@ -269,7 +269,7 @@ streamFromTopic :: Topic -> StreamName -> Stream ByteString
 streamFromTopic tc streamName =
   Stream
     { streamReadAndCheckpoint = \_cfg rn pid _chkptSS n _state -> do
-        msgs <- Topic.readNAndCheckpoint' tc pid rn n
+        msgs <- Topic.readNAndCheckpoint tc pid rn n
         return $ fmap (\(vs, x) -> (Just vs, x)) msgs,
       streamMinReaderPartitions = fromIntegral $ Topic.numPartitions tc,
       streamWatermarkSS = Nothing,

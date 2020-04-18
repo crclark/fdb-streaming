@@ -14,17 +14,17 @@ module FDBStreaming.Topic
     makeTopic,
     randPartition,
     watchPartition,
-    getCheckpoint',
+    getCheckpoint,
     getCheckpoints,
     readNAndCheckpoint,
-    readNAndCheckpoint',
+    readNAndCheckpointIO,
     writeTopic,
-    writeTopic',
+    writeTopicIO,
     getPartitionCount,
     getTopicCount,
     listExistingTopics,
     watchTopic,
-    watchTopic',
+    watchTopicIO,
     awaitTopicOrTimeout,
     getEntireTopic
   )
@@ -223,13 +223,13 @@ readerCheckpointKey topic i rn =
 -- | Write a batch of messages to this topic.
 -- Danger!! It's possible to write multiple messages with the same key
 -- if this is called more than once in a single transaction.
-writeTopic' ::
+writeTopic ::
   Traversable t =>
   Topic ->
   PartitionId ->
   t ByteString ->
   Transaction ()
-writeTopic' topic@Topic {..} p bss = do
+writeTopic topic@Topic {..} p bss = do
   incrPartitionCountBy topic p (fromIntegral $ length bss)
   void $ foldlM go 1 bss
   where
@@ -243,15 +243,19 @@ writeTopic' topic@Topic {..} p bss = do
 
 -- | Transactionally write a batch of messages to the given topic. The
 -- batch must be small enough to fit into a single FoundationDB transaction.
-writeTopic ::
+-- Exposed primarily for testing purposes. This operation is not idempotent,
+-- and if it throws CommitUnknownResult, you won't know whether the write
+-- succeeded. For more robust write utilities,
+-- see 'FDBStreaming.Util.BatchWriter'.
+writeTopicIO ::
   Traversable t =>
   FDB.Database ->
   Topic ->
   t ByteString ->
   IO ()
-writeTopic db topic@Topic {..} bss = do
+writeTopicIO db topic@Topic {..} bss = do
   p <- randPartition topic
-  FDB.runTransaction db $ writeTopic' topic p bss
+  FDB.runTransaction db $ writeTopic topic p bss
 
 parseOutput ::
   Topic ->
@@ -285,8 +289,8 @@ watchPartition topic pid = watch (partitionCountKey topic pid)
 -- Currently, streaming jobs do not use this functionality, because watches do
 -- not seem to fire promptly enough to maintain real time throughput. However,
 -- other advanced use cases may find this useful.
-watchTopic' :: Topic -> Transaction TopicWatch
-watchTopic' tc = fmap TopicWatch $ for [0 .. numPartitions tc - 1] $ \pid ->
+watchTopic :: Topic -> Transaction TopicWatch
+watchTopic tc = fmap TopicWatch $ for [0 .. numPartitions tc - 1] $ \pid ->
   fmap (const pid) <$> watch (partitionCountKey tc pid)
 
 -- | For use with the return value of 'watchTopic''. Must be called from outside
@@ -311,18 +315,18 @@ awaitTopicOrTimeout timeout futures =
 -- Currently, streaming jobs do not use this functionality, because watches do
 -- not seem to fire promptly enough to maintain real time throughput. However,
 -- other advanced use cases may find this useful.
-watchTopic :: FDB.Database -> Topic -> IO (Either FDB.Error PartitionId)
-watchTopic db topic = do
-  ws <- runTransaction db (watchTopic' topic)
+watchTopicIO :: FDB.Database -> Topic -> IO (Either FDB.Error PartitionId)
+watchTopicIO db topic = do
+  ws <- runTransaction db (watchTopic topic)
   awaitTopic ws
 
-checkpoint' ::
+checkpoint ::
   Topic ->
   PartitionId ->
   ReaderName ->
   Versionstamp 'Complete ->
   Transaction ()
-checkpoint' topic p rn vs = do
+checkpoint topic p rn vs = do
   let k = readerCheckpointKey topic p rn
   let v = encodeVersionstamp vs
   FDB.atomicOp k (Op.byteMax v)
@@ -335,12 +339,12 @@ decodeCheckpoint bs = case decodeVersionstamp bs of
 -- | For a given reader, returns a versionstamp that is guaranteed to be less
 -- than the first unread message in the topic partition. If the reader
 -- hasn't made a checkpoint yet, returns a versionstamp containing all zeros.
-getCheckpoint' ::
+getCheckpoint ::
   Topic ->
   PartitionId ->
   ReaderName ->
   Transaction (Versionstamp 'Complete)
-getCheckpoint' topic p rn = do
+getCheckpoint topic p rn = do
   let cpk = readerCheckpointKey topic p rn
   bs <- FDB.get cpk >>= await
   case decodeCheckpoint <$> bs of
@@ -371,7 +375,7 @@ readNPastCheckpoint ::
   Word16 ->
   Transaction (Seq (Versionstamp 'Complete, ByteString))
 readNPastCheckpoint topic p rn n = do
-  cpvs <- getCheckpoint' topic p rn
+  cpvs <- getCheckpoint topic p rn
   let begin = FDB.pack (partitionMsgsSS topic p) [FDB.CompleteVS cpvs]
   let end = prefixRangeEnd $ FDB.subspaceKey (partitionMsgsSS topic p)
   let r = Range
@@ -390,30 +394,30 @@ readNPastCheckpoint topic p rn n = do
 -- | Read N messages from the given topic partition. These messages are guaranteed
 -- to be previously unseen for the given ReaderName, and will be checkpointed so
 --that they are never seen again.
-readNAndCheckpoint' ::
+readNAndCheckpoint ::
   Topic ->
   PartitionId ->
   ReaderName ->
   Word16 ->
   Transaction (Seq (Versionstamp 'Complete, ByteString))
-readNAndCheckpoint' topic@Topic {..} p rn n =
+readNAndCheckpoint topic@Topic {..} p rn n =
   readNPastCheckpoint topic p rn n >>= \case
     x@(_ :|> (vs, _)) -> do
-      checkpoint' topic p rn vs
+      checkpoint topic p rn vs
       return x
     _ -> return mempty
 
 -- | Read N messages from a random partition of the given topic, and checkpoints
 -- so that they will never be seen by the same reader again.
-readNAndCheckpoint ::
+readNAndCheckpointIO ::
   FDB.Database ->
   Topic ->
   ReaderName ->
   Word16 ->
   IO (Seq (Versionstamp 'Complete, ByteString))
-readNAndCheckpoint db topic@Topic {..} rn n = do
+readNAndCheckpointIO db topic@Topic {..} rn n = do
   p <- randPartition topic
-  FDB.runTransaction db (readNAndCheckpoint' topic p rn n)
+  FDB.runTransaction db (readNAndCheckpoint topic p rn n)
 
 -- | Gets all data from the given topic. For debugging and testing purposes.
 -- This will try to load the entire topic into memory.

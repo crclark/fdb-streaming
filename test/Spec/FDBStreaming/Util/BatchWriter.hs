@@ -13,7 +13,7 @@ import qualified Data.ByteString as BS
 import Data.ByteString.Lazy (toStrict)
 import qualified Data.UUID as UUID
 import qualified Data.UUID.V4 as UUID
-import FDBStreaming.Topic (getTopicCount, makeTopic, writeTopic')
+import FDBStreaming.Topic (getTopicCount, makeTopic, writeTopic)
 import qualified FDBStreaming.Util.BatchWriter as BW
 import FoundationDB (runTransaction)
 import qualified FoundationDB as FDB
@@ -43,7 +43,7 @@ writeSuccess testSS db = testCase "write" $ do
   bwSS <- extendRand testSS
   tSS <- extendRand testSS
   let topic = makeTopic tSS "test" 1
-  let f = writeTopic' topic 0
+  let f = writeTopic topic 0
   bw <- BW.batchWriter BW.defaultBatchWriterConfig db bwSS f
   x <- newWrite
   res <- BW.write bw x
@@ -65,7 +65,7 @@ batchSize testSS db = testCase "maxBatchSize" $ do
   bwSS <- extendRand testSS
   tSS <- extendRand testSS
   let topic = makeTopic tSS "test" 1
-  let f = writeTopic' topic 0
+  let f = writeTopic topic 0
   bw <-
     BW.batchWriter
       BW.defaultBatchWriterConfig
@@ -91,7 +91,7 @@ idempotencyKeyTimeout testSS db = testCase "minIdempotencyMemoryDurationSeconds"
   bwSS <- extendRand testSS
   tSS <- extendRand testSS
   let topic = makeTopic tSS "test" 1
-  let f = writeTopic' topic 0
+  let f = writeTopic topic 0
   let cfg = BW.defaultBatchWriterConfig {BW.minIdempotencyMemoryDurationSeconds = 1}
   bw <- BW.batchWriter cfg db bwSS f
   x <- newWrite
