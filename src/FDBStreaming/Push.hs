@@ -148,7 +148,7 @@ module FDBStreaming.Push
   )
 where
 
-import Control.Monad (replicateM)
+import Control.Monad (replicateM, void)
 import Control.Monad.IO.Class (liftIO)
 import Data.Foldable (for_)
 import Data.Maybe (fromMaybe, isJust)
@@ -198,7 +198,7 @@ runPushStream jc sn ps bwc bn = do
         fromMaybe
           (JC.defaultNumPartitions jc)
           (pushStreamOutputPartitions ps)
-  let topic = makeTopic (JC.jobConfigSS jc) sn numPartitions
+  let topic = makeTopic (JC.jobConfigSS jc) sn numPartitions (JC.defaultChunkSizeBytes jc)
   let stream = (if isJust (pushStreamWatermarkBy ps)
                    then setStreamWatermarkByTopic
                    else id)
@@ -210,7 +210,7 @@ runPushStream jc sn ps bwc bn = do
             setWatermark (topicWatermarkSS topic) w
           _ -> return ()
         pid <- liftIO $ randPartition topic
-        writeTopic topic pid (fmap toMessage xs)
+        void $ writeTopic topic pid (fmap toMessage xs)
   let bwSS = FDB.extend (topicCustomMetadataSS topic) [FDB.Bytes "pbw"]
   writers <- replicateM (fromIntegral bn) $ batchWriter bwc (JC.jobConfigDB jc) bwSS writeBatch
   return (fmap fromMessage stream, writers)

@@ -10,6 +10,7 @@ module FDBStreaming.Testing (
 import Data.Traversable (for)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async, cancel)
+import Control.Monad (void)
 import FDBStreaming (MonadStream, Stream, runJob, streamFromTopic, runPure)
 import FDBStreaming.Topic (Topic(topicName), makeTopic, writeTopicIO, TopicName, listExistingTopics, getTopicCount)
 import FDBStreaming.Message (Message (fromMessage, toMessage))
@@ -40,15 +41,15 @@ waitCountUnchanged db ss = do
 -- the same type as input, run the pipeline on that input. Blocks until activity
 -- in the pipeline appears to have stopped. Expect this to take a few seconds to
 -- run.
-testOnInput :: (Message a, Traversable t)
+testOnInput :: (Message a)
             => JC.JobConfig
-            -> t a
+            -> [a]
             -> (forall m . MonadStream m => Stream a -> m b)
             -> IO b
 testOnInput cfg xs topology = do
   -- TODO: what if user has already named a stream "test_input_stream"?
-  let inTopic = makeTopic (JC.jobConfigSS cfg) "test_input_stream" 2
-  writeTopicIO (JC.jobConfigDB cfg) inTopic (fmap toMessage xs)
+  let inTopic = makeTopic (JC.jobConfigSS cfg) "test_input_stream" 2 0
+  void $ writeTopicIO (JC.jobConfigDB cfg) inTopic (fmap toMessage xs)
   let strm = fromMessage <$> streamFromTopic inTopic "test_input_stream"
   job <- async $ runJob cfg (topology strm)
   -- TODO: this is probably incredibly brittle.
@@ -68,5 +69,6 @@ testJobConfig db ss = JC.JobConfig
   , JC.numStreamThreads = 8
   , JC.numPeriodicJobThreads = 1
   , JC.defaultNumPartitions = 2
+  , JC.defaultChunkSizeBytes = 0
   , JC.logLevel = Log.LogError
   }

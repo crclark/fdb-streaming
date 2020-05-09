@@ -10,7 +10,7 @@ module FDBStreaming.StreamStep.Internal  where
 
 import FDBStreaming.Message(Message)
 import FDBStreaming.Stream.Internal(Stream)
-import FDBStreaming.Topic (Topic)
+import FDBStreaming.Topic (Topic, Checkpoint)
 import qualified FDBStreaming.AggrTable as AT
 import FDBStreaming.Watermark
   ( Watermark,
@@ -23,10 +23,6 @@ import Data.ByteString (ByteString)
 import Data.Sequence (Seq)
 import Data.Word (Word8, Word16)
 import FoundationDB (Transaction)
-import FoundationDB.Versionstamp
-  ( Versionstamp,
-    VersionstampCompleteness (Complete),
-  )
 
 -- | The name of a step in the pipeline. A step can be thought of as a function
 -- that consumes a stream and writes to a stream, a table, or a side effect.
@@ -76,7 +72,7 @@ data StreamStep outMsg runResult where
       -- reason I can see that pipeStep and this callback both need to exist.
       -- Same with the other constructors.
       streamProcessorProcessBatch ::
-        Seq (Maybe (Versionstamp 'Complete), a) ->
+        (Maybe Checkpoint, Seq a) ->
         Transaction (Seq b),
       streamProcessorStreamStepConfig :: StreamStepConfig
     } ->
@@ -99,12 +95,12 @@ data StreamStep outMsg runResult where
       -- the user created, too.
       stream2ProcessorRunBatchL ::
         ( Topic ->
-          Seq (Maybe (Versionstamp 'Complete), a1) ->
+          (Maybe Checkpoint, Seq a1) ->
           Transaction (Seq b)
         ),
       stream2ProcessorRunBatchR ::
         ( Topic ->
-          Seq (Maybe (Versionstamp 'Complete), a2) ->
+          (Maybe Checkpoint, Seq a2) ->
           Transaction (Seq b)
         ),
       stream2ProcessorStreamStepConfig :: StreamStepConfig

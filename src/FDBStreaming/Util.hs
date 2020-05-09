@@ -1,5 +1,6 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE BangPatterns #-}
 
 module FDBStreaming.Util (
   currMillisSinceEpoch,
@@ -7,7 +8,8 @@ module FDBStreaming.Util (
   millisSinceEpochToUTC,
   runGetMay,
   logErrors,
-  withOneIn
+  withOneIn,
+  chunksOfSize
 ) where
 
 import Control.Logger.Simple (logError, showText)
@@ -69,3 +71,17 @@ withOneIn :: (Random a, Integral a, MonadIO m) => a -> m () -> m ()
 withOneIn n action = do
   x <- liftIO $ randomRIO (1,n)
   if x == 1 then action else return ()
+
+-- | @chunksOfSize n sz@ splits a list into chunks, such that for each chunk
+-- @c@, @sum $ map sz c@ is less than or equal to @n@, except for elements
+-- larger than the chunk size, which will be placed in singleton chunks.
+chunksOfSize :: Word -> (a -> Int) -> [a] -> [[a]]
+chunksOfSize _ _ [] = []
+chunksOfSize n sz xs@(h:_) =
+  let (l, rest) = go (sz h) 1 xs
+      in take l xs : chunksOfSize n sz rest
+
+  where go _ !l [] = (l, [])
+        go !i !l (z:zs)
+          | i + sz z > (fromIntegral n) = (l, zs)
+          | otherwise = go (i + sz z) (l + 1) zs

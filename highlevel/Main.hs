@@ -327,7 +327,7 @@ printWatermarkLag db root leaf = do
     Right (Just r, Just l) -> do
       printf "Watermark of root is %s\n" $ show r
       printf "Watermark of leaf is %s\n" $ show l
-      printf "Watermark lag is %s\n" $ show $ round $ diffUTCTime (watermarkUTCTime r) (watermarkUTCTime l)
+      printf "Watermark lag is %s\n" $ show @ Int $ round $ diffUTCTime (watermarkUTCTime r) (watermarkUTCTime l)
     _ -> return ()
 
 mainLoop :: Database -> Subspace -> Args Identity -> IO ()
@@ -340,7 +340,8 @@ mainLoop db ss Args{ generatorNumThreads
                    , batchSize
                    , numLeaseThreads
                    , watermark
-                   , numPartitions } = do
+                   , numPartitions
+                   , bytesPerChunk } = do
   metricsStore <- Metrics.newStore
   latencyDist <- Metrics.createDistribution "end_to_end_latency" metricsStore
   awaitedOrders <- Metrics.createGauge "waitingOrders" metricsStore
@@ -355,9 +356,12 @@ mainLoop db ss Args{ generatorNumThreads
              , numPeriodicJobThreads = 1
              , defaultNumPartitions = coerce numPartitions
              , logLevel = LogDebug
+             , defaultChunkSizeBytes = runIdentity $ fmap fromIntegral bytesPerChunk
              }
   let pconf = Push.PushStreamConfig
-                (Just $ \_ -> liftIO getCurrentTime >>= return . Watermark)
+                ( if coerce watermark
+                    then Just $ \_ -> liftIO getCurrentTime >>= return . Watermark
+                    else Nothing)
                 (Just $ fromIntegral @Word8 $ coerce numPartitions)
                 (Just $ fromIntegral @Int $ coerce generatorBatchSize)
   let bwconf = BW.BatchWriterConfig
@@ -371,6 +375,7 @@ mainLoop db ss Args{ generatorNumThreads
   (input, bws) <- Push.runPushStream conf "incoming_orders" pconf bwconf (fromIntegral @Int $ coerce generatorNumThreads)
   let table = getAggrTable conf "order_table" (coerce numPartitions)
   stats <- newTVarIO $ LatencyStats 0 1
+  -- TODO: use async for all of the threads below.
   forM_ bws $ \bw ->
     forkIO $ orderGeneratorLoop db
                                 bw
@@ -382,10 +387,10 @@ mainLoop db ss Args{ generatorNumThreads
                                 awaitedOrders
                                 (coerce generatorWatchResults)
   void $ forkIO $ latencyReportLoop stats
-  forkIO $ forever $ do
+  _ <- forkIO $ forever $ do
     when (coerce printTopicStats) $ printStats db ss (coerce numPartitions)
     threadDelay 1000000
-  forkIO $ forever $ do
+  _ <- forkIO $ forever $ do
     printWatermarkLag db (topicWatermarkSS $ fromJust $ streamTopic input) (AT.aggrTableWatermarkSS table)
     threadDelay 1000000
   if coerce streamRun
@@ -398,7 +403,9 @@ cleanup db ss = catches (do
   let (delBegin, delEnd) = rangeKeys $ subspaceRange ss
   runTransactionWithConfig defaultConfig {timeout = 5000} db $ clearRange delBegin delEnd
   putStrLn "Cleanup successful")
-  [Handler $ \(CError err) -> putStrLn $ "Caught " ++ show err ++ "while clearing subspace"]
+  [Handler $ \case
+     (CError err) -> putStrLn $ "Caught " ++ show err ++ "while clearing subspace"
+     (Error err) -> putStrLn $ "Caught " ++ show err ++ "while clearing subspace"]
 
 wordCount :: MonadStream m => Stream Text -> m (AT.AggrTable Text (Sum Int))
 wordCount txts = aggregate "counts" (groupBy Text.words txts) (const (Sum 1))
@@ -416,6 +423,7 @@ data Args f = Args
   , numLeaseThreads :: f Int
   , watermark :: f Bool
   , numPartitions :: f Word8
+  , bytesPerChunk :: f Word16
   }
   deriving (Generic)
 
@@ -438,6 +446,7 @@ applyDefaults Args{..} = Args
   , numLeaseThreads = dflt 12 numLeaseThreads
   , watermark = dflt False watermark
   , numPartitions = dflt 2 numPartitions
+  , bytesPerChunk = dflt 4096 bytesPerChunk
   }
 
   where dflt d x = Identity $ fromMaybe d x

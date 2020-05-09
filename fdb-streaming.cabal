@@ -63,7 +63,8 @@ library
       time,
       safe,
       simple-logger,
-      stm
+      stm,
+      streamly
   default-language: Haskell2010
 
 executable fdb-streaming-highlevel
