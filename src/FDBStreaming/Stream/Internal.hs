@@ -60,7 +60,7 @@ type StreamReadAndCheckpoint a state =
   FDB.Subspace ->
   Word16 ->
   state ->
-  Transaction (Maybe Topic.Checkpoint, Seq a)
+  Transaction (Seq (Maybe Topic.Checkpoint, a))
 
 -- TODO: say we have a topology like
 --
@@ -99,14 +99,7 @@ data Stream a
         -- again. User-defined stream readers should return 'Nothing' for
         -- the Topic 'Checkpoint'; this value is used to persist watermarks for
         -- streams that are stored inside FoundationDB as 'Topic's.
-        streamReadAndCheckpoint ::
-          JobConfig ->
-          ReaderName ->
-          PartitionId ->
-          FDB.Subspace ->
-          Word16 ->
-          state ->
-          Transaction (Maybe Topic.Checkpoint, Seq a),
+        streamReadAndCheckpoint :: StreamReadAndCheckpoint a state,
         -- | The minimum number of threads that must concurrently read from
         -- the stream in order to maintain real-time throughput.
         streamMinReaderPartitions :: Integer,
@@ -184,7 +177,7 @@ customStream readBatch minThreads wmFn streamName setUp destroy =
                 for_
                   (maximumMay (mapMaybe (fromJust wmFn) msgs))
                   $ \wm -> setWatermark wmSS wm
-            return (Nothing, msgs),
+            return (fmap (Nothing,) msgs),
           streamMinReaderPartitions = minThreads,
           streamWatermarkSS = case wmFn of
             Nothing -> Nothing
@@ -233,7 +226,7 @@ instance Filterable Stream where
   mapMaybe g Stream {..} =
     Stream
       { streamReadAndCheckpoint = \cfg rdNm pid ss batchSize state ->
-          (\(ckpt, xs) -> (ckpt, mapMaybe g xs))
+          mapMaybe (mapM g)
             <$> streamReadAndCheckpoint cfg rdNm pid ss batchSize state,
         ..
       }
@@ -265,7 +258,7 @@ streamFromTopic :: Topic -> StreamName -> Stream ByteString
 streamFromTopic tc streamName =
   Stream
     { streamReadAndCheckpoint = \_cfg rn pid _chkptSS n _state ->
-        fmap (\(c,xs) -> (Just c, xs)) $ Topic.readNAndCheckpoint tc pid rn n,
+        fmap (fmap (\(c,xs) -> (Just c, xs))) $ Topic.readNAndCheckpoint tc pid rn n,
       streamMinReaderPartitions = fromIntegral $ Topic.numPartitions tc,
       streamWatermarkSS = Nothing,
       streamTopic = Just tc,

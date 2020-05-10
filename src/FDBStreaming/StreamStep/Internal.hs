@@ -72,7 +72,7 @@ data StreamStep outMsg runResult where
       -- reason I can see that pipeStep and this callback both need to exist.
       -- Same with the other constructors.
       streamProcessorProcessBatch ::
-        (Maybe Checkpoint, Seq a) ->
+        Seq (Maybe Checkpoint, a) ->
         Transaction (Seq b),
       streamProcessorStreamStepConfig :: StreamStepConfig
     } ->
@@ -95,12 +95,12 @@ data StreamStep outMsg runResult where
       -- the user created, too.
       stream2ProcessorRunBatchL ::
         ( Topic ->
-          (Maybe Checkpoint, Seq a1) ->
+          Seq (Maybe Checkpoint, a1) ->
           Transaction (Seq b)
         ),
       stream2ProcessorRunBatchR ::
         ( Topic ->
-          (Maybe Checkpoint, Seq a2) ->
+          Seq (Maybe Checkpoint, a2) ->
           Transaction (Seq b)
         ),
       stream2ProcessorStreamStepConfig :: StreamStepConfig

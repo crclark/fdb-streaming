@@ -4,6 +4,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE TypeApplications #-}
 
 module FDBStreaming.Topic
   ( TopicName,
@@ -31,7 +32,6 @@ module FDBStreaming.Topic
   )
 where
 
-import Control.Monad (when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async
@@ -51,11 +51,12 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.ByteString.Lazy (fromStrict, toStrict)
 import Data.Foldable (forM_)
+import Data.Function ((&))
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Maybe (fromMaybe)
 import qualified Data.Sequence as Seq
-import Data.Sequence (Seq ((:|>), (:<|)))
+import Data.Sequence (Seq ((:|>)))
 import Data.Traversable (for)
 import Data.Word
   ( Word16,
@@ -63,7 +64,7 @@ import Data.Word
     Word8,
   )
 
-import FDBStreaming.Util (chunksOfSize)
+import FDBStreaming.Util (chunksOfSize, streamlyRangeResult)
 import qualified FDBStreaming.Topic.Constants as C
 import qualified FoundationDB as FDB
 import FoundationDB as FDB (Database, FutureIO, KeySelector (FirstGreaterOrEq, FirstGreaterThan), Range (Range), Transaction, atomicOp, await, awaitIO, getKey, runTransaction, watch)
@@ -77,7 +78,7 @@ import FoundationDB.Versionstamp
       ),
     VersionstampCompleteness (Complete),
   )
-import GHC.Exts (fromList)
+import qualified Streamly.Prelude as S
 import System.Random (randomRIO)
 
 -- | Integer zero, little endian
@@ -301,6 +302,20 @@ parseTopicKV Topic {..} p (k, v) =
       unBytes (FDB.Bytes x : xs) = x : unBytes xs
       unBytes _                  = error "unreachable case in parseTopicKV"
 
+-- | Parse a topic key/value pair (in the format (versionstamp, sequence of
+-- messages)) to a list of messages, each paired with the Checkpoint that points
+-- to that message. This checkpoint is the checkpoint that we
+-- would use if we were to stop reading at that message.
+topicKVToCheckpointMessage ::
+  Topic ->
+  PartitionId ->
+  (ByteString, ByteString)
+  -> [(Checkpoint, ByteString)]
+topicKVToCheckpointMessage t pid kv =
+  let (vs, msgs) = parseTopicKV t pid kv
+      imsgs = zip [0..] msgs
+      in [(Checkpoint vs i, msg) | (i, msg) <- imsgs]
+
 newtype TopicWatch = TopicWatch {unTopicWatch :: [FutureIO PartitionId]}
   deriving (Show)
 
@@ -409,9 +424,7 @@ getCheckpoint topic p rn = do
   let cpk = readerCheckpointKey topic p rn
   bs <- FDB.get cpk >>= await
   case decodeCheckpoint <$> bs of
-    Just vs -> do
-      liftIO $ putStrLn $ "Checkpoint: " ++ show vs
-      return vs
+    Just vs -> return vs
     Nothing -> return (Checkpoint minBound (-1))
 
 -- | Return all checkpoints for all partitions for a reader.
@@ -431,13 +444,14 @@ getCheckpoints topic rn = do
       -- futures to handle this.
       FDB.RangeMore _ _ -> error "Internal error: unexpectedly large number of partitions"
 
+
 -- | Read n messages past the given checkpoint. The message pointed to by the
 -- checkpoint is not included in the results -- remember that checkpoints point
 -- at the last message acknowledged to have been read.
 -- Returns a sequence of messages, and a Checkpoint pointing at the last
 -- message in that sequence.
--- NOTE: doing readNPastCheckpoint as a snapshot read breaks the exactly-once
--- guarantee.
+-- WARNING: wrapping readNPastCheckpoint with 'withSnapshot' breaks the
+-- exactly-once guarantee.
 -- TODO: in some cases this will return a checkpoint that points at the last
 -- message of a chunk. In that case, when we read again, we unnecessarily read
 -- that key again, even though there are no more unread messages in it. Could we
@@ -448,11 +462,9 @@ readNPastCheckpoint ::
   PartitionId ->
   ReaderName ->
   Word16 ->
-  Transaction (Checkpoint, Seq ByteString)
+  Transaction (Seq (Checkpoint, ByteString))
 readNPastCheckpoint topic pid rn n = do
-  liftIO  $ putStrLn $ "Reading from pid: " ++ show pid
-  liftIO $ putStrLn $ "reading with limit: " ++ show n
-  cp@(Checkpoint cpvs cpi) <- getCheckpoint topic pid rn
+  ckpt@(Checkpoint cpvs _) <- getCheckpoint topic pid rn
   let begin = FDB.pack (partitionMsgsSS topic pid) [FDB.CompleteVS cpvs]
   let end = prefixRangeEnd $ FDB.subspaceKey (partitionMsgsSS topic pid)
   let r = Range
@@ -463,88 +475,18 @@ readNPastCheckpoint topic pid rn n = do
           rangeLimit = Just (fromIntegral n + 1),
           rangeReverse = False
         }
-  rr <- FDB.getRange' r FDB.StreamingModeSmall
-  (cp', xs) <- go rr cpvs cpi mempty
-  liftIO $ putStrLn $ "new checkpoint: " ++ show cp'
-  when (cp == cp') (liftIO $ putStrLn "Warning: checkpoint unchanged")
-  return (cp', xs)
-
-  where
-    -- TODO: the code below is really ugly. We have to duplicate some of the
-    -- logic twice: once to iterate over the range result, and once to iterate
-    -- over each chunk of results returned by FDB. A streaming library would
-    -- probably allow us to clean this up a lot. Alternatively, translate the
-    -- stream of future result chunks into a stream of k/vs, essentially doing
-    -- what a streaming library would do, but manually.
-    go :: FDB.Future FDB.RangeResult
-       -> Versionstamp 'Complete
-       -> Int
-       -> Seq ByteString
-       -> Transaction (Checkpoint, Seq ByteString)
-    go frr cpvs cpi result = do
-      liftIO $ putStrLn $ "go: result so far: " ++ show result
-      let nSoFar = fromIntegral $ length result
-      if nSoFar == n
-        then do
-          liftIO $ putStrLn "got desired n; ending"
-          FDB.cancelFuture frr
-          return (Checkpoint cpvs cpi, result)
-        else do
-          rr <- FDB.await frr
-          let kvs = rangeKVs rr
-          liftIO $ putStrLn $ "unparsed: " ++ show kvs
-          let parsed = dropPrefix cpi $ fmap (parseTopicKV topic pid) kvs
-          liftIO $ putStrLn $ "parsed: " ++ show parsed
-          let nStillNeeded = n - nSoFar
-          let tut@(cpvs', cpi', ms) = takeUpTo nStillNeeded cpvs cpi parsed
-          liftIO $ putStrLn $ "takeUpTo returns: " ++ show tut
-          case rangeMore rr of
-            Nothing -> do
-              liftIO $ putStrLn "no more in the range read, ending"
-              return (Checkpoint cpvs' cpi', result <> ms)
-            Just fm -> go fm cpvs' cpi' (result <> ms)
-
-    -- | Drop the first part of the first chunk to respect the chunk index of
-    -- the checkpoint.
-    dropPrefix :: Int
-               -> Seq (Versionstamp 'Complete, [ByteString])
-               -> Seq (Versionstamp 'Complete, [ByteString])
-    dropPrefix _ Seq.Empty = Seq.Empty
-    dropPrefix m ((cpvs, ms) :<| ys) = (cpvs, drop (m + 1) ms) :<| ys
-
-    takeUpTo :: Word16
-             -> Versionstamp 'Complete
-             -> Int
-             -> Seq (Versionstamp 'Complete, [ByteString])
-             -> (Versionstamp 'Complete, Int, Seq ByteString)
-    takeUpTo 0 cpvs cpi _         = (cpvs, cpi, mempty)
-    takeUpTo _ cpvs cpi Seq.Empty = (cpvs, cpi, mempty)
-    takeUpTo p cpvs cpi ((cpvs', chunk) :<| xs)
-      | length chunk == fromIntegral p =
-        ( cpvs'
-        -- The cpvs' == cpvs case accounts for dropPrefix having altered the
-        -- length of the first chunk.
-        , if cpvs' == cpvs then cpi + length chunk else length chunk
-        , fromList chunk)
-      | length chunk > fromIntegral p  =
-        ( cpvs'
-        , if cpvs' == cpvs then cpi + fromIntegral p else fromIntegral p - 1
-        , fromList $ take (fromIntegral p) chunk)
-      | length chunk < fromIntegral p =
-        let chunkSeq = fromList chunk
-        -- TODO: not tail-recursive :(
-            (cpvs'', cpi'', rest) = takeUpTo (p - fromIntegral (length chunk))
-                                             cpvs'
-                                             (length chunk - 1)
-                                             xs
-            in (cpvs'', cpi'', chunkSeq <> rest)
-    takeUpTo _ _ _ _ = error "confused pattern match exhaustiveness checker"
-
-    rangeKVs (FDB.RangeDone kvs)   = kvs
-    rangeKVs (FDB.RangeMore kvs _) = kvs
-
-    rangeMore (FDB.RangeDone _)   = Nothing
-    rangeMore (FDB.RangeMore _ m) = Just m
+  rr <- FDB.getRange' r FDB.StreamingModeSmall >>= FDB.await
+  streamlyRangeResult rr
+    -- Parse bytestrings to Stream of chunks: Stream [(Checkpoint, ByteString)]
+    & fmap (topicKVToCheckpointMessage topic pid)
+    -- flatten chunks into top-level stream: Stream (Checkpoint, ByteString)
+    & S.concatMap S.fromFoldable
+    -- Drop msgs that we have already processed
+    & S.dropWhile ((<= ckpt) . fst)
+    -- take the requested number of msgs
+    & S.take (fromIntegral n)
+    & S.toList
+    & fmap Seq.fromList
 
 -- | Read N messages from the given topic partition. These messages are guaranteed
 -- to be previously unseen for the given ReaderName, and will be checkpointed so
@@ -554,10 +496,10 @@ readNAndCheckpoint ::
   PartitionId ->
   ReaderName ->
   Word16 ->
-  Transaction (Checkpoint, Seq ByteString)
+  Transaction (Seq (Checkpoint, ByteString))
 readNAndCheckpoint topic@Topic {..} p rn n =
   readNPastCheckpoint topic p rn n >>= \case
-    x@(ckpt, _ :|> _) -> do
+    x@(_ :|> (ckpt, _)) -> do
       checkpoint topic p rn ckpt
       return x
     x -> return x
@@ -569,7 +511,7 @@ readNAndCheckpointIO ::
   Topic ->
   ReaderName ->
   Word16 ->
-  IO (Checkpoint, Seq ByteString)
+  IO (Seq (Checkpoint, ByteString))
 readNAndCheckpointIO db topic@Topic {..} rn n = do
   p <- randPartition topic
   FDB.runTransaction db (readNAndCheckpoint topic p rn n)

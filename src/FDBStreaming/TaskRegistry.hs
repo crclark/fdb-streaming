@@ -23,6 +23,7 @@ import           Data.Map (Map)
 import qualified Data.Map as M
 
 import FDBStreaming.TaskLease (TaskSpace, TaskName, TaskID, ReleaseResult, EnsureTaskResult(AlreadyExists, NewlyCreated), taskSpace, ensureTask, acquireRandomUnbiased, isLeaseValid, isLocked, release)
+import FDBStreaming.Util (logAndRethrowErrors)
 
 -- | A registry to store continuously-recurring tasks. Processes can ask the
 -- registry for a task assignment. The registry is responsible for acquiring
@@ -104,7 +105,8 @@ runRandomTask db (TaskRegistry ts tr) = do
                    <> " acquired by "
                    <> showText howAcquired
 
-        f ((&&) <$> isLeaseValid ts taskID lease
-                <*> isLocked ts taskName)
+        logAndRethrowErrors (show taskName)
+          $ f ((&&) <$> isLeaseValid ts taskID lease
+                    <*> isLocked ts taskName)
           (release ts taskName lease)
         return True

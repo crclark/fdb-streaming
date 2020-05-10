@@ -15,7 +15,7 @@ import Test.Tasty.HUnit ((@?=), testCase)
 import FoundationDB (Database, runTransaction)
 import FoundationDB.Layer.Subspace (Subspace)
 import Spec.FDBStreaming.Util (extendRand)
-import FDBStreaming.Topic (writeTopic, getEntireTopic, writeTopicIO, readNAndCheckpoint, readNAndCheckpointIO, makeTopic, getTopicCount, getPartitionCount)
+import FDBStreaming.Topic (writeTopic, PartitionId, getEntireTopic, writeTopicIO, readNAndCheckpoint, readNAndCheckpointIO, makeTopic, getTopicCount, getPartitionCount)
 
 readWrite :: Subspace -> Database -> TestTree
 readWrite testSS db = testCase "writeTopic and readNAndCheckpoint" $ do
@@ -23,7 +23,7 @@ readWrite testSS db = testCase "writeTopic and readNAndCheckpoint" $ do
   let topic = makeTopic ss "test" 3 0
   let write pid xs =
         runTransaction db $ void $ writeTopic topic pid xs
-  let readP pid = fmap snd $ runTransaction db $ readNAndCheckpoint topic pid "tr" 3
+  let readP pid = fmap (fmap snd) $ runTransaction db $ readNAndCheckpoint topic pid "tr" 3
   -- write to each of the three partitions
   write 0 ["1", "2", "3"]
   write 1 ["4", "5", "6"]
@@ -32,7 +32,7 @@ readWrite testSS db = testCase "writeTopic and readNAndCheckpoint" $ do
   xs1 <- readP 0
   xs2 <- readP 1
   xs3 <- readP 2
-  xs1 @?= ["1", "2", "3"]
+  xs1 @?= (["1", "2", "3"] :: Seq.Seq BS.ByteString)
   xs2 @?= ["4", "5", "6"]
   xs3 @?= ["7", "8", "9"]
 
@@ -65,9 +65,9 @@ checkpoints testSS db = testCase "readNAndCheckpoint2" $ do
   ss <- extendRand testSS
   let topic = makeTopic ss "test" 1 0
   void $ writeTopicIO db topic ["1", "2", "3", "4", "5"]
-  xs1 <- snd <$> readNAndCheckpointIO db topic "tr" 2
-  xs2 <- snd <$> readNAndCheckpointIO db topic "tr" 2
-  xs3 <- snd <$> readNAndCheckpointIO db topic "tr" 1
+  xs1 <- fmap snd <$> readNAndCheckpointIO db topic "tr" 2
+  xs2 <- fmap snd <$> readNAndCheckpointIO db topic "tr" 2
+  xs3 <- fmap snd <$> readNAndCheckpointIO db topic "tr" 1
   liftIO $ putStrLn $ show xs1 ++ ": " ++ show xs2 ++ ": " ++ show xs3
   entire <- runTransaction db $ getEntireTopic topic
   liftIO $ putStrLn $ "entire: " ++ show entire
@@ -75,7 +75,7 @@ checkpoints testSS db = testCase "readNAndCheckpoint2" $ do
   xs2 @?= ["3", "4"]
   xs3 @?= ["5"]
 
-  xs4 <- snd <$> readNAndCheckpointIO db topic "tr2" 2
+  xs4 <- fmap snd <$> readNAndCheckpointIO db topic "tr2" 2
   xs4 @?= ["1", "2"]
 
 chunking :: Subspace -> Database -> TestTree
@@ -85,18 +85,18 @@ chunking testSS db = testCase "topic chunking" $ do
   void $ writeTopicIO db topic ["1", "2", "3", "4", "5"]
   void $ writeTopicIO db topic ["6", "7", "8", "9", "10"]
   void $ writeTopicIO db topic ["11", "12", "13", "14", "15"]
-  xs1 <- snd <$> readNAndCheckpointIO db topic "tr" 3
-  xs2 <- snd <$> readNAndCheckpointIO db topic "tr" 3
+  xs1 <- fmap snd <$> readNAndCheckpointIO db topic "tr" 3
+  xs2 <- fmap snd <$> readNAndCheckpointIO db topic "tr" 3
 
-  xs3 <- snd <$> readNAndCheckpointIO db topic "tr" 4
+  xs3 <- fmap snd <$> readNAndCheckpointIO db topic "tr" 4
 
-  xs4 <- snd <$> readNAndCheckpointIO db topic "tr" 1
+  xs4 <- fmap snd <$> readNAndCheckpointIO db topic "tr" 1
 
-  xs5 <- snd <$> readNAndCheckpointIO db topic "tr" 1
+  xs5 <- fmap snd <$> readNAndCheckpointIO db topic "tr" 1
 
-  xs6 <- snd <$> readNAndCheckpointIO db topic "tr" 2
+  xs6 <- fmap snd <$> readNAndCheckpointIO db topic "tr" 2
 
-  xs7 <- snd <$> readNAndCheckpointIO db topic "tr" 5
+  xs7 <- fmap snd <$> readNAndCheckpointIO db topic "tr" 5
 
   xs1 @?= ["1", "2", "3"]
 
@@ -112,7 +112,7 @@ chunking testSS db = testCase "topic chunking" $ do
 
   xs7 @?= ["15"]
 
-  xs8 <- snd <$> readNAndCheckpointIO db topic "tr2" 15
+  xs8 <- fmap snd <$> readNAndCheckpointIO db topic "tr2" 15
   xs8 @?= Seq.fromList [BS.pack (show @Int x) | x <- [1..15]]
 
 topicTests :: Subspace -> Database -> TestTree

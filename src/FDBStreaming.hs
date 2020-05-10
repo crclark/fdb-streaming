@@ -340,7 +340,7 @@ import FoundationDB.Versionstamp
     Versionstamp (CompleteVersionstamp),
     VersionstampCompleteness (Complete),
   )
-import Safe.Foldable (minimumDef, minimumMay)
+import Safe.Foldable (minimumBound, minimumMay)
 import System.Clock (Clock (Monotonic), diffTimeSpec, getTime, toNanoSecs)
 import qualified System.Metrics as Metrics
 import System.Metrics.Counter (Counter)
@@ -430,9 +430,11 @@ watermarkSS jobSS stream = case streamWatermarkSS stream of
 benignIO :: (a -> IO (Maybe b)) -> Stream a -> Stream b
 benignIO g (Stream rc np wmSS stc streamName setUp destroy) =
   build $ \cfg rn pid ss n state -> do
-    (mckpt, xs) <- rc cfg rn pid ss n state
-    xs' <- flip witherM xs $ \x -> liftIO (g x)
-    return (mckpt, xs')
+    xs <- rc cfg rn pid ss n state
+    -- NOTE: functions like this must always be run after checkpointing, or
+    -- we could filter out the last message we see and make no progress forever.
+    xs' <- flip witherM xs $ \(c, x) -> (fmap (c,)) <$> liftIO (g x)
+    return xs'
   where
     build x = Stream x np wmSS stc streamName setUp destroy
 
@@ -583,7 +585,7 @@ defaultWatermark topicsAndReaders wmSS = do
     chkptsF <- getCheckpoints parent rn
     return $
       flip fmap chkptsF \ckpts ->
-        (parent, minimumDef minBound ckpts)
+        (parent, minimumBound minBound ckpts)
   minCheckpoints <- for minCheckpointsF await
   parentWMsF <- for minCheckpoints \(parent, Topic.Checkpoint vs _) ->
     getWatermark (topicWatermarkSS parent) $ transactionV $ conservativeVS vs
@@ -653,7 +655,7 @@ atLeastOnce sn input f = void $ do
     StreamProcessor
       { streamProcessorInStream = input,
         streamProcessorWatermarkBy = NoWatermark,
-        streamProcessorProcessBatch = mapM (liftIO . f) . snd,
+        streamProcessorProcessBatch = mapM (liftIO . f . snd),
         streamProcessorStreamStepConfig = defaultStreamStepConfig
       }
 
@@ -690,7 +692,7 @@ pipe' input f =
         if isStreamWatermarked input
           then DefaultWatermark
           else NoWatermark,
-      streamProcessorProcessBatch = fmap catMaybes . mapM (liftIO . f) . snd,
+      streamProcessorProcessBatch = fmap catMaybes . mapM (liftIO . f . snd),
       streamProcessorStreamStepConfig = defaultStreamStepConfig
     }
 
@@ -1260,7 +1262,7 @@ pipeStep ::
   state ->
   Topic ->
   StepName ->
-  ((Maybe Checkpoint, Seq a) -> Transaction (Seq b)) ->
+  (Seq (Maybe Checkpoint, a) -> Transaction (Seq b)) ->
   Maybe StreamEdgeMetrics ->
   PartitionId ->
   Transaction (Int, Seq b)
@@ -1276,7 +1278,7 @@ pipeStep
   metrics
   pid = do
     let checkpointSS = streamConsumerCheckpointSS (jobConfigSS jobCfg) inStream sn
-    (mckpt, inMsgs) <-
+    inMsgs <-
       readAndCheckpoint
         jobCfg
         sn
@@ -1286,7 +1288,7 @@ pipeStep
         state
     liftIO $ when (Seq.null inMsgs) (incrEmptyBatchCount metrics)
     liftIO $ recordMsgsPerBatch metrics (Seq.length inMsgs)
-    ys <- transformBatch (mckpt, inMsgs)
+    ys <- transformBatch inMsgs
     let outMsgs = fmap toMessage ys
     p' <- liftIO $ randPartition outCfg
     void $ writeTopic outCfg p' (toList outMsgs)
@@ -1302,9 +1304,9 @@ oneToOneJoinStep ::
   Int ->
   (a1 -> c) ->
   (a1 -> a2 -> b) ->
-  (Maybe Checkpoint, Seq a1) ->
+  Seq (Maybe Checkpoint, a1) ->
   Transaction (Seq b)
-oneToOneJoinStep outputTopic streamJoinIx pl combiner (_mckpt, msgs) = do
+oneToOneJoinStep outputTopic streamJoinIx pl combiner ckptmsgs = do
   -- Read from one of the two join streams, and for each
   -- message read, compute the join key. Using the join key, look in the
   -- join table to see if the partner is already there. If so, write the tuple
@@ -1314,7 +1316,7 @@ oneToOneJoinStep outputTopic streamJoinIx pl combiner (_mckpt, msgs) = do
   let joinSS = topicCustomMetadataSS outputTopic
   let otherIx = if streamJoinIx == 0 then 1 else 0
   joinFutures <-
-    for msgs \msg -> do
+    for ckptmsgs \(_,msg) -> do
       let k = pl msg
       joinF <- withSnapshot $ get1to1JoinData joinSS sn otherIx k
       return (k, msg, joinF)
@@ -1356,9 +1358,7 @@ aggregateStep
   metrics
   pid = do
     let checkpointSS = streamConsumerCheckpointSS (jobConfigSS jobCfg) inStream sn
-    msgs <-
-      snd
-        <$> streamReadAndCheckpoint
+    msgs <- fmap snd <$> streamReadAndCheckpoint
           jobCfg
           sn
           pid
