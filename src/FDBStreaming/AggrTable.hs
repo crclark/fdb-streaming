@@ -259,7 +259,7 @@ getBlocking db at k = do
                 $ \w ->
                   async
                   $ catch (FDB.awaitInterruptibleIO w)
-                    $ \(_e :: AsyncCancelled) -> FDB.cancelFutureIO w
+                    $ \(_e :: AsyncCancelled) -> Right <$> FDB.cancelFutureIO w
       waitAnyCancel asyncs >> getBlocking db at k
 
 -- | Look up the value in a table for a given key.

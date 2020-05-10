@@ -48,18 +48,18 @@ packages:
     commit: d82f384cc127e8bbabb774407d225ef07f341076
 - completed:
     cabal-file:
-      size: 5494
-      sha256: 906c3a8fb5ca75e86bf5f46c9a39ccc0f2672552a67427288618e9cdbd15e404
+      size: 5540
+      sha256: 43c29e569c77756aef68e14b5d00f3b1b2bf6e229c58ecceba4ff6b0b3abdd0d
     name: foundationdb-haskell
     version: 0.1.0.0
     git: https://github.com/crclark/foundationdb-haskell.git
     pantry-tree:
-      size: 2590
-      sha256: 7d4b1c7308c8384c57cfe8a515630383f7b80141ee71547a02b322568fee0a79
-    commit: 9053373fdffb49d6350b359f5720ee1f89b61bad
+      size: 7586
+      sha256: 5de3b416d5bee737cb4b9e4c1c7580804aad87139138f3999aa97316154a58d2
+    commit: ccd206bb19343469d8cc50362230f6bab2630fa3
   original:
     git: https://github.com/crclark/foundationdb-haskell.git
-    commit: 9053373fdffb49d6350b359f5720ee1f89b61bad
+    commit: ccd206bb19343469d8cc50362230f6bab2630fa3
 - completed:
     hackage: simple-logger-0.0.4@sha256:d66b9804a4ec63a2e4b5b284cfec892c5d881050a53947314710eb4b1a1ba91f,1008
     pantry-tree:
