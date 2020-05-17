@@ -32,7 +32,6 @@ module FDBStreaming.Topic
   )
 where
 
-import Control.Monad.IO.Class (liftIO)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async
   ( async,
@@ -70,7 +69,7 @@ import qualified FoundationDB as FDB
 import FoundationDB as FDB (Database, FutureIO, KeySelector (FirstGreaterOrEq, FirstGreaterThan), Range (Range), Transaction, atomicOp, await, awaitIO, getKey, runTransaction, watch)
 import qualified FoundationDB.Layer.Subspace as FDB
 import qualified FoundationDB.Layer.Tuple as FDB
-import qualified FoundationDB.Options as Op
+import qualified FoundationDB.Options.MutationType as Mut
 import FoundationDB.Transaction (prefixRangeEnd)
 import FoundationDB.Versionstamp
   ( Versionstamp
@@ -213,7 +212,7 @@ incrPartitionCountBy :: Topic -> PartitionId -> Word64 -> Transaction ()
 incrPartitionCountBy topic pid n = do
   let k = partitionCountKey topic pid
   let bs = runPut $ putWord64le n
-  FDB.atomicOp k (Op.add $ toStrict bs)
+  FDB.atomicOp k (Mut.add $ toStrict bs)
 
 getPartitionCount :: Topic -> PartitionId -> Transaction Word64
 getPartitionCount topic i = do
@@ -260,7 +259,7 @@ writeTopic topic@Topic {..} p bss = do
                            ]
   forM_ keyedIndexedChunks $ \(k, bs) -> do
     let v = FDB.encodeTupleElems (map (FDB.Bytes . snd) bs)
-    FDB.atomicOp k (Op.setVersionstampedKey v)
+    FDB.atomicOp k (Mut.setVersionstampedKey v)
   return [(k, i) | (k,cs) <- keyedIndexedChunks, (i,_) <- cs]
 
 -- TODO: support messages larger than FDB size limit, via chunking.
@@ -404,7 +403,7 @@ checkpoint ::
 checkpoint topic p rn (Checkpoint vs i) = do
   let k = readerCheckpointKey topic p rn
   let v = FDB.encodeTupleElems [FDB.CompleteVS vs, FDB.Int (fromIntegral i)]
-  FDB.atomicOp k (Op.byteMax v)
+  FDB.atomicOp k (Mut.byteMax v)
 
 decodeCheckpoint :: ByteString -> Checkpoint
 decodeCheckpoint bs = case FDB.decodeTupleElems bs of

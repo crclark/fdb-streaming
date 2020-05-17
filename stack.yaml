@@ -48,7 +48,7 @@ extra-deps:
   - git: git@github.com:Shimuuar/monoid-statistics.git
     commit: d82f384cc127e8bbabb774407d225ef07f341076
   - git: https://github.com/crclark/foundationdb-haskell.git
-    commit: ccd206bb19343469d8cc50362230f6bab2630fa3
+    commit: 3e7559bb1c3509d17a0af3ce922fa80aa758477b
   - simple-logger-0.0.4@sha256:d66b9804a4ec63a2e4b5b284cfec892c5d881050a53947314710eb4b1a1ba91f,1008
 # Override default flag values for local packages and extra-deps
 # flags: {}

@@ -38,7 +38,7 @@ import FoundationDB as FDB
   )
 import qualified FoundationDB.Layer.Subspace as FDB
 import qualified FoundationDB.Layer.Tuple as FDB
-import qualified FoundationDB.Options as FDB
+import qualified FoundationDB.Options.MutationType as Mut
 import qualified FoundationDB.Versionstamp as FDB
 
 watermarkMillisSinceEpoch :: Watermark -> Int64
@@ -119,7 +119,7 @@ setWatermark :: WatermarkSS -> Watermark -> Transaction ()
 setWatermark ss watermark = do
   current <- getCurrentWatermark ss >>= FDB.await
   let k = watermarkIncompleteKey ss $ maybe watermark (max watermark) current
-  FDB.atomicOp k (FDB.setVersionstampedKey "")
+  FDB.atomicOp k (Mut.setVersionstampedKey "")
 
 parseWatermarkKeyResult :: WatermarkSS -> ByteString -> Maybe Watermark
 parseWatermarkKeyResult ss k = case FDB.unpack ss k of
