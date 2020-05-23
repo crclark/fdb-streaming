@@ -52,6 +52,7 @@ import           FoundationDB                  as FDB
 import           FoundationDB.Error
 import           FoundationDB.Layer.Subspace   as FDB
 import           FoundationDB.Layer.Tuple      as FDB
+import qualified FoundationDB.Options.NetworkOption as NetOp
 import Data.Foldable (for_)
 import Data.UUID as UUID
 import           Data.UUID                      ( UUID )
@@ -451,8 +452,16 @@ applyDefaults Args{..} = Args
 
   where dflt d x = Identity $ fromMaybe d x
 
+options :: FDB.FoundationDBOptions
+options = defaultOptions {
+  networkOptions = [ NetOp.traceEnable "/home/connor/Dropbox/haskell/fdb-streaming"
+                   , NetOp.traceRollSize 0
+                   , NetOp.traceFormat "json"
+                   ]
+}
+
 main :: IO ()
-main = withFoundationDB defaultOptions $ \db -> do
+main = withFoundationDB options $ \db -> do
   args@Args {subspaceName, cleanupFirst} <- applyDefaults <$> getRecord "stream test"
   let ss = FDB.subspace [FDB.Bytes (runIdentity subspaceName)]
   --TODO: cleanup can time out in some circumstances, which crashes the program

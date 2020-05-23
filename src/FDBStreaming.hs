@@ -15,6 +15,7 @@
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE TypeApplications #-}
 
 -- | FDBStreaming is a poorly-named, work-in-progress, proof-of-concept library
 -- for large-scale processing of unbounded data sets and sources. It is inspired
@@ -245,7 +246,7 @@ import qualified Data.Sequence as Seq
 import Data.Text.Encoding (decodeUtf8)
 import Data.Traversable (for)
 import Data.Witherable (catMaybes, witherM)
-import Data.Word (Word8, Word16, Word64)
+import Data.Word (Word8, Word16, Word32, Word64)
 import qualified FDBStreaming.AggrTable as AT
 import FDBStreaming.JobConfig (JobConfig (JobConfig, defaultNumPartitions, jobConfigDB, jobConfigSS, leaseDuration, logLevel, msgsPerBatch, numPeriodicJobThreads, numStreamThreads, streamMetricsStore, defaultChunkSizeBytes), JobSubspace)
 import FDBStreaming.Joins
@@ -335,6 +336,7 @@ import FoundationDB.Error as FDB
   )
 import qualified FoundationDB.Layer.Subspace as FDB
 import qualified FoundationDB.Layer.Tuple as FDB
+import qualified FoundationDB.Options.TransactionOption as TxOp
 import FoundationDB.Versionstamp
   ( TransactionVersionstamp (TransactionVersionstamp),
     Versionstamp (CompleteVersionstamp),
@@ -347,6 +349,9 @@ import System.Metrics.Counter (Counter)
 import qualified System.Metrics.Counter as Counter
 import System.Metrics.Distribution (Distribution)
 import qualified System.Metrics.Distribution as Distribution
+
+import System.Random (randomIO)
+import Numeric (showHex)
 
 data StreamEdgeMetrics
   = StreamEdgeMetrics
@@ -394,6 +399,8 @@ incrTimeouts m = for_ m $ Counter.inc . timeouts
 runStreamTxn :: FDB.Database -> FDB.Transaction a -> IO a
 runStreamTxn =
   FDB.runTransactionWithConfig FDB.TransactionConfig
+    -- NOTE: actually all stream transactions are idempotent, but retries are
+    -- set to zero, so it's moot.
     { FDB.idempotent = False,
       FDB.snapshotReads = False,
       -- No point in retrying since we are running in a loop
@@ -401,6 +408,13 @@ runStreamTxn =
       maxRetries = 0,
       timeout = 5000
     }
+
+setLogging :: BS8.ByteString -> Transaction a -> Transaction a
+setLogging txnName next = do
+  i <- liftIO $ randomIO @Word32
+  FDB.setOption (TxOp.debugTransactionIdentifier (BS8.unpack txnName ++ "_" ++ showHex i ""))
+  FDB.setOption (TxOp.logTransaction)
+  next
 
 {-
 
@@ -1002,6 +1016,7 @@ instance MonadStream LeaseBasedStreamWorker where
                     $ void
                     $ throttleByErrors metrics sn
                     $ runStreamTxn jobConfigDB
+                    $ setLogging lname
                     $ runCustomWatermark (topicWatermarkSS outTopic) watermarker
                     $ pipeStep
                       cfg
@@ -1025,6 +1040,7 @@ instance MonadStream LeaseBasedStreamWorker where
                     $ void
                     $ throttleByErrors metrics sn
                     $ runStreamTxn jobConfigDB
+                    $ setLogging rname
                     $ runCustomWatermark (topicWatermarkSS outTopic) watermarker
                     $ pipeStep
                       cfg
@@ -1210,10 +1226,6 @@ throttleByErrors metrics sn x =
               logWarn (showText sn <> " timed out. If this keeps happening, try reducing the batch size.")
               incrTimeouts metrics
               threadDelay 15000
-            e -> throw e
-        ),
-      Handler
-        ( \case
             Error (MaxRetriesExceeded (CError NotCommitted)) -> do
               incrConflicts metrics
               logWarn (showText sn <> " conflicted with another transaction. If this happens frequently, it may be a bug in fdb-streaming.")
