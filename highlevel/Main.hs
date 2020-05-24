@@ -461,7 +461,7 @@ options = defaultOptions {
 }
 
 main :: IO ()
-main = withFoundationDB options $ \db -> do
+main = withFoundationDB defaultOptions $ \db -> do
   args@Args {subspaceName, cleanupFirst} <- applyDefaults <$> getRecord "stream test"
   let ss = FDB.subspace [FDB.Bytes (runIdentity subspaceName)]
   --TODO: cleanup can time out in some circumstances, which crashes the program

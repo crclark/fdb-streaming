@@ -103,39 +103,6 @@ executable fdb-streaming-highlevel
     , simple-logger
   default-language: Haskell2010
 
-executable transaction-debugger
-  main-is: Main.hs
-  other-modules:
-      Paths_fdb_streaming
-  hs-source-dirs:
-      transaction-debugger
-  ghc-options: -threaded
-               -rtsopts
-               -with-rtsopts=-N
-               -Wall
-               -g
-               -O2
-  build-depends:
-      base >=4.7 && <5
-    , binary
-    , bytestring
-    , fdb-streaming
-    , foundationdb-haskell
-    , optparse-generic
-    , containers
-    , unordered-containers
-    , text
-    , streamly
-    , aeson
-    , parsers
-    , attoparsec
-    , regex-posix
-    , safe
-    , hashable
-    , Ranged-sets
-    , pretty-simple
-  default-language: Haskell2010
-
 test-suite fdb-streaming-test
   type: exitcode-stdio-1.0
   main-is: Spec.hs

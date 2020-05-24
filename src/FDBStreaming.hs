@@ -409,13 +409,6 @@ runStreamTxn =
       timeout = 5000
     }
 
-setLogging :: BS8.ByteString -> Transaction a -> Transaction a
-setLogging txnName next = do
-  i <- liftIO $ randomIO @Word32
-  FDB.setOption (TxOp.debugTransactionIdentifier (BS8.unpack txnName ++ "_" ++ showHex i ""))
-  FDB.setOption (TxOp.logTransaction)
-  next
-
 {-
 
 High-level streaming combinators -- an experiment.
@@ -1016,7 +1009,6 @@ instance MonadStream LeaseBasedStreamWorker where
                     $ void
                     $ throttleByErrors metrics sn
                     $ runStreamTxn jobConfigDB
-                    $ setLogging lname
                     $ runCustomWatermark (topicWatermarkSS outTopic) watermarker
                     $ pipeStep
                       cfg
@@ -1040,7 +1032,6 @@ instance MonadStream LeaseBasedStreamWorker where
                     $ void
                     $ throttleByErrors metrics sn
                     $ runStreamTxn jobConfigDB
-                    $ setLogging rname
                     $ runCustomWatermark (topicWatermarkSS outTopic) watermarker
                     $ pipeStep
                       cfg

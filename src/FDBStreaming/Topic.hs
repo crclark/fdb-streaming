@@ -70,6 +70,7 @@ import FoundationDB as FDB (Database, FutureIO, KeySelector (FirstGreaterOrEq, F
 import qualified FoundationDB.Layer.Subspace as FDB
 import qualified FoundationDB.Layer.Tuple as FDB
 import qualified FoundationDB.Options.MutationType as Mut
+import qualified FoundationDB.Options.TransactionOption as Op
 import FoundationDB.Transaction (prefixRangeEnd)
 import FoundationDB.Versionstamp
   ( Versionstamp
@@ -286,7 +287,7 @@ parseTopicKV ::
   (Versionstamp 'Complete, [ByteString])
 parseTopicKV Topic {..} p (k, v) =
   case (FDB.unpack (partitionMsgsSS p) k, FDB.decodeTupleElems v) of
-    (Right [FDB.CompleteVS vs], Right bs) | allBytes bs -> (vs, (unBytes bs))
+    (Right [FDB.CompleteVS vs], Right bs) | allBytes bs -> (vs, unBytes bs)
     (Right [FDB.CompleteVS _], Right _) -> error "unexpected topic chunk format"
     (Right t, _) -> error $ "unexpected tuple: " ++ show t
     (Left err, _) -> error $ "failed to decode " ++ show k ++ " because " ++ show err
@@ -474,7 +475,7 @@ readNPastCheckpoint topic pid rn n = do
           rangeLimit = Just (fromIntegral n + 1),
           rangeReverse = False
         }
-  rr <- FDB.getRange' r FDB.StreamingModeSmall >>= FDB.await
+  rr <- FDB.withSnapshot (FDB.getRange' r FDB.StreamingModeSmall) >>= FDB.await
   streamlyRangeResult rr
     -- Parse bytestrings to Stream of chunks: Stream [(Checkpoint, ByteString)]
     & fmap (topicKVToCheckpointMessage topic pid)

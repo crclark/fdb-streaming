@@ -68,9 +68,7 @@ checkpoints testSS db = testCase "readNAndCheckpoint2" $ do
   xs1 <- fmap snd <$> readNAndCheckpointIO db topic "tr" 2
   xs2 <- fmap snd <$> readNAndCheckpointIO db topic "tr" 2
   xs3 <- fmap snd <$> readNAndCheckpointIO db topic "tr" 1
-  liftIO $ putStrLn $ show xs1 ++ ": " ++ show xs2 ++ ": " ++ show xs3
   entire <- runTransaction db $ getEntireTopic topic
-  liftIO $ putStrLn $ "entire: " ++ show entire
   xs1 @?= ["1", "2"]
   xs2 @?= ["3", "4"]
   xs3 @?= ["5"]
