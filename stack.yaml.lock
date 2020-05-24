@@ -33,6 +33,20 @@ packages:
   original:
     hackage: pretty-show-1.9.5@sha256:92aa3f43d8459a9b543e102fbb0b7a6aae0074e18ca6a9970d9922a867114f53
 - completed:
+    hackage: witherable-0.3.5@sha256:6590a15735b50ac14dcc138d4265ff1585d5f3e9d3047d5ebc5abf4cd5f50084,1476
+    pantry-tree:
+      size: 271
+      sha256: b99f21dbac28da031eb7c787fbffbe5e77e0aee42b64b5dda082470e907d5ab5
+  original:
+    hackage: witherable-0.3.5@sha256:6590a15735b50ac14dcc138d4265ff1585d5f3e9d3047d5ebc5abf4cd5f50084,1476
+- completed:
+    hackage: witherable-class-0@sha256:91f05518f9f4af5b02424f13ee7dcdab5d6618e01346aa2f388a72ff93e2e501,775
+    pantry-tree:
+      size: 277
+      sha256: e99696bf95da593a3892c7b9a28db09ffd139b4b1b313f32cec9d26979aa7ce2
+  original:
+    hackage: witherable-class-0@sha256:91f05518f9f4af5b02424f13ee7dcdab5d6618e01346aa2f388a72ff93e2e501,775
+- completed:
     cabal-file:
       size: 2399
       sha256: 501ed999e587c14877d4cb8b69fdef65fb9e4eec8d11b33459d9c8978275efe5
@@ -48,18 +62,18 @@ packages:
     commit: d82f384cc127e8bbabb774407d225ef07f341076
 - completed:
     cabal-file:
-      size: 5540
-      sha256: 43c29e569c77756aef68e14b5d00f3b1b2bf6e229c58ecceba4ff6b0b3abdd0d
+      size: 7318
+      sha256: 7dbff82bc126b657692174ca304ec397c0c6d11960f181ced7ce9fb320d668a0
     name: foundationdb-haskell
     version: 0.1.0.0
     git: https://github.com/crclark/foundationdb-haskell.git
     pantry-tree:
-      size: 7586
-      sha256: 5de3b416d5bee737cb4b9e4c1c7580804aad87139138f3999aa97316154a58d2
-    commit: ccd206bb19343469d8cc50362230f6bab2630fa3
+      size: 8582
+      sha256: efc1fc2c33904c6149e51ecd7f790ad93f72b3c12556da916b2b20009f3e6c6e
+    commit: 3e7559bb1c3509d17a0af3ce922fa80aa758477b
   original:
     git: https://github.com/crclark/foundationdb-haskell.git
-    commit: ccd206bb19343469d8cc50362230f6bab2630fa3
+    commit: 3e7559bb1c3509d17a0af3ce922fa80aa758477b
 - completed:
     hackage: simple-logger-0.0.4@sha256:d66b9804a4ec63a2e4b5b284cfec892c5d881050a53947314710eb4b1a1ba91f,1008
     pantry-tree:
@@ -69,7 +83,7 @@ packages:
     hackage: simple-logger-0.0.4@sha256:d66b9804a4ec63a2e4b5b284cfec892c5d881050a53947314710eb4b1a1ba91f,1008
 snapshots:
 - completed:
-    size: 497078
-    url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/lts/13/14.yaml
-    sha256: 9e5ba48e5188aeb52bb0df9bc65dbd858a12c33f5b8d495a3eb588dc9ffcb15a
-  original: lts-13.14
+    size: 524996
+    url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/lts/14/27.yaml
+    sha256: 7ea31a280c56bf36ff591a7397cc384d0dff622e7f9e4225b47d8980f019a0f0
+  original: lts-14.27

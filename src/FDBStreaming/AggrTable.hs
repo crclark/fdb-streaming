@@ -67,7 +67,7 @@ import FDBStreaming.Message(Message (fromMessage, toMessage))
 import FDBStreaming.Topic (PartitionId)
 
 import qualified FoundationDB as FDB
-import qualified FoundationDB.Options as Op
+import qualified FoundationDB.Options.MutationType as Mut
 import qualified FoundationDB.Layer.Subspace as SS
 import qualified FoundationDB.Layer.Tuple as FDB
 import qualified FoundationDB.Versionstamp as FDB
@@ -149,7 +149,7 @@ getVia f t pid k = do
 -- | Helper function to define 'TableSemigroup.mappendBatch' easily.
 mappendAtomicVia :: TableKey k
                  => (v -> ByteString)
-                 -> (ByteString -> Op.MutationType)
+                 -> (ByteString -> Mut.MutationType)
                  -> AggrTable k v
                  -> PartitionId
                  -> k
@@ -484,7 +484,7 @@ instance PutIntLE Int where
 
 instance PutIntLE a => TableSemigroup (Sum a) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (toStrict . runPut . putIntLE . getSum) Op.add table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (toStrict . runPut . putIntLE . getSum) Mut.add table pid
   set = setVia (toStrict . runPut . putIntLE . getSum)
   get = getVia (Sum . runGet getIntLE . fromStrict)
 
@@ -503,7 +503,7 @@ tupleBytesToInt bs = case FDB.decodeTupleElems bs of
 
 instance TableSemigroup (Min Integer) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . getMin) Op.byteMin table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . getMin) Mut.byteMin table pid
   set = setVia (intToTupleBytes . getMin)
   get = getVia (Min . tupleBytesToInt)
 
@@ -513,7 +513,7 @@ instance RangeAccessibleTable (Min Integer) where
 
 instance TableSemigroup (Max Integer) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . getMax) Op.byteMax table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . getMax) Mut.byteMax table pid
   set = setVia (intToTupleBytes . getMax)
   get = getVia (Max . tupleBytesToInt)
 
@@ -523,7 +523,7 @@ instance RangeAccessibleTable (Max Integer) where
 
 instance TableSemigroup (Min Int8) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMin) Op.byteMin table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMin) Mut.byteMin table pid
   set = setVia (intToTupleBytes . toInteger . getMin)
   get = getVia (Min . fromInteger . tupleBytesToInt)
 
@@ -533,7 +533,7 @@ instance RangeAccessibleTable (Min Int8) where
 
 instance TableSemigroup (Max Int8) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMax) Op.byteMax table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMax) Mut.byteMax table pid
   set = setVia (intToTupleBytes . toInteger . getMax)
   get = getVia (Max . fromInteger . tupleBytesToInt)
 
@@ -543,7 +543,7 @@ instance RangeAccessibleTable (Max Int8) where
 
 instance TableSemigroup (Min Int16) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMin) Op.byteMin table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMin) Mut.byteMin table pid
   set = setVia (intToTupleBytes . toInteger . getMin)
   get = getVia (Min . fromInteger . tupleBytesToInt)
 
@@ -553,7 +553,7 @@ instance RangeAccessibleTable (Min Int16) where
 
 instance TableSemigroup (Max Int16) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMax) Op.byteMax table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMax) Mut.byteMax table pid
   set = setVia (intToTupleBytes . toInteger . getMax)
   get = getVia (Max . fromInteger . tupleBytesToInt)
 
@@ -563,7 +563,7 @@ instance RangeAccessibleTable (Max Int16) where
 
 instance TableSemigroup (Min Int32) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMin) Op.byteMin table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMin) Mut.byteMin table pid
   set = setVia (intToTupleBytes . toInteger . getMin)
   get = getVia (Min . fromInteger . tupleBytesToInt)
 
@@ -573,7 +573,7 @@ instance RangeAccessibleTable (Min Int32) where
 
 instance TableSemigroup (Max Int32) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMax) Op.byteMax table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMax) Mut.byteMax table pid
   set = setVia (intToTupleBytes . toInteger . getMax)
   get = getVia (Max . fromInteger . tupleBytesToInt)
 
@@ -583,7 +583,7 @@ instance RangeAccessibleTable (Max Int32) where
 
 instance TableSemigroup (Min Int64) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMin) Op.byteMin table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMin) Mut.byteMin table pid
   set = setVia (intToTupleBytes . toInteger . getMin)
   get = getVia (Min . fromInteger . tupleBytesToInt)
 
@@ -593,7 +593,7 @@ instance RangeAccessibleTable (Min Int64) where
 
 instance TableSemigroup (Max Int64) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMax) Op.byteMax table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMax) Mut.byteMax table pid
   set = setVia (intToTupleBytes . toInteger . getMax)
   get = getVia (Max . fromInteger . tupleBytesToInt)
 
@@ -603,7 +603,7 @@ instance RangeAccessibleTable (Max Int64) where
 
 instance TableSemigroup (Min Word8) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMin) Op.byteMin table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMin) Mut.byteMin table pid
   set = setVia (intToTupleBytes . toInteger . getMin)
   get = getVia (Min . fromInteger . tupleBytesToInt)
 
@@ -613,7 +613,7 @@ instance RangeAccessibleTable (Min Word8) where
 
 instance TableSemigroup (Max Word8) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMax) Op.byteMax table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMax) Mut.byteMax table pid
   set = setVia (intToTupleBytes . toInteger . getMax)
   get = getVia (Max . fromInteger . tupleBytesToInt)
 
@@ -623,7 +623,7 @@ instance RangeAccessibleTable (Max Word8) where
 
 instance TableSemigroup (Min Word16) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMin) Op.byteMin table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMin) Mut.byteMin table pid
   set = setVia (intToTupleBytes . toInteger . getMin)
   get = getVia (Min . fromInteger . tupleBytesToInt)
 
@@ -633,7 +633,7 @@ instance RangeAccessibleTable (Min Word16) where
 
 instance TableSemigroup (Max Word16) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMax) Op.byteMax table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMax) Mut.byteMax table pid
   set = setVia (intToTupleBytes . toInteger . getMax)
   get = getVia (Max . fromInteger . tupleBytesToInt)
 
@@ -643,7 +643,7 @@ instance RangeAccessibleTable (Max Word16) where
 
 instance TableSemigroup (Min Word32) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMin) Op.byteMin table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMin) Mut.byteMin table pid
   set = setVia (intToTupleBytes . toInteger . getMin)
   get = getVia (Min . fromInteger . tupleBytesToInt)
 
@@ -653,7 +653,7 @@ instance RangeAccessibleTable (Min Word32) where
 
 instance TableSemigroup (Max Word32) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMax) Op.byteMax table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMax) Mut.byteMax table pid
   set = setVia (intToTupleBytes . toInteger . getMax)
   get = getVia (Max . fromInteger . tupleBytesToInt)
 
@@ -663,7 +663,7 @@ instance RangeAccessibleTable (Max Word32) where
 
 instance TableSemigroup (Min Word64) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMin) Op.byteMin table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMin) Mut.byteMin table pid
   set = setVia (intToTupleBytes . toInteger . getMin)
   get = getVia (Min . fromInteger . tupleBytesToInt)
 
@@ -673,7 +673,7 @@ instance RangeAccessibleTable (Min Word64) where
 
 instance TableSemigroup (Max Word64) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMax) Op.byteMax table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (intToTupleBytes . toInteger . getMax) Mut.byteMax table pid
   set = setVia (intToTupleBytes . toInteger . getMax)
   get = getVia (Max . fromInteger . tupleBytesToInt)
 
@@ -701,7 +701,7 @@ tupleBytesToFloat bs = case FDB.decodeTupleElems bs of
 
 instance TableSemigroup (Min Double) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (doubleToTupleBytes . getMin) Op.byteMin table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (doubleToTupleBytes . getMin) Mut.byteMin table pid
   set = setVia (doubleToTupleBytes . getMin)
   get = getVia (Min . tupleBytesToDouble)
 
@@ -711,7 +711,7 @@ instance RangeAccessibleTable (Min Double) where
 
 instance TableSemigroup (Max Double) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (doubleToTupleBytes . getMax) Op.byteMax table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (doubleToTupleBytes . getMax) Mut.byteMax table pid
   set = setVia (doubleToTupleBytes . getMax)
   get = getVia (Max . tupleBytesToDouble)
 
@@ -721,7 +721,7 @@ instance RangeAccessibleTable (Max Double) where
 
 instance TableSemigroup (Min Float) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (floatToTupleBytes . getMin) Op.byteMin table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (floatToTupleBytes . getMin) Mut.byteMin table pid
   set = setVia (floatToTupleBytes . getMin)
   get = getVia (Min . tupleBytesToFloat)
 
@@ -731,7 +731,7 @@ instance RangeAccessibleTable (Min Float) where
 
 instance TableSemigroup (Max Float) where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia (floatToTupleBytes . getMax) Op.byteMax table pid
+    for_ kvs $ uncurry $ mappendAtomicVia (floatToTupleBytes . getMax) Mut.byteMax table pid
   set = setVia (floatToTupleBytes . getMax)
   get = getVia (Max . tupleBytesToFloat)
 
@@ -747,7 +747,7 @@ allFromBytes = All . toEnum . fromIntegral . runGet getWord8 . fromStrict
 
 instance TableSemigroup All where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia allToByte Op.bitAnd table pid
+    for_ kvs $ uncurry $ mappendAtomicVia allToByte Mut.bitAnd table pid
   set = setVia allToByte
   get = getVia allFromBytes
 
@@ -763,7 +763,7 @@ anyFromBytes = Any . toEnum . fromIntegral . runGet getWord8 . fromStrict
 
 instance TableSemigroup Any where
   mappendBatch table pid kvs =
-    for_ kvs $ uncurry $ mappendAtomicVia anyToByte Op.bitOr table pid
+    for_ kvs $ uncurry $ mappendAtomicVia anyToByte Mut.bitOr table pid
   set = setVia anyToByte
   get = getVia anyFromBytes
 

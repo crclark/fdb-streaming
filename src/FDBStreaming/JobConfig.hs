@@ -55,6 +55,10 @@ data JobConfig
         -- partitions, but having fewer writers won't significantly affect
         -- pipeline timeliness.
         defaultNumPartitions :: Word8,
+        -- | Default target number of bytes to store per k/v in topics. Small
+        -- messages will be combined into one k/v to reach this target. This
+        -- generally improves throughput and reduces disk usage in FDB.
+        defaultChunkSizeBytes :: Word,
         -- | Logging level for fdb-streaming log messages
         logLevel :: Log.LogLevel
       }

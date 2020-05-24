@@ -7,7 +7,7 @@ where
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (Async, async, poll)
-import Control.Monad (replicateM)
+import Control.Monad (replicateM, void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.ByteString.Lazy (toStrict)
@@ -42,9 +42,9 @@ writeSuccess :: FDB.Subspace -> FDB.Database -> TestTree
 writeSuccess testSS db = testCase "write" $ do
   bwSS <- extendRand testSS
   tSS <- extendRand testSS
-  let topic = makeTopic tSS "test" 1
+  let topic = makeTopic tSS "test" 1 0
   let f = writeTopic topic 0
-  bw <- BW.batchWriter BW.defaultBatchWriterConfig db bwSS f
+  bw <- BW.batchWriter BW.defaultBatchWriterConfig db bwSS (void . f)
   x <- newWrite
   res <- BW.write bw x
   res @?= BW.Success
@@ -64,7 +64,7 @@ batchSize :: FDB.Subspace -> FDB.Database -> TestTree
 batchSize testSS db = testCase "maxBatchSize" $ do
   bwSS <- extendRand testSS
   tSS <- extendRand testSS
-  let topic = makeTopic tSS "test" 1
+  let topic = makeTopic tSS "test" 1 0
   let f = writeTopic topic 0
   bw <-
     BW.batchWriter
@@ -74,7 +74,7 @@ batchSize testSS db = testCase "maxBatchSize" $ do
         }
       db
       bwSS
-      f
+      (void . f)
   [x, y] <- replicateM 2 (async $ newWrite >>= BW.write bw)
   pendingX <- isPending x
   pendingY <- isPending y
@@ -90,10 +90,10 @@ idempotencyKeyTimeout :: FDB.Subspace -> FDB.Database -> TestTree
 idempotencyKeyTimeout testSS db = testCase "minIdempotencyMemoryDurationSeconds" $ do
   bwSS <- extendRand testSS
   tSS <- extendRand testSS
-  let topic = makeTopic tSS "test" 1
+  let topic = makeTopic tSS "test" 1 0
   let f = writeTopic topic 0
   let cfg = BW.defaultBatchWriterConfig {BW.minIdempotencyMemoryDurationSeconds = 1}
-  bw <- BW.batchWriter cfg db bwSS f
+  bw <- BW.batchWriter cfg db bwSS (void . f)
   x <- newWrite
   res <- BW.write bw x
   res @?= BW.Success

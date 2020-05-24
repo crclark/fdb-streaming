@@ -62,7 +62,7 @@ import qualified FoundationDB as FDB
 import           FoundationDB.Layer.Subspace (Subspace)
 import qualified FoundationDB.Layer.Subspace as FDB
 import qualified FoundationDB.Layer.Tuple as FDB
-import qualified FoundationDB.Options as Op
+import qualified FoundationDB.Options.MutationType as Mut
 
 -- | Uniquely identifies an acquired lease on a 'TaskName'.
 newtype AcquiredLease = AcquiredLease Int
@@ -191,7 +191,7 @@ getCount l = do
 incrCount :: TaskSpace -> Transaction ()
 incrCount l = do
   let k = countKey l
-  FDB.atomicOp k (Op.add oneLE)
+  FDB.atomicOp k (Mut.add oneLE)
 
 getAcquiredLease :: TaskSpace -> TaskID -> Transaction AcquiredLease
 getAcquiredLease l taskID = do
@@ -206,7 +206,7 @@ getAcquiredLease l taskID = do
 incrAcquiredLease :: TaskSpace -> TaskID -> Transaction ()
 incrAcquiredLease l taskID = do
   let k = lockVersionKey l taskID
-  FDB.atomicOp k (Op.add oneLE)
+  FDB.atomicOp k (Mut.add oneLE)
 
 -- | Returns True iff the given lease is still the most recent lease for the
 -- given task. Does not check whether the lease has expired.

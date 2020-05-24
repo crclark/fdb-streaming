@@ -22,7 +22,7 @@ import Data.ByteString (ByteString)
 import Data.Foldable (for_)
 import Data.Maybe (fromJust, isJust)
 import Data.Sequence (Seq ())
-import Data.Witherable (Filterable, catMaybes, mapMaybe)
+import Data.Witherable (Filterable, mapMaybe)
 import Data.Word (Word16)
 import FDBStreaming.JobConfig (JobConfig (jobConfigSS), JobSubspace)
 import FDBStreaming.Topic
@@ -45,10 +45,6 @@ import FoundationDB as FDB
   )
 import qualified FoundationDB.Layer.Subspace as FDB
 import qualified FoundationDB.Layer.Tuple as FDB
-import FoundationDB.Versionstamp
-  ( Versionstamp (),
-    VersionstampCompleteness (Complete),
-  )
 import Safe.Foldable (maximumMay)
 
 -- TODO: add a MonadStream implementation that checks that all stream names are
@@ -64,7 +60,7 @@ type StreamReadAndCheckpoint a state =
   FDB.Subspace ->
   Word16 ->
   state ->
-  Transaction (Seq (Maybe (Versionstamp 'Complete), a))
+  Transaction (Seq (Maybe Topic.Checkpoint, a))
 
 -- TODO: say we have a topology like
 --
@@ -101,16 +97,9 @@ data Stream a
         -- transactionally read up to n messages and checkpoint the stream
         -- so that no calls with the same StepName will see the same message
         -- again. User-defined stream readers should return 'Nothing' for
-        -- the versionstamp; this value is used to persist watermarks for
-        -- streams that are stored inside FoundationDB.
-        streamReadAndCheckpoint ::
-          JobConfig ->
-          ReaderName ->
-          PartitionId ->
-          FDB.Subspace ->
-          Word16 ->
-          state ->
-          Transaction (Seq (Maybe (Versionstamp 'Complete), a)),
+        -- the Topic 'Checkpoint'; this value is used to persist watermarks for
+        -- streams that are stored inside FoundationDB as 'Topic's.
+        streamReadAndCheckpoint :: StreamReadAndCheckpoint a state,
         -- | The minimum number of threads that must concurrently read from
         -- the stream in order to maintain real-time throughput.
         streamMinReaderPartitions :: Integer,
@@ -186,9 +175,9 @@ customStream readBatch minThreads wmFn streamName setUp destroy =
               )
               $ \wmSS ->
                 for_
-                  (maximumMay $ catMaybes $ (fmap (fromJust wmFn) msgs))
+                  (maximumMay (mapMaybe (fromJust wmFn) msgs))
                   $ \wm -> setWatermark wmSS wm
-            return $ fmap (Nothing,) msgs,
+            return (fmap (Nothing,) msgs),
           streamMinReaderPartitions = minThreads,
           streamWatermarkSS = case wmFn of
             Nothing -> Nothing
@@ -237,7 +226,7 @@ instance Filterable Stream where
   mapMaybe g Stream {..} =
     Stream
       { streamReadAndCheckpoint = \cfg rdNm pid ss batchSize state ->
-          mapMaybe (\(mv, x) -> fmap (mv,) (g x))
+          mapMaybe (mapM g)
             <$> streamReadAndCheckpoint cfg rdNm pid ss batchSize state,
         ..
       }
@@ -268,9 +257,8 @@ setStreamWatermarkByTopic stream =
 streamFromTopic :: Topic -> StreamName -> Stream ByteString
 streamFromTopic tc streamName =
   Stream
-    { streamReadAndCheckpoint = \_cfg rn pid _chkptSS n _state -> do
-        msgs <- Topic.readNAndCheckpoint tc pid rn n
-        return $ fmap (\(vs, x) -> (Just vs, x)) msgs,
+    { streamReadAndCheckpoint = \_cfg rn pid _chkptSS n _state ->
+        fmap (fmap (\(c,xs) -> (Just c, xs))) $ Topic.readNAndCheckpoint tc pid rn n,
       streamMinReaderPartitions = fromIntegral $ Topic.numPartitions tc,
       streamWatermarkSS = Nothing,
       streamTopic = Just tc,

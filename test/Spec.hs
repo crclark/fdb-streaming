@@ -9,6 +9,7 @@ import Spec.FDBStreaming.TaskLease
 import Spec.FDBStreaming.Watermark (watermarks)
 import Spec.FDBStreaming.Topic (topicTests)
 import Spec.FDBStreaming.Util.BatchWriter (batchWriterTests)
+import Spec.FDBStreaming.Util (utilProps)
 import Test.Tasty
 
 testSS :: Subspace
@@ -27,7 +28,8 @@ allTests db =
       tableProps testSS db,
       watermarks testSS db,
       topicTests testSS db,
-      batchWriterTests testSS db
+      batchWriterTests testSS db,
+      utilProps
     ]
 
 main :: IO ()

@@ -15,6 +15,7 @@
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE TypeApplications #-}
 
 -- | FDBStreaming is a poorly-named, work-in-progress, proof-of-concept library
 -- for large-scale processing of unbounded data sets and sources. It is inspired
@@ -245,9 +246,9 @@ import qualified Data.Sequence as Seq
 import Data.Text.Encoding (decodeUtf8)
 import Data.Traversable (for)
 import Data.Witherable (catMaybes, witherM)
-import Data.Word (Word16, Word8)
+import Data.Word (Word8, Word16, Word64)
 import qualified FDBStreaming.AggrTable as AT
-import FDBStreaming.JobConfig (JobConfig (JobConfig, defaultNumPartitions, jobConfigDB, jobConfigSS, leaseDuration, logLevel, msgsPerBatch, numPeriodicJobThreads, numStreamThreads, streamMetricsStore), JobSubspace)
+import FDBStreaming.JobConfig (JobConfig (JobConfig, defaultNumPartitions, jobConfigDB, jobConfigSS, leaseDuration, logLevel, msgsPerBatch, numPeriodicJobThreads, numStreamThreads, streamMetricsStore, defaultChunkSizeBytes), JobSubspace)
 import FDBStreaming.Joins
   ( delete1to1JoinData,
     get1to1JoinData,
@@ -309,6 +310,7 @@ import FDBStreaming.TaskRegistry as TaskRegistry
 import FDBStreaming.Topic
   ( PartitionId,
     ReaderName,
+    Checkpoint,
     Topic (topicCustomMetadataSS),
     getCheckpoints,
     makeTopic,
@@ -339,7 +341,7 @@ import FoundationDB.Versionstamp
     Versionstamp (CompleteVersionstamp),
     VersionstampCompleteness (Complete),
   )
-import Safe.Foldable (minimumDef, minimumMay)
+import Safe.Foldable (minimumMay)
 import System.Clock (Clock (Monotonic), diffTimeSpec, getTime, toNanoSecs)
 import qualified System.Metrics as Metrics
 import System.Metrics.Counter (Counter)
@@ -393,6 +395,8 @@ incrTimeouts m = for_ m $ Counter.inc . timeouts
 runStreamTxn :: FDB.Database -> FDB.Transaction a -> IO a
 runStreamTxn =
   FDB.runTransactionWithConfig FDB.TransactionConfig
+    -- NOTE: actually all stream transactions are idempotent, but retries are
+    -- set to zero, so it's moot.
     { FDB.idempotent = False,
       FDB.snapshotReads = False,
       -- No point in retrying since we are running in a loop
@@ -430,9 +434,10 @@ benignIO :: (a -> IO (Maybe b)) -> Stream a -> Stream b
 benignIO g (Stream rc np wmSS stc streamName setUp destroy) =
   build $ \cfg rn pid ss n state -> do
     xs <- rc cfg rn pid ss n state
-    flip witherM xs $ \(mv, x) -> liftIO (g x) >>= \case
-      Nothing -> return Nothing
-      Just y -> return $ Just (mv, y)
+    -- NOTE: functions like this must always be run after checkpointing, or
+    -- we could filter out the last message we see and make no progress forever.
+    xs' <- flip witherM xs $ \(c, x) -> (fmap (c,)) <$> liftIO (g x)
+    return xs'
   where
     build x = Stream x np wmSS stc streamName setUp destroy
 
@@ -563,6 +568,13 @@ instance MonadStream DefaultWatermarker where
 --
 -- This function also assumes that all input streams are actually
 -- watermarked. If not, we don't write a watermark.
+-- NOTE: since introducing chunking and the new 'Checkpoint' type, the watermark
+-- can be slightly wrong, in the case where a reader is checkpointed halfway
+-- through a chunk. For example, if vn are versionstamp keys, and bn are msgs in
+-- a chunk, then our checkpoint might be v2,b2, but the root watermark is always
+-- computed in terms of the last msg in the chunk, b3. To fix this, we subtract
+-- 1 from the versionstamp, so that our watermark is guaranteed to be pointing
+-- at the last completely-read chunk.
 defaultWatermark ::
   -- | All parent input streams, paired with the name
   -- of the reader whose checkpoints we use to look up
@@ -576,15 +588,24 @@ defaultWatermark topicsAndReaders wmSS = do
     chkptsF <- getCheckpoints parent rn
     return $
       flip fmap chkptsF \ckpts ->
-        (parent, minimumDef minBound ckpts)
+        (parent, fromMaybe minBound $ minimumMay ckpts)
   minCheckpoints <- for minCheckpointsF await
-  parentWMsF <- for minCheckpoints \(parent, CompleteVersionstamp (TransactionVersionstamp v _) _) ->
-    getWatermark (topicWatermarkSS parent) v
+  parentWMsF <- for minCheckpoints \(parent, Topic.Checkpoint vs _) ->
+    getWatermark (topicWatermarkSS parent) $ transactionV $ conservativeVS vs
   parentsWMs <- for parentWMsF await
   let minParentWM = minimumMay (catMaybes parentsWMs)
   case minParentWM of
     Nothing -> return ()
     Just newWM -> setWatermark wmSS newWM
+
+  where
+    conservativeVS :: Versionstamp 'Complete -> Versionstamp 'Complete
+    conservativeVS vs@(CompleteVersionstamp (TransactionVersionstamp 0 _) _) = vs
+    conservativeVS (CompleteVersionstamp (TransactionVersionstamp v _) _) =
+      CompleteVersionstamp (TransactionVersionstamp (v-1) maxBound) maxBound
+
+    transactionV :: Versionstamp 'Complete -> Word64
+    transactionV (CompleteVersionstamp (TransactionVersionstamp v _) _) = v
 
 -- | Read messages from an existing Stream.
 --
@@ -637,7 +658,7 @@ atLeastOnce sn input f = void $ do
     StreamProcessor
       { streamProcessorInStream = input,
         streamProcessorWatermarkBy = NoWatermark,
-        streamProcessorProcessBatch = (mapM (\(_, x) -> liftIO $ f x)),
+        streamProcessorProcessBatch = mapM (liftIO . f . snd),
         streamProcessorStreamStepConfig = defaultStreamStepConfig
       }
 
@@ -674,7 +695,7 @@ pipe' input f =
         if isStreamWatermarked input
           then DefaultWatermark
           else NoWatermark,
-      streamProcessorProcessBatch = (\b -> catMaybes <$> for b (\(_, x) -> liftIO $ f x)),
+      streamProcessorProcessBatch = fmap catMaybes . mapM (liftIO . f . snd),
       streamProcessorStreamStepConfig = defaultStreamStepConfig
     }
 
@@ -780,6 +801,7 @@ makeStream stepName streamName step = do
           (jobConfigSS jc)
           stepName
           (getStepNumPartitions jc (getStepConfig step))
+          (defaultChunkSizeBytes jc)
   return
     $ fmap fromMessage
     $ ( if stepProducesWatermark step
@@ -875,6 +897,7 @@ outputStreamAndTopic stepName step = do
           (jobConfigSS jc)
           stepName
           (getStepNumPartitions jc (getStepConfig step))
+          (defaultChunkSizeBytes jc)
   let stream =
         ( if stepProducesWatermark step
             then setStreamWatermarkByTopic
@@ -1190,10 +1213,6 @@ throttleByErrors metrics sn x =
               logWarn (showText sn <> " timed out. If this keeps happening, try reducing the batch size.")
               incrTimeouts metrics
               threadDelay 15000
-            e -> throw e
-        ),
-      Handler
-        ( \case
             Error (MaxRetriesExceeded (CError NotCommitted)) -> do
               incrConflicts metrics
               logWarn (showText sn <> " conflicted with another transaction. If this happens frequently, it may be a bug in fdb-streaming.")
@@ -1225,11 +1244,12 @@ produceStep ::
 produceStep batchSize topic step = do
   -- TODO: this keeps spinning even if the producer is done and will never
   -- produce again.
-  xs <- catMaybes <$> Seq.replicateM (fromIntegral batchSize) step
+  xs <- catMaybes <$> replicateM (fromIntegral batchSize) step
   p' <- liftIO $ randPartition topic
-  writeTopic topic p' (fmap toMessage xs)
-  return (0, xs)
+  void $ writeTopic topic p' (fmap toMessage xs)
+  return (0, Seq.fromList xs)
 
+-- TODO: pipeStep just does a few miscellaneous things. Destroy it.
 -- | Returns number of messages consumed from upstream, and
 -- new messages to send downstream.
 pipeStep ::
@@ -1241,7 +1261,7 @@ pipeStep ::
   state ->
   Topic ->
   StepName ->
-  (Seq (Maybe (Versionstamp 'Complete), a) -> Transaction (Seq b)) ->
+  (Seq (Maybe Checkpoint, a) -> Transaction (Seq b)) ->
   Maybe StreamEdgeMetrics ->
   PartitionId ->
   Transaction (Int, Seq b)
@@ -1270,7 +1290,7 @@ pipeStep
     ys <- transformBatch inMsgs
     let outMsgs = fmap toMessage ys
     p' <- liftIO $ randPartition outCfg
-    writeTopic outCfg p' outMsgs
+    void $ writeTopic outCfg p' (toList outMsgs)
     return (length inMsgs, ys)
 
 oneToOneJoinStep ::
@@ -1283,9 +1303,9 @@ oneToOneJoinStep ::
   Int ->
   (a1 -> c) ->
   (a1 -> a2 -> b) ->
-  Seq (Maybe (Versionstamp 'Complete), a1) ->
+  Seq (Maybe Checkpoint, a1) ->
   Transaction (Seq b)
-oneToOneJoinStep outputTopic streamJoinIx pl combiner msgs = do
+oneToOneJoinStep outputTopic streamJoinIx pl combiner ckptmsgs = do
   -- Read from one of the two join streams, and for each
   -- message read, compute the join key. Using the join key, look in the
   -- join table to see if the partner is already there. If so, write the tuple
@@ -1295,7 +1315,7 @@ oneToOneJoinStep outputTopic streamJoinIx pl combiner msgs = do
   let joinSS = topicCustomMetadataSS outputTopic
   let otherIx = if streamJoinIx == 0 then 1 else 0
   joinFutures <-
-    for msgs \(_, msg) -> do
+    for ckptmsgs \(_,msg) -> do
       let k = pl msg
       joinF <- withSnapshot $ get1to1JoinData joinSS sn otherIx k
       return (k, msg, joinF)
@@ -1337,9 +1357,7 @@ aggregateStep
   metrics
   pid = do
     let checkpointSS = streamConsumerCheckpointSS (jobConfigSS jobCfg) inStream sn
-    msgs <-
-      fmap snd
-        <$> streamReadAndCheckpoint
+    msgs <- fmap snd <$> streamReadAndCheckpoint
           jobCfg
           sn
           pid
