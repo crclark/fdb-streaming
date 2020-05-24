@@ -22,7 +22,7 @@ import Data.ByteString (ByteString)
 import Data.Foldable (for_)
 import Data.Maybe (fromJust, isJust)
 import Data.Sequence (Seq ())
-import Data.Witherable (Filterable, mapMaybe)
+import Data.Witherable.Class (Filterable, mapMaybe)
 import Data.Word (Word16)
 import FDBStreaming.JobConfig (JobConfig (jobConfigSS), JobSubspace)
 import FDBStreaming.Topic

@@ -59,7 +59,7 @@ library
       ekg-core,
       clock,
       unliftio,
-      witherable,
+      witherable-class,
       time,
       safe,
       simple-logger,

@@ -245,7 +245,7 @@ import Data.Sequence (Seq ())
 import qualified Data.Sequence as Seq
 import Data.Text.Encoding (decodeUtf8)
 import Data.Traversable (for)
-import Data.Witherable (catMaybes, witherM)
+import Data.Witherable.Class (catMaybes, witherM)
 import Data.Word (Word8, Word16, Word64)
 import qualified FDBStreaming.AggrTable as AT
 import FDBStreaming.JobConfig (JobConfig (JobConfig, defaultNumPartitions, jobConfigDB, jobConfigSS, leaseDuration, logLevel, msgsPerBatch, numPeriodicJobThreads, numStreamThreads, streamMetricsStore, defaultChunkSizeBytes), JobSubspace)
