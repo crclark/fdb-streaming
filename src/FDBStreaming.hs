@@ -246,7 +246,7 @@ import qualified Data.Sequence as Seq
 import Data.Text.Encoding (decodeUtf8)
 import Data.Traversable (for)
 import Data.Witherable (catMaybes, witherM)
-import Data.Word (Word8, Word16, Word32, Word64)
+import Data.Word (Word8, Word16, Word64)
 import qualified FDBStreaming.AggrTable as AT
 import FDBStreaming.JobConfig (JobConfig (JobConfig, defaultNumPartitions, jobConfigDB, jobConfigSS, leaseDuration, logLevel, msgsPerBatch, numPeriodicJobThreads, numStreamThreads, streamMetricsStore, defaultChunkSizeBytes), JobSubspace)
 import FDBStreaming.Joins
@@ -336,22 +336,18 @@ import FoundationDB.Error as FDB
   )
 import qualified FoundationDB.Layer.Subspace as FDB
 import qualified FoundationDB.Layer.Tuple as FDB
-import qualified FoundationDB.Options.TransactionOption as TxOp
 import FoundationDB.Versionstamp
   ( TransactionVersionstamp (TransactionVersionstamp),
     Versionstamp (CompleteVersionstamp),
     VersionstampCompleteness (Complete),
   )
-import Safe.Foldable (minimumBound, minimumMay)
+import Safe.Foldable (minimumMay)
 import System.Clock (Clock (Monotonic), diffTimeSpec, getTime, toNanoSecs)
 import qualified System.Metrics as Metrics
 import System.Metrics.Counter (Counter)
 import qualified System.Metrics.Counter as Counter
 import System.Metrics.Distribution (Distribution)
 import qualified System.Metrics.Distribution as Distribution
-
-import System.Random (randomIO)
-import Numeric (showHex)
 
 data StreamEdgeMetrics
   = StreamEdgeMetrics
@@ -592,7 +588,7 @@ defaultWatermark topicsAndReaders wmSS = do
     chkptsF <- getCheckpoints parent rn
     return $
       flip fmap chkptsF \ckpts ->
-        (parent, minimumBound minBound ckpts)
+        (parent, fromMaybe minBound $ minimumMay ckpts)
   minCheckpoints <- for minCheckpointsF await
   parentWMsF <- for minCheckpoints \(parent, Topic.Checkpoint vs _) ->
     getWatermark (topicWatermarkSS parent) $ transactionV $ conservativeVS vs

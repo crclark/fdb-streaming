@@ -328,7 +328,7 @@ printWatermarkLag db root leaf = do
     Right (Just r, Just l) -> do
       printf "Watermark of root is %s\n" $ show r
       printf "Watermark of leaf is %s\n" $ show l
-      printf "Watermark lag is %s\n" $ show @ Int $ round $ diffUTCTime (watermarkUTCTime r) (watermarkUTCTime l)
+      printf "Watermark lag is %s seconds\n" $ show @ Int $ round $ diffUTCTime (watermarkUTCTime r) (watermarkUTCTime l)
     _ -> return ()
 
 mainLoop :: Database -> Subspace -> Args Identity -> IO ()

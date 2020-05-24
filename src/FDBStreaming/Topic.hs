@@ -70,7 +70,6 @@ import FoundationDB as FDB (Database, FutureIO, KeySelector (FirstGreaterOrEq, F
 import qualified FoundationDB.Layer.Subspace as FDB
 import qualified FoundationDB.Layer.Tuple as FDB
 import qualified FoundationDB.Options.MutationType as Mut
-import qualified FoundationDB.Options.TransactionOption as Op
 import FoundationDB.Transaction (prefixRangeEnd)
 import FoundationDB.Versionstamp
   ( Versionstamp

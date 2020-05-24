@@ -12,10 +12,12 @@ import qualified Data.ByteString.Char8 as BS
 import qualified Data.Sequence as Seq
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit ((@?=), testCase)
+import qualified FoundationDB as FDB
 import FoundationDB (Database, runTransaction)
 import FoundationDB.Layer.Subspace (Subspace)
 import Spec.FDBStreaming.Util (extendRand)
 import FDBStreaming.Topic (writeTopic, PartitionId, getEntireTopic, writeTopicIO, readNAndCheckpoint, readNAndCheckpointIO, makeTopic, getTopicCount, getPartitionCount)
+import qualified FDBStreaming.Topic as Topic
 
 readWrite :: Subspace -> Database -> TestTree
 readWrite testSS db = testCase "writeTopic and readNAndCheckpoint" $ do
@@ -75,6 +77,10 @@ checkpoints testSS db = testCase "readNAndCheckpoint2" $ do
 
   xs4 <- fmap snd <$> readNAndCheckpointIO db topic "tr2" 2
   xs4 @?= ["1", "2"]
+
+  ckpt <- runTransaction db $ Topic.getCheckpoint topic 0 "tr"
+  ckpts <- runTransaction db $ Topic.getCheckpoints topic "tr" >>= FDB.await
+  Seq.singleton ckpt @?= ckpts
 
 chunking :: Subspace -> Database -> TestTree
 chunking testSS db = testCase "topic chunking" $ do
