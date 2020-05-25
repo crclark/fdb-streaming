@@ -414,17 +414,22 @@ decodeCheckpoint bs = case FDB.decodeTupleElems bs of
 -- | For a given reader, returns a 'Checkpoint' that is guaranteed to be less
 -- than the first unread message in the topic partition. If the reader
 -- hasn't made a checkpoint yet, returns a Checkpoint containing all zeros.
+getCheckpoint' ::
+  Topic ->
+  PartitionId ->
+  ReaderName ->
+  Transaction (FDB.Future Checkpoint)
+getCheckpoint' topic p rn = do
+  let cpk = readerCheckpointKey topic p rn
+  fmap (maybe (Checkpoint minBound (-1)) decodeCheckpoint) <$> FDB.get cpk
+
 getCheckpoint ::
   Topic ->
   PartitionId ->
   ReaderName ->
   Transaction Checkpoint
-getCheckpoint topic p rn = do
-  let cpk = readerCheckpointKey topic p rn
-  bs <- FDB.get cpk >>= await
-  case decodeCheckpoint <$> bs of
-    Just vs -> return vs
-    Nothing -> return (Checkpoint minBound (-1))
+getCheckpoint topic p rn =
+  getCheckpoint' topic p rn >>= FDB.await
 
 -- | Return all checkpoints for all partitions for a reader.
 getCheckpoints ::
@@ -432,17 +437,8 @@ getCheckpoints ::
   ReaderName ->
   Transaction (FDB.Future (Seq Checkpoint))
 getCheckpoints topic rn = do
-  let ss = readerCheckpointSS topic rn
-  let ssRange = FDB.subspaceRange ss
-  rangeResult <- FDB.getRange' ssRange FDB.StreamingModeWantAll
-  return
-    $ flip fmap rangeResult
-    $ \case
-      FDB.RangeDone kvs -> fmap (decodeCheckpoint . snd) kvs
-      -- TODO: we need to be able to register monadic callbacks on
-      -- futures to handle this.
-      FDB.RangeMore _ _ -> error "Internal error: unexpectedly large number of partitions"
-
+  let pids = Seq.fromList [0 .. numPartitions topic - 1]
+  sequenceA <$> traverse (\pid -> getCheckpoint' topic pid rn) pids
 
 -- | Read n messages past the given checkpoint. The message pointed to by the
 -- checkpoint is not included in the results -- remember that checkpoints point

@@ -245,7 +245,7 @@ import Data.Sequence (Seq ())
 import qualified Data.Sequence as Seq
 import Data.Text.Encoding (decodeUtf8)
 import Data.Traversable (for)
-import Data.Witherable (catMaybes, witherM)
+import Data.Witherable.Class (catMaybes, witherM)
 import Data.Word (Word8, Word16, Word64)
 import qualified FDBStreaming.AggrTable as AT
 import FDBStreaming.JobConfig (JobConfig (JobConfig, defaultNumPartitions, jobConfigDB, jobConfigSS, leaseDuration, logLevel, msgsPerBatch, numPeriodicJobThreads, numStreamThreads, streamMetricsStore, defaultChunkSizeBytes), JobSubspace)
@@ -341,7 +341,7 @@ import FoundationDB.Versionstamp
     Versionstamp (CompleteVersionstamp),
     VersionstampCompleteness (Complete),
   )
-import Safe.Foldable (minimumMay)
+import Safe.Foldable (minimumMay, minimumNote)
 import System.Clock (Clock (Monotonic), diffTimeSpec, getTime, toNanoSecs)
 import qualified System.Metrics as Metrics
 import System.Metrics.Counter (Counter)
@@ -588,7 +588,8 @@ defaultWatermark topicsAndReaders wmSS = do
     chkptsF <- getCheckpoints parent rn
     return $
       flip fmap chkptsF \ckpts ->
-        (parent, fromMaybe minBound $ minimumMay ckpts)
+        (parent, minimumNote "No checkpoints found for topic. Does it have zero partitions?"
+                             ckpts)
   minCheckpoints <- for minCheckpointsF await
   parentWMsF <- for minCheckpoints \(parent, Topic.Checkpoint vs _) ->
     getWatermark (topicWatermarkSS parent) $ transactionV $ conservativeVS vs
