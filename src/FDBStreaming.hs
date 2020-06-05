@@ -192,7 +192,6 @@ module FDBStreaming
     -- * Creating streams
     existing,
     existingWatermarked,
-    produce,
     atLeastOnce,
     pipe,
     oneToOneJoin,
@@ -265,13 +264,9 @@ import FDBStreaming.Stream.Internal
    streamFromTopic,
    setStreamWatermarkByTopic)
 import FDBStreaming.StreamStep.Internal
-  ( StreamStep(WriteOnlyProcessor,
-               StreamProcessor,
+  ( StreamStep(StreamProcessor,
                Stream2Processor,
                TableProcessor),
-    writeOnlyWatermarkBy,
-    writeOnlyProduce,
-    writeOnlyStreamStepConfig,
     streamProcessorInStream,
     streamProcessorWatermarkBy,
     streamProcessorProcessBatch,
@@ -492,7 +487,6 @@ watermarkNext t = do
   State.modify \(c, t') -> (c, t' >> runStreamTxn jobConfigDB t)
 
 instance MonadStream DefaultWatermarker where
-  run sn w@WriteOnlyProcessor {} = makeStream sn sn w --writer has no parents, nothing to do
   run sn step@StreamProcessor {streamProcessorInStream} = do
     JobConfig {jobConfigSS} <- getJobConfig
     output <- makeStream sn sn step
@@ -627,21 +621,6 @@ existing tc =
 existingWatermarked :: (Message a, MonadStream m) => Topic -> m (Stream a)
 existingWatermarked tc =
   fmap setStreamWatermarkByTopic (existing tc)
-
--- TODO: if this handler type took a batch at a time,
--- it would be easier to optimize -- imagine if it were to
--- to do a get from FDB for each item -- it could do them all
--- in parallel.
--- TODO: produce isn't idempotent in cases of CommitUnknownResult.
--- TODO: for a lot of applications, we won't actually want to blindly persist
--- the raw input unchanged -- imagine if we were reading from Kafka. Totally
--- redundant. This should be wrapped up into a generalized Stream type that can
--- read from non-FDB sources (or just pull in anything). Then we would just
--- need pipe.
-produce :: (Message a, MonadStream m) => StepName -> Transaction (Maybe a) -> m (Stream a)
-produce sn f =
-  run sn $
-    WriteOnlyProcessor NoWatermark f defaultStreamStepConfig
 
 -- TODO: better operation for externally-visible side effects. Perhaps we can
 -- introduce an atMostOnceSideEffect type for these sorts of things, that
@@ -908,27 +887,6 @@ outputStreamAndTopic stepName step = do
   return (fmap fromMessage stream, streamTopic)
 
 instance MonadStream LeaseBasedStreamWorker where
-  run
-    sn
-    s@WriteOnlyProcessor
-      { writeOnlyProduce,
-        writeOnlyWatermarkBy,
-        writeOnlyStreamStepConfig
-      } = do
-      (outStream, outTopic) <- outputStreamAndTopic sn s
-      (cfg@JobConfig {jobConfigDB}, taskReg) <- Reader.ask
-      metrics <- registerStepMetrics sn
-      let job _stillValid _release =
-            doForSeconds (leaseDuration cfg)
-              $ void
-              $ throttleByErrors metrics sn
-              $ runStreamTxn jobConfigDB
-              $ runCustomWatermark (topicWatermarkSS outTopic) writeOnlyWatermarkBy
-              $ produceStep (getMsgsPerBatch cfg writeOnlyStreamStepConfig) outTopic writeOnlyProduce
-      liftIO
-        $ runStreamTxn jobConfigDB
-        $ addTask taskReg (TaskName sn) (leaseDuration cfg) job
-      return outStream
   run
     sn
     s@StreamProcessor
@@ -1235,21 +1193,6 @@ throttleByErrors metrics sn x =
       recordBatchLatency metrics timeMillis
       when (numConsumed == 0) (threadDelay 1000000)
 
-produceStep ::
-  Message a =>
-  Word16 ->
-  Topic ->
-  Transaction (Maybe a) ->
-  -- | Number of incoming messages consumed, outgoing messages
-  FDB.Transaction (Int, Seq a)
-produceStep batchSize topic step = do
-  -- TODO: this keeps spinning even if the producer is done and will never
-  -- produce again.
-  xs <- catMaybes <$> replicateM (fromIntegral batchSize) step
-  p' <- liftIO $ randPartition topic
-  void $ writeTopic topic p' (fmap toMessage xs)
-  return (0, Seq.fromList xs)
-
 -- TODO: pipeStep just does a few miscellaneous things. Destroy it.
 -- | Returns number of messages consumed from upstream, and
 -- new messages to send downstream.
@@ -1403,7 +1346,6 @@ instance HasJobConfig PureStream where
   getJobConfig = Reader.ask
 
 instance MonadStream PureStream where
-  run sn s@WriteOnlyProcessor {} = makeStream sn sn s
   run sn s@StreamProcessor {} = makeStream sn sn s
   run sn s@Stream2Processor {} = makeStream sn sn s
   run sn s@TableProcessor {} = do

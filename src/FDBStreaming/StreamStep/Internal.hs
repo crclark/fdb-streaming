@@ -49,19 +49,6 @@ defaultStreamStepConfig :: StreamStepConfig
 defaultStreamStepConfig = StreamStepConfig Nothing Nothing
 
 data StreamStep outMsg runResult where
-  -- TODO: can WriteOnly be merged with Stream by making instream optional? Or
-  -- by creating a fake Stream that always returns ()?
-  -- Do something similar for the table processor?
-  -- | A step that writes to a topic. This would usually be used for testing and
-  -- such, since it doesn't have any checkpointing mechanism.
-  WriteOnlyProcessor ::
-    Message a =>
-    { writeOnlyWatermarkBy :: WatermarkBy a,
-      writeOnlyProduce :: Transaction (Maybe a),
-      writeOnlyStreamStepConfig :: StreamStepConfig
-    } ->
-    StreamStep a
-      (Stream a)
   StreamProcessor ::
     Message b =>
     { streamProcessorInStream :: Stream a,
@@ -126,7 +113,6 @@ data StreamStep outMsg runResult where
       (AT.AggrTable k aggr)
 
 stepWatermarkBy :: StreamStep outMsg runResult -> WatermarkBy outMsg
-stepWatermarkBy WriteOnlyProcessor {..} = writeOnlyWatermarkBy
 stepWatermarkBy StreamProcessor {..} = streamProcessorWatermarkBy
 stepWatermarkBy Stream2Processor {..} = stream2ProcessorWatermarkBy
 stepWatermarkBy TableProcessor {..} = tableProcessorWatermarkBy
@@ -140,14 +126,11 @@ isStepDefaultWatermarked = isDefaultWatermark . stepWatermarkBy
 -- NOTE: GHC bug prevents us from using record update syntax in this function,
 -- which would make this much cleaner. https://gitlab.haskell.org/ghc/ghc/issues/2595
 watermarkBy :: (b -> Transaction Watermark) -> StreamStep b r -> StreamStep b r
-watermarkBy f (WriteOnlyProcessor _ x stepCfg) = WriteOnlyProcessor (CustomWatermark f) x stepCfg
 watermarkBy f (StreamProcessor input _ p stepCfg) = StreamProcessor input (CustomWatermark f) p stepCfg
 watermarkBy f (Stream2Processor inl inr _ pl pr stepCfg) = Stream2Processor inl inr (CustomWatermark f) pl pr stepCfg
 watermarkBy f (TableProcessor g a _ trigger stepCfg) = TableProcessor g a (CustomWatermark f) trigger stepCfg
 
 getStepConfig :: StreamStep b r -> StreamStepConfig
-getStepConfig WriteOnlyProcessor {writeOnlyStreamStepConfig} =
-  writeOnlyStreamStepConfig
 getStepConfig StreamProcessor {streamProcessorStreamStepConfig} =
   streamProcessorStreamStepConfig
 getStepConfig Stream2Processor {stream2ProcessorStreamStepConfig} =
@@ -156,7 +139,6 @@ getStepConfig TableProcessor {tableProcessorStreamStepConfig} =
   tableProcessorStreamStepConfig
 
 mapStepConfig :: (StreamStepConfig -> StreamStepConfig) -> StreamStep b r -> StreamStep b r
-mapStepConfig f (WriteOnlyProcessor w x c) = WriteOnlyProcessor w x (f c)
 mapStepConfig f (StreamProcessor i w p c) = StreamProcessor i w p (f c)
 mapStepConfig f (Stream2Processor inl inr w pl pr c) = Stream2Processor inl inr w pl pr (f c)
 mapStepConfig f (TableProcessor g a w t c) = TableProcessor g a w t (f c)
