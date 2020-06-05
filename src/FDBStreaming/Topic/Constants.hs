@@ -7,7 +7,8 @@ module FDBStreaming.Topic.Constants (
   checkpoint,
   aggrTable,
   oneToOneJoin,
-  customMeta
+  customMeta,
+  indices
 ) where
 
 import FoundationDB.Layer.Tuple (Elem(Int))
@@ -35,3 +36,6 @@ oneToOneJoin = Int 6
 
 customMeta :: Elem
 customMeta = Int 7
+
+indices :: Elem
+indices = Int 8

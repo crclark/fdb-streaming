@@ -8,6 +8,7 @@ import Spec.FDBStreaming.AggrTable (tableProps)
 import Spec.FDBStreaming.TaskLease
 import Spec.FDBStreaming.Watermark (watermarks)
 import Spec.FDBStreaming.Topic (topicTests)
+import Spec.FDBStreaming.Index (indexTests)
 import Spec.FDBStreaming.Util.BatchWriter (batchWriterTests)
 import Spec.FDBStreaming.Util (utilProps)
 import Test.Tasty
@@ -29,6 +30,7 @@ allTests db =
       watermarks testSS db,
       topicTests testSS db,
       batchWriterTests testSS db,
+      indexTests testSS db,
       utilProps
     ]
 

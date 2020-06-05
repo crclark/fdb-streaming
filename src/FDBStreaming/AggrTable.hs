@@ -60,17 +60,16 @@ import Data.Map.Strict (Map, unionsWith)
 import qualified Data.Map.Strict as Map
 import Data.Monoid (Sum(Sum, getSum), All(All, getAll), Any(Any, getAny))
 import Data.Semigroup (Max(Max, getMax), Min(Min, getMin))
-import Data.Text (Text)
 import Data.Word (Word8, Word16, Word32, Word64)
 
 import FDBStreaming.Message(Message (fromMessage, toMessage))
+import FDBStreaming.TableKey(TableKey(fromKeyBytes, toKeyBytes), OrdTableKey)
 import FDBStreaming.Topic (PartitionId)
 
 import qualified FoundationDB as FDB
 import qualified FoundationDB.Options.MutationType as Mut
 import qualified FoundationDB.Layer.Subspace as SS
 import qualified FoundationDB.Layer.Tuple as FDB
-import qualified FoundationDB.Versionstamp as FDB
 
 
 -- | A table of monoidal values, resulting from aggregating a grouped stream.
@@ -86,20 +85,6 @@ data AggrTable k v = AggrTable {
 aggrTableWatermarkSS :: AggrTable k v -> SS.Subspace
 aggrTableWatermarkSS = flip SS.extend [FDB.Bytes "wm"] . aggrTableSS
 
--- | Class of types that can be serialized as table keys. This is distinct from
--- 'Message' to enable cases where the user may want to read entire ranges of
--- a table efficiently. In such cases, the serialized representation of the
--- key must have a lexicographic ordering equivalent to the 'Ord' instance of
--- the type. For the 'Message' class, we don't require any ordering of the
--- serialized representation, which may admit for more efficient serialization
--- in some cases.
-class TableKey a where
-  toKeyBytes :: a -> ByteString
-  fromKeyBytes :: ByteString -> a
-
--- | An additional predicate for types that satisfy
--- @compare x y == compare (toKeyBytes x) (toKeyBytes y)@
-class TableKey a => OrdTableKey a
 
 -- | Class for aggregate values stored in tables that were created by 'GroupBy'.
 -- Laws:
@@ -201,7 +186,7 @@ class RangeAccessibleTable v where
   -- | For tables with keys whose serialized representation is ordered and
   -- the state of each table row is of bounded size, get a range of k,v pairs
   -- from the table.
-  getTableRange :: (Ord k, OrdTableKey k, TableSemigroup v)
+  getTableRange :: (OrdTableKey k, TableSemigroup v)
                 => AggrTable k v
                 -> PartitionId
                 -> k
@@ -210,7 +195,7 @@ class RangeAccessibleTable v where
                 -- ^ End of the range, inclusive
                 -> FDB.Transaction (Map k v)
 
-getTableRangeVia :: (Ord k, OrdTableKey k)
+getTableRangeVia :: (OrdTableKey k)
                  => AggrTable k v
                  -> PartitionId
                  -> k
@@ -270,7 +255,7 @@ getRow table k = do
   fold <$> traverse FDB.await futs
 
 -- | For ordered keys, looks up a range of key-values in a table.
-getRowRange :: (Ord k, OrdTableKey k, RangeAccessibleTable v, TableSemigroup v)
+getRowRange :: (OrdTableKey k, RangeAccessibleTable v, TableSemigroup v)
             => AggrTable k v
             -> k
             -- ^ Beginning of the range
@@ -281,154 +266,6 @@ getRowRange table start end = do
   maps <- forM [0..(aggrTableNumPartitions table - 1)]
                $ \pid -> getTableRange table pid start end
   return $ unionsWith (<>) maps
-
-instance TableKey ByteString where
-  toKeyBytes x = FDB.encodeTupleElems [FDB.Bytes x]
-  fromKeyBytes bs = case FDB.decodeTupleElems bs of
-    Left err -> error $ "Failed to decode Bytes TableKey: " ++ show err
-    Right [FDB.Bytes x] -> x
-    -- TODO: print actual type we decoded in error message, but don't print
-    -- raw bytes value.
-    Right _ -> error "Expected Bytes when decoding TableKey"
-
-instance OrdTableKey ByteString
-
-instance TableKey Text where
-  toKeyBytes x = FDB.encodeTupleElems [FDB.Text x]
-  fromKeyBytes bs = case FDB.decodeTupleElems bs of
-    Left err -> error $ "Failed to decode Text TableKey: " ++ show err
-    Right [FDB.Text x] -> x
-    Right _ -> error "Expected Text when decoding TableKey"
-
-instance OrdTableKey Text
-
-instance TableKey Integer where
-  toKeyBytes x = FDB.encodeTupleElems [FDB.Int x]
-  fromKeyBytes bs = case FDB.decodeTupleElems bs of
-    Left err -> error $ "Failed to decode Integer TableKey: " ++ show err
-    Right [FDB.Int x] -> x
-    Right _ -> error $ "Expected Integer when decoding TableKey"
-
-instance OrdTableKey Integer
-
-instance TableKey Int where
-  toKeyBytes x = FDB.encodeTupleElems [FDB.Int $ fromIntegral x]
-  fromKeyBytes bs = case FDB.decodeTupleElems bs of
-    Left err -> error $ "Failed to decode Int TableKey: " ++ show err
-    Right [FDB.Int x] -> fromIntegral x
-    Right _ -> error $ "Expected Int when decoding TableKey"
-
-instance OrdTableKey Int
-
-instance TableKey Float where
-  toKeyBytes x = FDB.encodeTupleElems [FDB.Float x]
-  fromKeyBytes bs = case FDB.decodeTupleElems bs of
-    Left err -> error $ "Failed to decode Float TableKey: " ++ show err
-    Right [FDB.Float x] -> x
-    Right _ -> error "Expected Float when decoding TableKey"
-
-instance OrdTableKey Float
-
-instance TableKey Double where
-  toKeyBytes x = FDB.encodeTupleElems [FDB.Double x]
-  fromKeyBytes bs = case FDB.decodeTupleElems bs of
-    Left err -> error $ "Failed to decode Double TableKey: " ++ show err
-    Right [FDB.Double x] -> x
-    Right _ -> error "Expected Double when decoding TableKey"
-
-instance OrdTableKey Double
-
-instance TableKey Bool where
-  toKeyBytes x = FDB.encodeTupleElems [FDB.Bool x]
-  fromKeyBytes bs = case FDB.decodeTupleElems bs of
-    Left err -> error $ "Failed to decode Bool TableKey: " ++ show err
-    Right [FDB.Bool x] -> x
-    Right _ -> error "Expected Bool when decoding TableKey"
-
-instance OrdTableKey Bool
-
-instance TableKey (FDB.Versionstamp 'FDB.Complete) where
-  toKeyBytes x = FDB.encodeTupleElems [FDB.CompleteVS x]
-  fromKeyBytes bs = case FDB.decodeTupleElems bs of
-    Left err -> error $ "Failed to decode Versionstamp TableKey: " ++ show err
-    Right [FDB.CompleteVS x] -> x
-    Right _ -> error "Expected Versionstamp when decoding TableKey"
-
-instance OrdTableKey (FDB.Versionstamp 'FDB.Complete)
-
-instance TableKey () where
-  toKeyBytes () = FDB.encodeTupleElems [FDB.Bytes "()"]
-  fromKeyBytes bs = case FDB.decodeTupleElems bs of
-    Left err -> error $ "Failed to decode () TableKey" ++ show err
-    Right [FDB.Bytes "()"] -> ()
-    Right _ -> error "Unexpected bytes decoding unit TableKey"
-
-instance (TableKey a, TableKey b) => TableKey (a,b) where
-  toKeyBytes (x,y) = FDB.encodeTupleElems [FDB.Bytes (toKeyBytes x),
-                                           FDB.Bytes (toKeyBytes y)]
-  fromKeyBytes bs = case FDB.decodeTupleElems bs of
-    Left err -> error $ "Failed to decode 2-tuple TableKey: " ++ show err
-    Right [FDB.Bytes x, FDB.Bytes y] -> (fromKeyBytes x, fromKeyBytes y)
-    Right _ -> error "Expected 2-tuple when decoding TableKey"
-
-instance (TableKey a, TableKey b) => OrdTableKey (a,b)
-
-instance (TableKey a, TableKey b, TableKey c) => TableKey (a,b,c) where
-  toKeyBytes (x,y,c) = FDB.encodeTupleElems [FDB.Bytes (toKeyBytes x),
-                                             FDB.Bytes (toKeyBytes y),
-                                             FDB.Bytes (toKeyBytes c)]
-  fromKeyBytes bs = case FDB.decodeTupleElems bs of
-    Left err -> error $ "Failed to decode 3-tuple TableKey: " ++ show err
-    Right [FDB.Bytes x, FDB.Bytes y, FDB.Bytes c] -> (fromKeyBytes x, fromKeyBytes y, fromKeyBytes c)
-    Right _ -> error "Expected 3-tuple when decoding TableKey"
-
-instance (TableKey a, TableKey b, TableKey c) => OrdTableKey (a,b,c)
-
-instance (TableKey a, TableKey b, TableKey c, TableKey d) => TableKey (a,b,c,d) where
-  toKeyBytes (x,y,c,d) = FDB.encodeTupleElems [FDB.Bytes (toKeyBytes x),
-                                               FDB.Bytes (toKeyBytes y),
-                                               FDB.Bytes (toKeyBytes c),
-                                               FDB.Bytes (toKeyBytes d)]
-  fromKeyBytes bs = case FDB.decodeTupleElems bs of
-    Left err -> error $ "Failed to decode 4-tuple TableKey: " ++ show err
-    Right [FDB.Bytes x, FDB.Bytes y, FDB.Bytes c, FDB.Bytes d] ->
-      (fromKeyBytes x, fromKeyBytes y, fromKeyBytes c, fromKeyBytes d)
-    Right _ -> error "Expected 4-tuple when decoding TableKey"
-
-instance (TableKey a, TableKey b, TableKey c, TableKey d) => OrdTableKey (a,b,c,d)
-
-instance (TableKey a, TableKey b, TableKey c, TableKey d, TableKey e)
-         => TableKey (a,b,c,d,e) where
-  toKeyBytes (x,y,c,d,e) = FDB.encodeTupleElems [FDB.Bytes (toKeyBytes x),
-                                                 FDB.Bytes (toKeyBytes y),
-                                                 FDB.Bytes (toKeyBytes c),
-                                                 FDB.Bytes (toKeyBytes d),
-                                                 FDB.Bytes (toKeyBytes e)]
-  fromKeyBytes bs = case FDB.decodeTupleElems bs of
-    Left err -> error $ "Failed to decode 5-tuple TableKey: " ++ show err
-    Right [FDB.Bytes x, FDB.Bytes y, FDB.Bytes c, FDB.Bytes d, FDB.Bytes e] ->
-      (fromKeyBytes x, fromKeyBytes y, fromKeyBytes c, fromKeyBytes d, fromKeyBytes e)
-    Right _ -> error "Expected 5-tuple when decoding TableKey"
-
-instance (TableKey a, TableKey b, TableKey c, TableKey d, TableKey e) => OrdTableKey (a,b,c,d,e)
-
-instance (TableKey a, TableKey b, TableKey c, TableKey d, TableKey e, TableKey f)
-    => TableKey (a,b,c,d,e,f) where
-  toKeyBytes (x,y,c,d,e,f) = FDB.encodeTupleElems [FDB.Bytes (toKeyBytes x),
-                                                FDB.Bytes (toKeyBytes y),
-                                                FDB.Bytes (toKeyBytes c),
-                                                FDB.Bytes (toKeyBytes d),
-                                                FDB.Bytes (toKeyBytes e),
-                                                FDB.Bytes (toKeyBytes f)]
-  fromKeyBytes bs = case FDB.decodeTupleElems bs of
-    Left err -> error $ "Failed to decode 6-tuple TableKey: " ++ show err
-    Right [FDB.Bytes x, FDB.Bytes y, FDB.Bytes c, FDB.Bytes d, FDB.Bytes e, FDB.Bytes f] ->
-      (fromKeyBytes x, fromKeyBytes y, fromKeyBytes c, fromKeyBytes d, fromKeyBytes e, fromKeyBytes f)
-    Right _ -> error "Expected 6-tuple when decoding TableKey"
-
-instance (TableKey a, TableKey b, TableKey c, TableKey d, TableKey e, TableKey f)
-         => OrdTableKey (a,b,c,d,e,f)
-
 instance PutIntLE Word8 where
   {-# INLINABLE putIntLE #-}
   putIntLE = putWord8

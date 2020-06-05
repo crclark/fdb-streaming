@@ -26,11 +26,13 @@ library
       FDBStreaming.Stream
       FDBStreaming.Stream.Internal,
       FDBStreaming.StreamStep.Internal,
+      FDBStreaming.TableKey,
       FDBStreaming.TaskLease,
       FDBStreaming.TaskRegistry,
       FDBStreaming.Testing,
       FDBStreaming.Topic,
       FDBStreaming.Topic.Constants,
+      FDBStreaming.Index,
       FDBStreaming.JobConfig
       FDBStreaming.Joins,
       FDBStreaming.Util,
@@ -114,6 +116,7 @@ test-suite fdb-streaming-test
       Spec.FDBStreaming.Util
       Spec.FDBStreaming.Util.BatchWriter
       Spec.FDBStreaming.Topic
+      Spec.FDBStreaming.Index
   hs-source-dirs:
       test
   ghc-options: -threaded -rtsopts -with-rtsopts=-N -Wall -g
@@ -141,4 +144,5 @@ test-suite fdb-streaming-test
     , persist
     , time
     , uuid
+    , streamly
   default-language: Haskell2010
