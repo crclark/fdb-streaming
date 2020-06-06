@@ -1,4 +1,5 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE NamedFieldPuns #-}
@@ -8,13 +9,15 @@
 
 module FDBStreaming.StreamStep.Internal  where
 
+import FDBStreaming.JobConfig (JobSubspace)
 import FDBStreaming.Message(Message)
-import FDBStreaming.Stream.Internal(Stream)
+import FDBStreaming.Stream.Internal(Stream(streamWatermarkSS, streamTopic))
 import FDBStreaming.Topic (Topic, Checkpoint)
 import qualified FDBStreaming.AggrTable as AT
 import FDBStreaming.Watermark
   ( Watermark,
     WatermarkBy(CustomWatermark),
+    WatermarkSS,
     producesWatermark,
     isDefaultWatermark
   )
@@ -23,6 +26,7 @@ import Data.ByteString (ByteString)
 import Data.Sequence (Seq)
 import Data.Word (Word8, Word16)
 import FoundationDB (Transaction)
+import FoundationDB.Layer.Subspace (Subspace)
 
 -- | The name of a step in the pipeline. A step can be thought of as a function
 -- that consumes a stream and writes to a stream, a table, or a side effect.
@@ -48,49 +52,51 @@ data StreamStepConfig
 defaultStreamStepConfig :: StreamStepConfig
 defaultStreamStepConfig = StreamStepConfig Nothing Nothing
 
+-- | Contains all the information we need to pull data out of a stream and
+-- transform it. Uses an existential so that we can more easily implement
+-- joins and other operations that pull from multiple streams. This type is an
+-- internal detail of StreamStep, and not very useful on its own.
+--
+-- If the input stream is a topic with n partitions, up to n instances of this
+-- processor will be running on n threads simultaneously.
+data BatchProcessor b =
+  forall a. BatchProcessor {
+    batchInStream :: Stream a,
+    -- | A batch processing function takes a batch of messages as input, along
+    -- with a subspace in which it can store any state it needs to persist to
+    -- operate or communicate. This subspace is shared among all batch
+    -- processors in the same 'StreamStep', which allows heterogeneous workers
+    -- within a step to communicate. For example, this is used to store
+    -- temporary data for joins -- one BatchProcessor is responsible for the
+    -- left side of the join, the other is responsible for the right side.
+    processBatch :: Subspace -> Seq (Maybe Checkpoint, a) -> Transaction (Seq b)
+  }
+
+-- | Returns the watermarkSS function from the underlying stream.
+batchProcessorInputWatermarkSS :: BatchProcessor b -> Maybe (JobSubspace -> WatermarkSS)
+batchProcessorInputWatermarkSS (BatchProcessor i _) = streamWatermarkSS i
+
+-- | Returns a topic if the input stream to this batch processor is persisted
+-- inside FoundationDB as a 'Topic'.
+batchProcessorInputTopic :: BatchProcessor b -> Maybe Topic
+batchProcessorInputTopic (BatchProcessor i _) = streamTopic i
+
+-- TODO: What is a stream step, really? Just seems to be miscellaneous inputs to
+-- 'run', gathered together so we can use a builder style on them.
+-- Streams and AggrTables are well-defined, but stream steps are not.
+-- TODO: need a splitter that can efficiently route messages to different
+-- output streams.
 data StreamStep outMsg runResult where
   StreamProcessor ::
     Message b =>
-    { streamProcessorInStream :: Stream a,
-      streamProcessorWatermarkBy :: WatermarkBy b,
+    { streamProcessorWatermarkBy :: WatermarkBy b,
       --TODO: we should probably move all the logic in 'pipeStep' into
-      -- this function, with a default value of StreamProcessor for 'pipe'. Then
+      -- the batch processors, with a default value of StreamProcessor for 'pipe'. Then
       -- add a function to compose more behavior onto this function. There's no
       -- reason I can see that pipeStep and this callback both need to exist.
       -- Same with the other constructors.
-      streamProcessorProcessBatch ::
-        Seq (Maybe Checkpoint, a) ->
-        Transaction (Seq b),
+      streamProcessorBatchProcessors :: [BatchProcessor b],
       streamProcessorStreamStepConfig :: StreamStepConfig
-    } ->
-    StreamStep b
-      (Stream b)
-  -- TODO: we don't really need this case. oneToOneJoin could just internally
-  -- create two StreamProcessors and the user would never know the difference.
-  -- Well, almost. 'oneToOneJoin'' returns this StreamStep so the user can
-  -- watermark it and so forth.
-  Stream2Processor ::
-    Message b =>
-    { stream2ProcessorInStreamL :: Stream a1,
-      stream2ProcessorInStreamR :: Stream a2,
-      stream2ProcessorWatermarkBy :: WatermarkBy b,
-      -- TODO: passing in the output Topic so that the step knows
-      -- where to write its state. Probably all user-provided
-      -- batch processing callbacks should take a subspace that they
-      -- can use to write per-processor state. That way, deleting a
-      -- processing step would be guaranteed to clean up everything
-      -- the user created, too.
-      stream2ProcessorRunBatchL ::
-        ( Topic ->
-          Seq (Maybe Checkpoint, a1) ->
-          Transaction (Seq b)
-        ),
-      stream2ProcessorRunBatchR ::
-        ( Topic ->
-          Seq (Maybe Checkpoint, a2) ->
-          Transaction (Seq b)
-        ),
-      stream2ProcessorStreamStepConfig :: StreamStepConfig
     } ->
     StreamStep b
       (Stream b)
@@ -114,7 +120,6 @@ data StreamStep outMsg runResult where
 
 stepWatermarkBy :: StreamStep outMsg runResult -> WatermarkBy outMsg
 stepWatermarkBy StreamProcessor {..} = streamProcessorWatermarkBy
-stepWatermarkBy Stream2Processor {..} = stream2ProcessorWatermarkBy
 stepWatermarkBy TableProcessor {..} = tableProcessorWatermarkBy
 
 stepProducesWatermark :: StreamStep outMsg runResult -> Bool
@@ -126,21 +131,19 @@ isStepDefaultWatermarked = isDefaultWatermark . stepWatermarkBy
 -- NOTE: GHC bug prevents us from using record update syntax in this function,
 -- which would make this much cleaner. https://gitlab.haskell.org/ghc/ghc/issues/2595
 watermarkBy :: (b -> Transaction Watermark) -> StreamStep b r -> StreamStep b r
-watermarkBy f (StreamProcessor input _ p stepCfg) = StreamProcessor input (CustomWatermark f) p stepCfg
-watermarkBy f (Stream2Processor inl inr _ pl pr stepCfg) = Stream2Processor inl inr (CustomWatermark f) pl pr stepCfg
-watermarkBy f (TableProcessor g a _ trigger stepCfg) = TableProcessor g a (CustomWatermark f) trigger stepCfg
+watermarkBy f (StreamProcessor _ ps stepCfg) =
+  StreamProcessor (CustomWatermark f) ps stepCfg
+watermarkBy f (TableProcessor g a _ trigger stepCfg) =
+  TableProcessor g a (CustomWatermark f) trigger stepCfg
 
 getStepConfig :: StreamStep b r -> StreamStepConfig
 getStepConfig StreamProcessor {streamProcessorStreamStepConfig} =
   streamProcessorStreamStepConfig
-getStepConfig Stream2Processor {stream2ProcessorStreamStepConfig} =
-  stream2ProcessorStreamStepConfig
 getStepConfig TableProcessor {tableProcessorStreamStepConfig} =
   tableProcessorStreamStepConfig
 
 mapStepConfig :: (StreamStepConfig -> StreamStepConfig) -> StreamStep b r -> StreamStep b r
-mapStepConfig f (StreamProcessor i w p c) = StreamProcessor i w p (f c)
-mapStepConfig f (Stream2Processor inl inr w pl pr c) = Stream2Processor inl inr w pl pr (f c)
+mapStepConfig f (StreamProcessor w p c) = StreamProcessor w p (f c)
 mapStepConfig f (TableProcessor g a w t c) = TableProcessor g a w t (f c)
 
 -- | Sets the number of messages to process per batch for the given step.

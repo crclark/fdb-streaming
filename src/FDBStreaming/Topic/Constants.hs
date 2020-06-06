@@ -8,7 +8,8 @@ module FDBStreaming.Topic.Constants (
   aggrTable,
   oneToOneJoin,
   customMeta,
-  indices
+  indices,
+  streamStepWorkspace
 ) where
 
 import FoundationDB.Layer.Tuple (Elem(Int))
@@ -39,3 +40,6 @@ customMeta = Int 7
 
 indices :: Elem
 indices = Int 8
+
+streamStepWorkspace :: Elem
+streamStepWorkspace = Int 9

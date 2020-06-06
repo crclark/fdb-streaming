@@ -239,7 +239,7 @@ import qualified Control.Monad.State.Strict as State
 import Control.Monad.State.Strict (MonadState, StateT)
 import qualified Data.ByteString.Char8 as BS8
 import Data.Foldable (for_, toList)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust, fromJust)
 import Data.Sequence (Seq ())
 import qualified Data.Sequence as Seq
 import Data.Text.Encoding (decodeUtf8)
@@ -264,19 +264,14 @@ import FDBStreaming.Stream.Internal
    streamFromTopic,
    setStreamWatermarkByTopic)
 import FDBStreaming.StreamStep.Internal
-  ( StreamStep(StreamProcessor,
-               Stream2Processor,
+  ( BatchProcessor(BatchProcessor),
+    batchProcessorInputWatermarkSS,
+    batchProcessorInputTopic,
+    StreamStep(StreamProcessor,
                TableProcessor),
-    streamProcessorInStream,
     streamProcessorWatermarkBy,
-    streamProcessorProcessBatch,
+    streamProcessorBatchProcessors,
     streamProcessorStreamStepConfig,
-    stream2ProcessorInStreamL,
-    stream2ProcessorInStreamR,
-    --stream2ProcessorWatermarkBy,
-    --stream2ProcessorRunBatchL,
-    --stream2ProcessorRunBatchR,
-    --stream2ProcessorStreamStepConfig,
     tableProcessorGroupedBy,
     tableProcessorAggregation,
     tableProcessorWatermarkBy,
@@ -486,8 +481,30 @@ watermarkNext t = do
   JobConfig {jobConfigDB} <- getJobConfig
   State.modify \(c, t') -> (c, t' >> runStreamTxn jobConfigDB t)
 
+-- | If it's possible to default watermark a streamstep's output, return the
+-- topics and the names of the batch processors reading from them, so that we
+-- can watermark.
+defaultWatermarkUpstreamTopics :: StepName
+                               -> StreamStep outMsg (Stream outMsg)
+                               -> Maybe [(Topic, StepName)]
+defaultWatermarkUpstreamTopics
+  sn StreamProcessor {streamProcessorBatchProcessors} =
+  -- This checks two of the conditions that must be satisfied to apply a default
+  -- watermark to a stream. Specifically, conditions 3 and 4:
+  -- 3. Does the input have a watermark subspace?
+  -- 4. Is the input a stream inside FoundationDB? If not, we can't get the
+  --    checkpoint for this reader that corresponds to a point in the
+  --    watermark function.
+  let wmSSs = map batchProcessorInputWatermarkSS streamProcessorBatchProcessors
+      topics = map batchProcessorInputTopic streamProcessorBatchProcessors
+      in
+        if all isJust wmSSs && all isJust topics
+          then Just $ zip (map fromJust topics)
+                          [sn <> BS8.pack (show i) | i <- [(0 :: Int)..]]
+          else Nothing
+
 instance MonadStream DefaultWatermarker where
-  run sn step@StreamProcessor {streamProcessorInStream} = do
+  run sn step@StreamProcessor{} = do
     JobConfig {jobConfigSS} <- getJobConfig
     output <- makeStream sn sn step
     -- TODO: There is a lot of stuff that must be checked before we can default
@@ -503,30 +520,10 @@ instance MonadStream DefaultWatermarker where
     --    watermark function.
     case ( isStepDefaultWatermarked step,
            watermarkSS jobConfigSS output,
-           streamWatermarkSS streamProcessorInStream,
-           streamTopic streamProcessorInStream
+           defaultWatermarkUpstreamTopics sn step
          ) of
-      (True, Just wmSS, Just _inWmSS, Just inTopic) ->
-        watermarkNext (defaultWatermark [(inTopic, sn)] wmSS)
-      _ -> return ()
-    return output
-  run sn step@Stream2Processor {stream2ProcessorInStreamL, stream2ProcessorInStreamR} = do
-    JobConfig {jobConfigSS} <- getJobConfig
-    output <- makeStream sn sn step
-    case ( isStepDefaultWatermarked step,
-           watermarkSS jobConfigSS output,
-           streamWatermarkSS stream2ProcessorInStreamL,
-           streamTopic stream2ProcessorInStreamL,
-           streamWatermarkSS stream2ProcessorInStreamR,
-           streamTopic stream2ProcessorInStreamR
-         ) of
-      (True, Just wmSS, Just _inWmSSL, Just inTopicL, Just _inWmSSR, Just inTopicR) ->
-        watermarkNext $
-          defaultWatermark
-            [ (inTopicL, sn <> "0"),
-              (inTopicR, sn <> "1")
-            ]
-            wmSS
+      (True, Just wmSS, Just xs) ->
+        watermarkNext (defaultWatermark xs wmSS)
       _ -> return ()
     return output
   run sn step@TableProcessor {tableProcessorGroupedBy} = do
@@ -636,9 +633,9 @@ atLeastOnce :: (MonadStream m) => StepName -> Stream a -> (a -> IO ()) -> m ()
 atLeastOnce sn input f = void $ do
   run sn $
     StreamProcessor
-      { streamProcessorInStream = input,
-        streamProcessorWatermarkBy = NoWatermark,
-        streamProcessorProcessBatch = mapM (liftIO . f . snd),
+      { streamProcessorWatermarkBy = NoWatermark,
+        streamProcessorBatchProcessors =
+          [BatchProcessor input (\_ xs -> mapM (liftIO . f . snd) xs)],
         streamProcessorStreamStepConfig = defaultStreamStepConfig
       }
 
@@ -670,12 +667,12 @@ pipe' ::
   StreamStep b (Stream b)
 pipe' input f =
   StreamProcessor
-    { streamProcessorInStream = input,
-      streamProcessorWatermarkBy =
+    { streamProcessorWatermarkBy =
         if isStreamWatermarked input
           then DefaultWatermark
           else NoWatermark,
-      streamProcessorProcessBatch = fmap catMaybes . mapM (liftIO . f . snd),
+      streamProcessorBatchProcessors =
+        [BatchProcessor input (\_ xs -> fmap catMaybes $ mapM (liftIO . f . snd) xs)],
       streamProcessorStreamStepConfig = defaultStreamStepConfig
     }
 
@@ -713,17 +710,15 @@ oneToOneJoin' ::
   (a -> b -> d) ->
   StreamStep d (Stream d)
 oneToOneJoin' inl inr pl pr j =
-  let lstep = \cfg -> oneToOneJoinStep cfg 0 pl j
-      rstep = \cfg -> oneToOneJoinStep cfg 1 pr (flip j)
-   in Stream2Processor
-        inl
-        inr
+  let lstep = \topic -> oneToOneJoinStep topic 0 pl j
+      rstep = \topic -> oneToOneJoinStep topic 1 pr (flip j)
+   in StreamProcessor
         ( if isStreamWatermarked inl && isStreamWatermarked inr
             then DefaultWatermark
             else NoWatermark
         )
-        lstep
-        rstep
+        [ BatchProcessor inl lstep
+        , BatchProcessor inr rstep]
         defaultStreamStepConfig
 
 -- TODO: implement one-to-many joins in terms of this?
@@ -890,128 +885,57 @@ instance MonadStream LeaseBasedStreamWorker where
   run
     sn
     s@StreamProcessor
-      { streamProcessorInStream,
-        streamProcessorWatermarkBy,
-        streamProcessorProcessBatch,
+      { streamProcessorWatermarkBy,
+        streamProcessorBatchProcessors,
         streamProcessorStreamStepConfig
       } = do
       (outStream, outTopic) <- outputStreamAndTopic sn s
       (cfg@JobConfig {jobConfigDB}, _) <- Reader.ask
       metrics <- registerStepMetrics sn
-      let checkpointSS =
-            streamConsumerCheckpointSS
+      let workspaceSS = FDB.extend (topicCustomMetadataSS outTopic)
+                                   [C.streamStepWorkspace]
+      let processorsWStepNames = zip streamProcessorBatchProcessors
+                                     [sn <> BS8.pack (show i) | i <- [(0 :: Int)..]]
+      for_ processorsWStepNames \(BatchProcessor inStream processBatch, sn_i) -> do
+        let checkpointSS =
+              streamConsumerCheckpointSS
               (jobConfigSS cfg)
-              streamProcessorInStream
-              sn
-      let job pid _stillValid _release =
-            -- NOTE: we must use a case here to do the pattern match to work around a
-            -- GHC limitation. In 8.6, let gives a very confusing error message about
-            -- variables escaping their scopes. In 8.8, it gives a more helpful
-            -- "my brain just exploded" message that says to use a case statement.
-            case streamProcessorInStream of
-              Stream streamReadAndCheckpoint _ _ _ _ setUpState destroyState ->
-                bracket
-                  (runStreamTxn jobConfigDB $ setUpState cfg sn pid checkpointSS)
-                  destroyState
-                  \state ->
-                    doForSeconds (leaseDuration cfg)
-                      $ void
-                      $ throttleByErrors metrics sn
-                      $ runStreamTxn jobConfigDB
-                      $ runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy
-                      $ pipeStep
-                        cfg
-                        streamProcessorStreamStepConfig
-                        streamProcessorInStream
-                        streamReadAndCheckpoint
-                        state
-                        outTopic
-                        sn
-                        streamProcessorProcessBatch
-                        metrics
-                        pid
-      forEachPartition streamProcessorInStream $ \pid -> do
-        let taskName = mkTaskName sn pid
-        taskReg <- taskRegistry
-        liftIO
-          $ runStreamTxn jobConfigDB
-          $ addTask taskReg taskName (leaseDuration cfg) (job pid)
+              inStream
+              sn_i
+        let job pid _stillValid _release =
+              -- NOTE: we must use a case here to do the pattern match to work around a
+              -- GHC limitation. In 8.6, let gives a very confusing error message about
+              -- variables escaping their scopes. In 8.8, it gives a more helpful
+              -- "my brain just exploded" message that says to use a case statement.
+              case inStream of
+                Stream streamReadAndCheckpoint _ _ _ _ setUpState destroyState ->
+                  bracket
+                    (runStreamTxn jobConfigDB $ setUpState cfg sn_i pid checkpointSS)
+                    destroyState
+                    \state ->
+                      doForSeconds (leaseDuration cfg)
+                        $ void
+                        $ throttleByErrors metrics sn_i
+                        $ runStreamTxn jobConfigDB
+                        $ runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy
+                        $ pipeStep
+                          cfg
+                          streamProcessorStreamStepConfig
+                          inStream
+                          streamReadAndCheckpoint
+                          state
+                          outTopic
+                          sn_i
+                          (processBatch workspaceSS)
+                          metrics
+                          pid
+        forEachPartition inStream $ \pid -> do
+          let taskName = mkTaskName sn_i pid
+          taskReg <- taskRegistry
+          liftIO
+            $ runStreamTxn jobConfigDB
+            $ addTask taskReg taskName (leaseDuration cfg) (job pid)
       return outStream
-  run sn s@(Stream2Processor inl inr watermarker ls rs stepCfg) = do
-    cfg@JobConfig {jobConfigDB} <- getJobConfig
-    (outStream, outTopic) <- outputStreamAndTopic sn s
-    metrics <- registerStepMetrics sn
-    let lname = sn <> "0"
-    let rname = sn <> "1"
-    let checkpointSSL =
-          streamConsumerCheckpointSS
-            (jobConfigSS cfg)
-            inl
-            lname
-    let checkpointSSR =
-          streamConsumerCheckpointSS
-            (jobConfigSS cfg)
-            inr
-            rname
-    let ljob pid _stillValid _release =
-          case inl of
-            Stream streamReadAndCheckpoint _ _ _ _ setUpState destroyState ->
-              bracket
-                (runStreamTxn jobConfigDB $ setUpState cfg lname pid checkpointSSL)
-                destroyState
-                \state ->
-                  doForSeconds (leaseDuration cfg)
-                    $ void
-                    $ throttleByErrors metrics sn
-                    $ runStreamTxn jobConfigDB
-                    $ runCustomWatermark (topicWatermarkSS outTopic) watermarker
-                    $ pipeStep
-                      cfg
-                      stepCfg
-                      inl
-                      streamReadAndCheckpoint
-                      state
-                      outTopic
-                      lname
-                      (ls outTopic)
-                      metrics
-                      pid
-    let rjob pid _stillValid _release =
-          case inr of
-            Stream streamReadAndCheckpoint _ _ _ _ setUpState destroyState ->
-              bracket
-                (runStreamTxn jobConfigDB $ setUpState cfg rname pid checkpointSSR)
-                destroyState
-                \state ->
-                  doForSeconds (leaseDuration cfg)
-                    $ void
-                    $ throttleByErrors metrics sn
-                    $ runStreamTxn jobConfigDB
-                    $ runCustomWatermark (topicWatermarkSS outTopic) watermarker
-                    $ pipeStep
-                      cfg
-                      stepCfg
-                      inr
-                      streamReadAndCheckpoint
-                      state
-                      outTopic
-                      rname
-                      (rs outTopic)
-                      metrics
-                      pid
-    forEachPartition inl $ \pid -> do
-      let lTaskName = TaskName $ BS8.pack (show lname ++ "_" ++ show pid)
-      taskReg <- taskRegistry
-      liftIO
-        $ runStreamTxn jobConfigDB
-        $ addTask taskReg lTaskName (leaseDuration cfg) (ljob pid)
-    forEachPartition inr $ \pid -> do
-      let rTaskName = TaskName $ BS8.pack (show rname ++ "_" ++ show pid)
-      taskReg <- taskRegistry
-      liftIO
-        $ runStreamTxn jobConfigDB
-        $ addTask taskReg rTaskName (leaseDuration cfg) (rjob pid)
-    return outStream
   run
     sn
     step@TableProcessor
@@ -1240,7 +1164,7 @@ pipeStep
 oneToOneJoinStep ::
   forall a1 a2 b c.
   (Message a1, Message a2, Message c) =>
-  Topic ->
+  FDB.Subspace ->
   -- | Index of the stream being consumed. 0 for left side of
   -- join, 1 for right. This will be refactored to support
   -- n-way joins in the future.
@@ -1249,14 +1173,13 @@ oneToOneJoinStep ::
   (a1 -> a2 -> b) ->
   Seq (Maybe Checkpoint, a1) ->
   Transaction (Seq b)
-oneToOneJoinStep outputTopic streamJoinIx pl combiner ckptmsgs = do
+oneToOneJoinStep joinSS streamJoinIx pl combiner ckptmsgs = do
   -- Read from one of the two join streams, and for each
   -- message read, compute the join key. Using the join key, look in the
   -- join table to see if the partner is already there. If so, write the tuple
   -- downstream. If not, write the one message we do have to the join table.
   -- TODO: think of a way to garbage collect items that never get joined.
   let sn = "1:1"
-  let joinSS = topicCustomMetadataSS outputTopic
   let otherIx = if streamJoinIx == 0 then 1 else 0
   joinFutures <-
     for ckptmsgs \(_,msg) -> do
@@ -1347,7 +1270,6 @@ instance HasJobConfig PureStream where
 
 instance MonadStream PureStream where
   run sn s@StreamProcessor {} = makeStream sn sn s
-  run sn s@Stream2Processor {} = makeStream sn sn s
   run sn s@TableProcessor {} = do
     cfg <- getJobConfig
     let table =
