@@ -8,7 +8,7 @@ module FDBStreaming.Stream (
 
 import FDBStreaming.Stream.Internal
   (
-    Stream,
+    Stream(streamTopic, streamName, streamWatermarkSS),
     StreamName,
     isStreamWatermarked,
     getStreamWatermark,

@@ -110,6 +110,7 @@ test-suite fdb-streaming-test
   main-is: Spec.hs
   other-modules:
       Paths_fdb_streaming
+      Spec.FDBStreaming
       Spec.FDBStreaming.TaskLease
       Spec.FDBStreaming.AggrTable
       Spec.FDBStreaming.Watermark

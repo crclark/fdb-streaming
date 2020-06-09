@@ -4,6 +4,7 @@
 import FoundationDB
 import FoundationDB.Layer.Subspace
 import FoundationDB.Layer.Tuple
+import Spec.FDBStreaming (jobTests)
 import Spec.FDBStreaming.AggrTable (tableProps)
 import Spec.FDBStreaming.TaskLease
 import Spec.FDBStreaming.Watermark (watermarks)
@@ -31,7 +32,8 @@ allTests db =
       topicTests testSS db,
       batchWriterTests testSS db,
       indexTests testSS db,
-      utilProps
+      utilProps,
+      jobTests testSS db
     ]
 
 main :: IO ()

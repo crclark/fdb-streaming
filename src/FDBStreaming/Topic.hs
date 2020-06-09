@@ -327,6 +327,11 @@ writeTopic topic@Topic {..} p bss = do
                            , let t = mkTuple i
                            ]
   forM_ keyedIndexedChunks $ \(_, k, bs) -> do
+    -- TODO: this has the unhappy side effect of increasing the size of
+    -- messages encoded by the persist library significantly. persist pads with
+    -- \x00, which FDB's tuple layer uses as a marker for the end of bytes, so
+    -- all the \x00 bytes get escaped with \ff by the tuple layer encoding.
+    -- In other words, every \x00 needs two bytes to encode.
     let v = FDB.encodeTupleElems (map (FDB.Bytes . snd) bs)
     FDB.atomicOp k (Mut.setVersionstampedKey v)
   return [m i | (m,_,cs) <- keyedIndexedChunks, (i,_) <- cs]
@@ -370,7 +375,7 @@ parseTopicKV Topic {..} (k, v) =
   case (FDB.unpack msgsSS k, parseTopicV v) of
     (Right [FDB.Int _, FDB.CompleteVS vs], bs) -> (vs, bs)
     (Right t, _) -> error $ "unexpected key tuple: " ++ show t
-    (Left err, _) -> error $ "failed to decode " ++ show k ++ " because " ++ show err
+    (Left err, _) -> error $ "failed to decode " ++ show k ++ "with msgsSS " ++ show msgsSS ++ " because " ++ show err
 
 -- | Parse a topic key/value pair (in the format (versionstamp, sequence of
 -- messages)) to a list of messages, each paired with the Checkpoint that points

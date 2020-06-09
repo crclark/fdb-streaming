@@ -364,7 +364,6 @@ mainLoop db ss Args{ generatorNumThreads
                     then Just $ \_ -> liftIO getCurrentTime >>= return . Watermark
                     else Nothing)
                 (Just $ fromIntegral @Word8 $ coerce numPartitions)
-                (Just $ fromIntegral @Int $ coerce generatorBatchSize)
   let bwconf = BW.BatchWriterConfig
                { BW.desiredMaxLatencyMillis = 2000
                , BW.maxBatchBytes = 10000

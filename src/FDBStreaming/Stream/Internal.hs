@@ -107,10 +107,10 @@ data Stream a
         -- If not 'Nothing', guarantees that this stream is watermarked in the
         -- given subspace.
         streamWatermarkSS :: Maybe (JobSubspace -> WatermarkSS),
-        -- | Hacky unexported field to indicate that this stream is stored within
-        -- FoundationDB. Several operations can only be performed on FoundationDB
-        -- streams. Currently, only FoundationDB streams (and tables) can be
-        -- watermarked.
+        -- | If this stream is the output of a stream step which is persisted to
+        -- FoundationDB, then this contains the underlying Topic in which the
+        -- stream is persisted. Streams that represent external data sources
+        -- (such as Kafka topics) will have this set to 'Nothing'.
         streamTopic :: Maybe Topic,
         -- | The unique name of this stream. This is used to persist checkpointing
         -- data in FoundationDB, so conflicts in these names are very, very bad.

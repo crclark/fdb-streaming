@@ -11,18 +11,16 @@ module Spec.FDBStreaming.Index
 where
 
 import Control.Monad ((>=>), void)
-import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BS
 import Data.Foldable (for_)
 import Data.Maybe (catMaybes, fromJust)
 import Data.Sequence (Seq)
-import qualified Data.Sequence as Seq
 import Data.Traversable (for)
 import Data.Word (Word64)
 import qualified FDBStreaming.Index as Index
-import FDBStreaming.TableKey (OrdTableKey, TableKey (fromKeyBytes, toKeyBytes))
-import FDBStreaming.Topic (PartitionId, getEntireTopic, getPartitionCount, getTopicCount, makeTopic, readNAndCheckpoint, readNAndCheckpointIO, writeTopic, writeTopicIO)
+import FDBStreaming.TableKey (OrdTableKey, TableKey)
+import FDBStreaming.Topic (makeTopic, writeTopic)
 import FDBStreaming.Topic (Topic)
 import qualified FDBStreaming.Topic as Topic
 import qualified FoundationDB as FDB
@@ -31,7 +29,6 @@ import FoundationDB.Layer.Subspace (Subspace)
 import qualified FoundationDB.Layer.Subspace as FDB
 import qualified FoundationDB.Layer.Tuple as FDB
 import qualified FoundationDB.Versionstamp as FDB
-import GHC.Exts (IsList (toList))
 import Spec.FDBStreaming.Util (extendRand)
 import qualified Streamly.Prelude as S
 import Test.Tasty (TestTree, testGroup)
@@ -215,15 +212,15 @@ indexCommitted testSS db = testCase "indexCommitted" $ do
   let topic = makeTopic ss "test" 2 2048
   let (ix :: Index.Index BS.ByteString) = Index.namedIndex topic "testIndex"
   let write pid xs = void $ runTransaction db $ writeTopic topic pid xs
-  let read pid =
+  let readPid pid =
         fmap (\(c, x) -> (Topic.checkpointToCoordinate pid c, x))
           <$> Topic.peekNPastCheckpoint topic pid "x" 100
   let writeIndices cks = runTransaction db $ for_ cks $
         \(c, k) -> Index.indexCommitted ix k c
   write 0 ["1", "2", "3"]
   write 1 ["4", "5", "6"]
-  p0 <- runTransaction db $ read 0
-  p1 <- runTransaction db $ read 1
+  p0 <- runTransaction db $ readPid 0
+  p1 <- runTransaction db $ readPid 1
   writeIndices p0
   writeIndices p1
   kcs <- fmap fst <$> getAllBetween db ix "1" "7"

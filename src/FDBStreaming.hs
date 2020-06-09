@@ -181,6 +181,7 @@ module FDBStreaming
     JobConfig (..),
     runJob,
     runPure,
+    listTopics,
 
     -- * Streams
     Stream (streamTopic),
@@ -195,6 +196,10 @@ module FDBStreaming
     atLeastOnce,
     pipe,
     oneToOneJoin,
+
+    -- * Indexing stream contents
+    indexBy,
+    Ix.Index,
 
     -- * Tables
     AT.AggrTable,
@@ -247,6 +252,7 @@ import Data.Traversable (for)
 import Data.Witherable.Class (catMaybes, witherM)
 import Data.Word (Word8, Word16, Word64)
 import qualified FDBStreaming.AggrTable as AT
+import qualified FDBStreaming.Index as Ix
 import FDBStreaming.JobConfig (JobConfig (JobConfig, defaultNumPartitions, jobConfigDB, jobConfigSS, leaseDuration, logLevel, msgsPerBatch, numPeriodicJobThreads, numStreamThreads, streamMetricsStore, defaultChunkSizeBytes), JobSubspace)
 import FDBStreaming.Joins
   ( delete1to1JoinData,
@@ -267,10 +273,15 @@ import FDBStreaming.StreamStep.Internal
   ( BatchProcessor(BatchProcessor),
     batchProcessorInputWatermarkSS,
     batchProcessorInputTopic,
-    StreamStep(StreamProcessor,
+    StreamStep(IndexedStreamProcessor,
+               StreamProcessor,
                TableProcessor),
+    indexedStreamProcessorInner,
+    indexedStreamProcessorIndexName,
+    indexedStreamProcessorIndexBy,
     streamProcessorWatermarkBy,
     streamProcessorBatchProcessors,
+    streamProcessorIndexers,
     streamProcessorStreamStepConfig,
     tableProcessorGroupedBy,
     tableProcessorAggregation,
@@ -289,7 +300,10 @@ import FDBStreaming.StreamStep.Internal
     StepName,
     GroupedBy(GroupedBy),
     groupedByInStream,
-    isStepDefaultWatermarked)
+    isStepDefaultWatermarked,
+    Indexer(Indexer),
+    consIndexer,
+    indexBy)
 import FDBStreaming.TaskLease (TaskName (TaskName), secondsSinceEpoch)
 import FDBStreaming.TaskRegistry as TaskRegistry
   ( TaskRegistry,
@@ -504,6 +518,8 @@ defaultWatermarkUpstreamTopics
           else Nothing
 
 instance MonadStream DefaultWatermarker where
+  run sn step@IndexedStreamProcessor{} =
+    runIndexedStreamProcessor sn step
   run sn step@StreamProcessor{} = do
     JobConfig {jobConfigSS} <- getJobConfig
     output <- makeStream sn sn step
@@ -636,6 +652,7 @@ atLeastOnce sn input f = void $ do
       { streamProcessorWatermarkBy = NoWatermark,
         streamProcessorBatchProcessors =
           [BatchProcessor input (\_ xs -> mapM (liftIO . f . snd) xs)],
+        streamProcessorIndexers = [],
         streamProcessorStreamStepConfig = defaultStreamStepConfig
       }
 
@@ -673,6 +690,7 @@ pipe' input f =
           else NoWatermark,
       streamProcessorBatchProcessors =
         [BatchProcessor input (\_ xs -> fmap catMaybes $ mapM (liftIO . f . snd) xs)],
+      streamProcessorIndexers = [],
       streamProcessorStreamStepConfig = defaultStreamStepConfig
     }
 
@@ -719,6 +737,7 @@ oneToOneJoin' inl inr pl pr j =
         )
         [ BatchProcessor inl lstep
         , BatchProcessor inr rstep]
+        []
         defaultStreamStepConfig
 
 -- TODO: implement one-to-many joins in terms of this?
@@ -860,6 +879,19 @@ runCustomWatermark wmSS (CustomWatermark f) t = do
   return (n, xs)
 runCustomWatermark _ _ t = t
 
+runIndexers :: [Indexer outMsg]
+            -> Topic
+            -> Transaction (Int, Seq (Topic.CoordinateUncommitted, outMsg))
+            -> Transaction (Int, Seq outMsg)
+runIndexers ixers outTopic f = do
+  (n, cmsgs) <- f
+  for_ ixers \(Indexer ixNm ixer) -> do
+    let ix = Ix.namedIndex outTopic ixNm
+    for_ cmsgs \(coord, msg) -> do
+      let ks = ixer msg
+      for_ ks \k -> Ix.index ix k coord
+  return (n, fmap snd cmsgs)
+
 outputStreamAndTopic ::
   (HasJobConfig m, Message c, Monad m) =>
   StepName ->
@@ -881,12 +913,35 @@ outputStreamAndTopic stepName step = do
           $ streamFromTopic streamTopic stepName
   return (fmap fromMessage stream, streamTopic)
 
+-- TODO: find a way to improve the type on this so that we don't need to
+-- return Maybe.
+-- | Returns Nothing if the step doesn't produce a topic (i.e., it's a
+-- TableProcessor).
+outputTopic ::
+  (HasJobConfig m, Monad m) =>
+  StepName ->
+  StreamStep b runResult ->
+  m (Maybe Topic)
+outputTopic stepName IndexedStreamProcessor{indexedStreamProcessorInner} =
+  outputTopic stepName indexedStreamProcessorInner
+outputTopic stepName step@StreamProcessor{} = do
+  jc <- getJobConfig
+  return $ Just $ makeTopic
+                    (jobConfigSS jc)
+                    stepName
+                    (getStepNumPartitions jc (getStepConfig step))
+                    (defaultChunkSizeBytes jc)
+outputTopic _ TableProcessor{} = return Nothing
+
 instance MonadStream LeaseBasedStreamWorker where
+  run sn step@IndexedStreamProcessor{} =
+    runIndexedStreamProcessor sn step
   run
     sn
     s@StreamProcessor
       { streamProcessorWatermarkBy,
         streamProcessorBatchProcessors,
+        streamProcessorIndexers,
         streamProcessorStreamStepConfig
       } = do
       (outStream, outTopic) <- outputStreamAndTopic sn s
@@ -918,6 +973,7 @@ instance MonadStream LeaseBasedStreamWorker where
                         $ throttleByErrors metrics sn_i
                         $ runStreamTxn jobConfigDB
                         $ runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy
+                        $ runIndexers streamProcessorIndexers outTopic
                         $ pipeStep
                           cfg
                           streamProcessorStreamStepConfig
@@ -1132,7 +1188,7 @@ pipeStep ::
   (Seq (Maybe Checkpoint, a) -> Transaction (Seq b)) ->
   Maybe StreamEdgeMetrics ->
   PartitionId ->
-  Transaction (Int, Seq b)
+  Transaction (Int, Seq (Topic.CoordinateUncommitted, b))
 pipeStep
   jobCfg
   stepCfg
@@ -1158,8 +1214,8 @@ pipeStep
     ys <- transformBatch inMsgs
     let outMsgs = fmap toMessage ys
     p' <- liftIO $ randPartition outCfg
-    void $ writeTopic outCfg p' (toList outMsgs)
-    return (length inMsgs, ys)
+    coords <- writeTopic outCfg p' (toList outMsgs)
+    return (length inMsgs, (Seq.zip (Seq.fromList coords) ys))
 
 oneToOneJoinStep ::
   forall a1 a2 b c.
@@ -1269,6 +1325,8 @@ instance HasJobConfig PureStream where
   getJobConfig = Reader.ask
 
 instance MonadStream PureStream where
+  run sn step@IndexedStreamProcessor{} =
+    runIndexedStreamProcessor sn step
   run sn s@StreamProcessor {} = makeStream sn sn s
   run sn s@TableProcessor {} = do
     cfg <- getJobConfig
@@ -1296,3 +1354,46 @@ getStepNumPartitions JobConfig {defaultNumPartitions} StreamStepConfig {stepOutp
 getMsgsPerBatch :: JobConfig -> StreamStepConfig -> Word16
 getMsgsPerBatch JobConfig {msgsPerBatch} StreamStepConfig {stepBatchSize} =
   fromMaybe msgsPerBatch stepBatchSize
+
+newtype ListTopics a = ListTopics {unListTopics :: ReaderT JobConfig (StateT [Topic] Identity) a}
+  deriving (Functor, Applicative, Monad, MonadReader JobConfig, MonadState [Topic])
+
+instance HasJobConfig ListTopics where
+  getJobConfig = Reader.ask
+
+instance MonadStream ListTopics where
+  run sn step@IndexedStreamProcessor{} = do
+    t <- outputTopic sn step
+    State.modify (fromJust t :)
+    runIndexedStreamProcessor sn step
+  run sn step@StreamProcessor{} = do
+    t <- outputTopic sn step
+    State.modify (fromJust t :)
+    makeStream sn sn step
+  run sn step@TableProcessor{} = do
+    cfg <- getJobConfig
+    let table =
+          getAggrTable
+            cfg
+            sn
+            (getStepNumPartitions cfg (getStepConfig step))
+    return table
+
+-- | List all topics written to by the given stream topology.
+listTopics :: JobConfig -> (forall m. MonadStream m => m a) -> [Topic]
+listTopics cfg f =
+  State.execState (Reader.runReaderT (unListTopics f) cfg) []
+
+runIndexedStreamProcessor :: (HasJobConfig m, MonadStream m) => StepName -> StreamStep outMsg runResult -> m runResult
+runIndexedStreamProcessor sn step@IndexedStreamProcessor{ indexedStreamProcessorInner
+                                    , indexedStreamProcessorIndexName
+                                    , indexedStreamProcessorIndexBy } = do
+    let step' = consIndexer indexedStreamProcessorInner
+                            indexedStreamProcessorIndexName
+                            indexedStreamProcessorIndexBy
+    res <- run sn step'
+    mtopic <- outputTopic sn step
+    case mtopic of
+      Nothing -> error "impossible happened"
+      Just topic -> return (Ix.namedIndex topic indexedStreamProcessorIndexName, res)
+runIndexedStreamProcessor _ _ = error "runIndexedStreamProcessor called on wrong constructor"

@@ -152,7 +152,7 @@ import Control.Monad (replicateM, void)
 import Control.Monad.IO.Class (liftIO)
 import Data.Foldable (for_)
 import Data.Maybe (fromMaybe, isJust)
-import Data.Word (Word16, Word8)
+import Data.Word (Word8)
 import qualified FDBStreaming.JobConfig as JC
 import FDBStreaming.Message (Message (fromMessage, toMessage))
 import FDBStreaming.Stream (Stream, StreamName)
@@ -168,14 +168,17 @@ import qualified FoundationDB.Layer.Tuple as FDB
 -- messages to it from outside the pipeline system.
 data PushStreamConfig inMsg
   = PushStreamConfig
-      { pushStreamWatermarkBy :: Maybe (inMsg -> Transaction Watermark),
+      { -- | A watermarking function for the inputs to the stream.
+        pushStreamWatermarkBy :: Maybe (inMsg -> Transaction Watermark),
         -- TODO: reuse StepConfig for options below?
-        pushStreamOutputPartitions :: Maybe Word8,
-        pushStreamBatchSize :: Maybe Word16
+        -- | Number of partitions in the Topic that the elements of the stream
+        -- will be persisted to. If Nothing, the default in the 'JobConfig' will
+        -- be used.
+        pushStreamOutputPartitions :: Maybe Word8
       }
 
 defaultPushStreamConfig :: PushStreamConfig a
-defaultPushStreamConfig = PushStreamConfig Nothing Nothing Nothing
+defaultPushStreamConfig = PushStreamConfig Nothing Nothing
 
 -- | Set up a stream that messages can be pushed to from outside the pipeline.
 -- Returns the stream and a set of BatchWriters for writing to it. The stream

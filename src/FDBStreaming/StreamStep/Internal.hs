@@ -3,6 +3,8 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE FlexibleInstances #-}
 
 -- Internal module; export everything!
 {-# OPTIONS_GHC -fno-warn-missing-export-lists #-}
@@ -12,6 +14,7 @@ module FDBStreaming.StreamStep.Internal  where
 import FDBStreaming.JobConfig (JobSubspace)
 import FDBStreaming.Message(Message)
 import FDBStreaming.Stream.Internal(Stream(streamWatermarkSS, streamTopic))
+import FDBStreaming.Index (Index, IndexName)
 import FDBStreaming.Topic (Topic, Checkpoint)
 import qualified FDBStreaming.AggrTable as AT
 import FDBStreaming.Watermark
@@ -81,12 +84,24 @@ batchProcessorInputWatermarkSS (BatchProcessor i _) = streamWatermarkSS i
 batchProcessorInputTopic :: BatchProcessor b -> Maybe Topic
 batchProcessorInputTopic (BatchProcessor i _) = streamTopic i
 
+data Indexer outMsg =
+  forall k. AT.TableKey k => Indexer {
+    indexerIndexName :: IndexName,
+    indexerIndexBy :: (outMsg -> [k])
+  }
+
 -- TODO: What is a stream step, really? Just seems to be miscellaneous inputs to
 -- 'run', gathered together so we can use a builder style on them.
 -- Streams and AggrTables are well-defined, but stream steps are not.
 -- TODO: need a splitter that can efficiently route messages to different
 -- output streams.
 data StreamStep outMsg runResult where
+  IndexedStreamProcessor ::
+    (Indexable c, Message b, AT.TableKey k) =>
+    { indexedStreamProcessorInner :: StreamStep b c,
+      indexedStreamProcessorIndexName :: IndexName,
+      indexedStreamProcessorIndexBy :: (b -> [k])
+    } -> StreamStep b (Index k, c)
   StreamProcessor ::
     Message b =>
     { streamProcessorWatermarkBy :: WatermarkBy b,
@@ -96,6 +111,13 @@ data StreamStep outMsg runResult where
       -- reason I can see that pipeStep and this callback both need to exist.
       -- Same with the other constructors.
       streamProcessorBatchProcessors :: [BatchProcessor b],
+      -- | This is a hack to allow IndexedStreamProcessor to push its index
+      -- function down into the run function for StreamProcessor. It should
+      -- only be used by 'run' for IndexedStreamProcessor. Its job is to forget
+      -- the index key type, while IndexedStreamProcessor's job is to remember
+      -- it. TODO: is there a less redundant way to do this? We have a new
+      -- GADT constructor, this existentially-quantified list, and a type class!
+      streamProcessorIndexers :: [Indexer b],
       streamProcessorStreamStepConfig :: StreamStepConfig
     } ->
     StreamStep b
@@ -118,7 +140,21 @@ data StreamStep outMsg runResult where
     StreamStep (k, aggr)
       (AT.AggrTable k aggr)
 
+class Indexable runResult where
+  indexBy :: (Message outMsg, AT.TableKey k)
+          => IndexName
+          -> (outMsg -> [k])
+          -> StreamStep outMsg runResult
+          -> StreamStep outMsg (Index k, runResult)
+
+instance Indexable (Stream outMsg) where
+  indexBy ixnm f stp = IndexedStreamProcessor stp ixnm f
+
+instance Indexable a => Indexable (Index k, a) where
+  indexBy ixnm f stp = IndexedStreamProcessor stp ixnm f
+
 stepWatermarkBy :: StreamStep outMsg runResult -> WatermarkBy outMsg
+stepWatermarkBy IndexedStreamProcessor {..} = stepWatermarkBy indexedStreamProcessorInner
 stepWatermarkBy StreamProcessor {..} = streamProcessorWatermarkBy
 stepWatermarkBy TableProcessor {..} = tableProcessorWatermarkBy
 
@@ -131,19 +167,25 @@ isStepDefaultWatermarked = isDefaultWatermark . stepWatermarkBy
 -- NOTE: GHC bug prevents us from using record update syntax in this function,
 -- which would make this much cleaner. https://gitlab.haskell.org/ghc/ghc/issues/2595
 watermarkBy :: (b -> Transaction Watermark) -> StreamStep b r -> StreamStep b r
-watermarkBy f (StreamProcessor _ ps stepCfg) =
-  StreamProcessor (CustomWatermark f) ps stepCfg
+watermarkBy f (IndexedStreamProcessor inner nm ixby) =
+  IndexedStreamProcessor (watermarkBy f inner) nm ixby
+watermarkBy f (StreamProcessor _ ps ixers stepCfg) =
+  StreamProcessor (CustomWatermark f) ps ixers stepCfg
 watermarkBy f (TableProcessor g a _ trigger stepCfg) =
   TableProcessor g a (CustomWatermark f) trigger stepCfg
 
 getStepConfig :: StreamStep b r -> StreamStepConfig
+getStepConfig IndexedStreamProcessor {indexedStreamProcessorInner} =
+  getStepConfig indexedStreamProcessorInner
 getStepConfig StreamProcessor {streamProcessorStreamStepConfig} =
   streamProcessorStreamStepConfig
 getStepConfig TableProcessor {tableProcessorStreamStepConfig} =
   tableProcessorStreamStepConfig
 
 mapStepConfig :: (StreamStepConfig -> StreamStepConfig) -> StreamStep b r -> StreamStep b r
-mapStepConfig f (StreamProcessor w p c) = StreamProcessor w p (f c)
+mapStepConfig f (IndexedStreamProcessor inner nm ixby) =
+  IndexedStreamProcessor (mapStepConfig f inner) nm ixby
+mapStepConfig f (StreamProcessor w p ixers c) = StreamProcessor w p ixers (f c)
 mapStepConfig f (TableProcessor g a w t c) = TableProcessor g a w t (f c)
 
 -- | Sets the number of messages to process per batch for the given step.
@@ -162,6 +204,19 @@ withBatchSize n = mapStepConfig (\c -> c {stepBatchSize = Just n})
 -- performance.
 withOutputPartitions :: Word8 -> StreamStep b r -> StreamStep b r
 withOutputPartitions np = mapStepConfig (\c -> c {stepOutputPartitions = Just np})
+
+consIndexer :: AT.TableKey k
+            => StreamStep outMsg runResult
+            -> IndexName
+            -> (outMsg -> [k])
+            -> StreamStep outMsg runResult
+consIndexer (IndexedStreamProcessor inner ixnm' f') ixnm f =
+  IndexedStreamProcessor (consIndexer inner ixnm f) ixnm' f'
+consIndexer (StreamProcessor wm bps ixers conf) ixnm f =
+  StreamProcessor wm bps (Indexer ixnm f : ixers) conf
+-- TODO: make type more precise to indicate that this won't work on
+-- table processors. Had difficulty doing so.
+consIndexer s@TableProcessor{} _ _ = s
 
 {- TODO
 triggerBy :: ((Versionstamp 'Complete, v, [k]) -> Transaction [(k,aggr)])

@@ -11,8 +11,8 @@ import Data.Traversable (for)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async, cancel)
 import Control.Monad (void)
-import FDBStreaming (MonadStream, Stream, runJob, streamFromTopic, runPure)
-import FDBStreaming.Topic (Topic(topicName), makeTopic, writeTopicIO, TopicName, listExistingTopics, getTopicCount)
+import FDBStreaming (MonadStream, Stream, runJob, streamFromTopic, runPure, listTopics)
+import FDBStreaming.Topic (Topic(topicName), makeTopic, writeTopicIO, TopicName, getTopicCount)
 import FDBStreaming.Message (Message (fromMessage, toMessage))
 import qualified FDBStreaming.JobConfig as JC
 import qualified Data.Map as Map
@@ -21,21 +21,25 @@ import Data.Map (Map)
 import qualified FoundationDB as FDB
 import qualified Control.Logger.Simple as Log
 
-topicCounts :: FDB.Database -> JC.JobSubspace -> IO (Map TopicName Int)
-topicCounts db ss = do
-  --TODO: this is now broken, because we don't know how many partitions the
-  --topics have.
-  tcs <- listExistingTopics db ss
+topicCounts :: FDB.Database
+            -> JC.JobConfig
+            -> (forall m . MonadStream m => m b)
+            -> IO (Map TopicName Int)
+topicCounts db cfg topology = do
+  let tcs = listTopics cfg topology
   FDB.runTransaction db $ fmap Map.fromList $ for tcs $ \tc -> do
     c <- getTopicCount tc
-    return ((topicName tc), fromIntegral c)
+    return (topicName tc, fromIntegral c)
 
-waitCountUnchanged :: FDB.Database -> JC.JobSubspace -> IO ()
-waitCountUnchanged db ss = do
-  tc1 <- topicCounts db ss
+waitCountUnchanged :: FDB.Database
+                   -> JC.JobConfig
+                   -> (forall m . MonadStream m => m b)
+                   -> IO ()
+waitCountUnchanged db cfg topology = do
+  tc1 <- topicCounts db cfg topology
   threadDelay 1000000
-  tc2 <- topicCounts db ss
-  if tc1 == tc2 then return () else waitCountUnchanged db ss
+  tc2 <- topicCounts db cfg topology
+  if tc1 == tc2 then return () else waitCountUnchanged db cfg topology
 
 -- | Given a small collection of input, and a topology that takes a stream of
 -- the same type as input, run the pipeline on that input. Blocks until activity
@@ -53,7 +57,7 @@ testOnInput cfg xs topology = do
   let strm = fromMessage <$> streamFromTopic inTopic "test_input_stream"
   job <- async $ runJob cfg (topology strm)
   -- TODO: this is probably incredibly brittle.
-  waitCountUnchanged (JC.jobConfigDB cfg) (JC.jobConfigSS cfg)
+  waitCountUnchanged (JC.jobConfigDB cfg) cfg (topology strm)
   cancel job
   return $ runPure cfg (topology strm)
 
