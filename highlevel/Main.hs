@@ -16,6 +16,7 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE OverloadedLabels #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
+{-# OPTIONS_GHC -fno-warn-missing-export-lists #-}
 
 module Main where
 
@@ -60,7 +61,7 @@ import           Data.UUID.V4                   as UUID
                                                 ( nextRandom )
 import           GHC.Generics                   ( Generic )
 import           System.Random                  ( randomIO, randomRIO )
-import           Data.Maybe                     ( fromMaybe, fromJust )
+import           Data.Maybe                     ( fromMaybe )
 import           Data.Persist                     ( Persist )
 import qualified Data.Persist                    as Persist
 import           Data.Functor.Identity (Identity(..))
@@ -271,7 +272,7 @@ latencyReportLoop stats = do
   threadDelay 1000000
   latencyReportLoop stats
 
-topology :: (MonadStream m) => Stream Order -> m (AT.AggrTable OrderID All)
+topology :: (MonadStream m) => Stream t Order -> m (AT.AggrTable OrderID All)
 topology input = do
   let fraudChecks = fmap isFraudulent input
   let invChecks = fmap inventoryCheck input
@@ -391,7 +392,7 @@ mainLoop db ss Args{ generatorNumThreads
     when (coerce printTopicStats) $ printStats db ss (coerce numPartitions)
     threadDelay 1000000
   _ <- forkIO $ forever $ do
-    printWatermarkLag db (topicWatermarkSS $ fromJust $ streamTopic input) (AT.aggrTableWatermarkSS table)
+    printWatermarkLag db (topicWatermarkSS $ streamTopic input) (AT.aggrTableWatermarkSS table)
     threadDelay 1000000
   if coerce streamRun
      then runJob conf (topology input)
@@ -407,7 +408,7 @@ cleanup db ss = catches (do
      (CError err) -> putStrLn $ "Caught " ++ show err ++ "while clearing subspace"
      (Error err) -> putStrLn $ "Caught " ++ show err ++ "while clearing subspace"]
 
-wordCount :: MonadStream m => Stream Text -> m (AT.AggrTable Text (Sum Int))
+wordCount :: MonadStream m => Stream t Text -> m (AT.AggrTable Text (Sum Int))
 wordCount txts = aggregate "counts" (groupBy Text.words txts) (const (Sum 1))
 
 data Args f = Args

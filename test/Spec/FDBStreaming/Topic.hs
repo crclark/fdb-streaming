@@ -7,7 +7,6 @@
 module Spec.FDBStreaming.Topic (topicTests) where
 
 import Control.Monad (void)
-import Control.Monad.IO.Class (liftIO)
 import qualified Data.ByteString.Char8 as BS
 import qualified Data.Sequence as Seq
 import Test.Tasty (TestTree, testGroup)
@@ -16,7 +15,7 @@ import qualified FoundationDB as FDB
 import FoundationDB (Database, runTransaction)
 import FoundationDB.Layer.Subspace (Subspace)
 import Spec.FDBStreaming.Util (extendRand)
-import FDBStreaming.Topic (writeTopic, PartitionId, getEntireTopic, writeTopicIO, readNAndCheckpoint, readNAndCheckpointIO, makeTopic, getTopicCount, getPartitionCount)
+import FDBStreaming.Topic (writeTopic, writeTopicIO, readNAndCheckpoint, readNAndCheckpointIO, makeTopic, getTopicCount, getPartitionCount)
 import qualified FDBStreaming.Topic as Topic
 
 readWrite :: Subspace -> Database -> TestTree
@@ -70,7 +69,6 @@ checkpoints testSS db = testCase "readNAndCheckpoint2" $ do
   xs1 <- fmap snd <$> readNAndCheckpointIO db topic "tr" 2
   xs2 <- fmap snd <$> readNAndCheckpointIO db topic "tr" 2
   xs3 <- fmap snd <$> readNAndCheckpointIO db topic "tr" 1
-  entire <- runTransaction db $ getEntireTopic topic
   xs1 @?= ["1", "2"]
   xs2 @?= ["3", "4"]
   xs3 @?= ["5"]

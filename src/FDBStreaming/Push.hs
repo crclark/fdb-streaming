@@ -1,5 +1,6 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE DataKinds #-}
 
 -- (Temporary) module for prototyping an HTTP input/output interface for
 -- stream pipelines.
@@ -155,7 +156,7 @@ import Data.Maybe (fromMaybe, isJust)
 import Data.Word (Word8)
 import qualified FDBStreaming.JobConfig as JC
 import FDBStreaming.Message (Message (fromMessage, toMessage))
-import FDBStreaming.Stream (Stream, StreamName)
+import FDBStreaming.Stream (Stream, StreamName, StreamPersisted(FDB))
 import FDBStreaming.Stream.Internal (streamFromTopic, setStreamWatermarkByTopic)
 import FDBStreaming.Topic (makeTopic, randPartition, topicCustomMetadataSS, writeTopic)
 import FDBStreaming.Util.BatchWriter (BatchWriter, BatchWriterConfig, batchWriter, defaultBatchWriterConfig)
@@ -195,7 +196,7 @@ runPushStream ::
   BatchWriterConfig ->
   -- | Number of batch writers to create
   Word ->
-  IO (Stream inMsg, [BatchWriter inMsg])
+  IO (Stream 'FDB inMsg, [BatchWriter inMsg])
 runPushStream jc sn ps bwc bn = do
   let numPartitions =
         fromMaybe
@@ -223,7 +224,7 @@ runPushStream' ::
   Message inMsg =>
   JC.JobConfig ->
   StreamName ->
-  IO (Stream inMsg, BatchWriter inMsg)
+  IO (Stream 'FDB inMsg, BatchWriter inMsg)
 runPushStream' jc sn =
   fmap head <$> runPushStream jc sn defaultPushStreamConfig defaultBatchWriterConfig 1
 

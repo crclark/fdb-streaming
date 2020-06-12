@@ -378,17 +378,18 @@ parseTopicKV Topic {..} (k, v) =
     (Left err, _) -> error $ "failed to decode " ++ show k ++ "with msgsSS " ++ show msgsSS ++ " because " ++ show err
 
 -- | Parse a topic key/value pair (in the format (versionstamp, sequence of
--- messages)) to a list of messages, each paired with the Checkpoint that points
--- to that message. This checkpoint is the checkpoint that we
--- would use if we were to stop reading at that message.
-topicKVToCheckpointMessage ::
+-- messages)) to a list of messages, each paired with the Coordinate that points
+-- to that message. This coordinate can be used to produce the checkpoint that
+-- we would use if we were to stop reading at that message.
+topicKVToCoordinateMessage ::
   Topic ->
+  PartitionId ->
   (ByteString, ByteString)
-  -> [(Checkpoint, ByteString)]
-topicKVToCheckpointMessage t kv =
+  -> [(Coordinate, ByteString)]
+topicKVToCoordinateMessage t pid kv =
   let (vs, msgs) = parseTopicKV t kv
       imsgs = zip [0..] msgs
-      in [(Checkpoint vs i, msg) | (i, msg) <- imsgs]
+      in [(Coordinate pid vs i, msg) | (i, msg) <- imsgs]
 
 newtype TopicWatch = TopicWatch {unTopicWatch :: [FutureIO PartitionId]}
   deriving (Show)
@@ -509,7 +510,7 @@ peekNPastCheckpoint ::
   PartitionId ->
   ReaderName ->
   Word16 ->
-  Transaction (Seq (Checkpoint, ByteString))
+  Transaction (Seq (Coordinate, ByteString))
 peekNPastCheckpoint topic pid rn n = do
   ckpt@(Checkpoint cpvs _) <- getCheckpoint topic pid rn
   let begin = FDB.pack (partitionMsgsSS topic pid) [FDB.CompleteVS cpvs]
@@ -524,12 +525,12 @@ peekNPastCheckpoint topic pid rn n = do
         }
   rr <- FDB.withSnapshot (FDB.getRange' r FDB.StreamingModeSmall) >>= FDB.await
   streamlyRangeResult rr
-    -- Parse bytestrings to Stream of chunks: Stream [(Checkpoint, ByteString)]
-    & fmap (topicKVToCheckpointMessage topic)
-    -- flatten chunks into top-level stream: Stream (Checkpoint, ByteString)
+    -- Parse bytestrings to Stream of chunks: Stream [(Coordinate, ByteString)]
+    & fmap (topicKVToCoordinateMessage topic pid)
+    -- flatten chunks into top-level stream: Stream (Coordinate, ByteString)
     & S.concatMap S.fromFoldable
     -- Drop msgs that we have already processed
-    & S.dropWhile ((<= ckpt) . fst)
+    & S.dropWhile ((<= ckpt) . coordinateToCheckpoint . fst)
     -- take the requested number of msgs
     & S.take (fromIntegral n)
     & S.toList
@@ -543,11 +544,11 @@ readNAndCheckpoint ::
   PartitionId ->
   ReaderName ->
   Word16 ->
-  Transaction (Seq (Checkpoint, ByteString))
+  Transaction (Seq (Coordinate, ByteString))
 readNAndCheckpoint topic@Topic {..} p rn n =
   peekNPastCheckpoint topic p rn n >>= \case
-    x@(_ :|> (ckpt, _)) -> do
-      checkpoint topic p rn ckpt
+    x@(_ :|> (coord, _)) -> do
+      checkpoint topic p rn (coordinateToCheckpoint coord)
       return x
     x -> return x
 
@@ -575,7 +576,7 @@ readNAndCheckpointIO ::
   Topic ->
   ReaderName ->
   Word16 ->
-  IO (Seq (Checkpoint, ByteString))
+  IO (Seq (Coordinate, ByteString))
 readNAndCheckpointIO db topic@Topic {..} rn n = do
   p <- randPartition topic
   FDB.runTransaction db (readNAndCheckpoint topic p rn n)

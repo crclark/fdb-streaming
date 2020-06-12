@@ -80,7 +80,7 @@ parseIndexKey :: (TableKey k) => Index k -> ByteString -> (k, Topic.Coordinate)
 parseIndexKey Index {indexSS} k = case FDB.unpack indexSS k of
   Right [FDB.Int _, FDB.Bytes k', FDB.CompleteVS vs, FDB.Int pid, FDB.Int i] ->
     (fromKeyBytes k', Topic.Coordinate (fromIntegral pid) vs (fromIntegral i))
-  _ -> error "Failed to parse index key."
+  x -> error $ "Failed to parse index key: " ++ show x
 
 -- | Parse a key/value pair returned from a range read initiated by
 -- 'countForKeysRange'.

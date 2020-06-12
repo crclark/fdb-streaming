@@ -15,7 +15,6 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BS
 import Data.Foldable (for_)
 import Data.Maybe (catMaybes, fromJust)
-import Data.Sequence (Seq)
 import Data.Traversable (for)
 import Data.Word (Word64)
 import qualified FDBStreaming.Index as Index
@@ -33,14 +32,6 @@ import Spec.FDBStreaming.Util (extendRand)
 import qualified Streamly.Prelude as S
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit ((@?=), testCase)
-
-getRawKeyRange ::
-  (Eq k, TableKey k) =>
-  Index.Index k ->
-  k ->
-  FDB.Transaction (Seq (ByteString, ByteString))
-getRawKeyRange ix k =
-  FDB.getEntireRange (Index.coordinateRangeForKey ix k)
 
 getOne ::
   (Eq k, TableKey k) =>
@@ -62,7 +53,7 @@ getOneOrCrash ix k = do
   return $ fromJust (fmap snd x)
 
 getAll ::
-  (Eq k, TableKey k) =>
+  (TableKey k) =>
   Index.Index k ->
   k ->
   FDB.Transaction [Topic.Coordinate]
@@ -84,7 +75,7 @@ getAllBetween db ix k1 k2 = runTransaction db $ do
   S.toList s
 
 getCount ::
-  (Eq k, TableKey k) =>
+  (TableKey k) =>
   Database ->
   Index.Index k ->
   k ->
@@ -104,7 +95,7 @@ getAllCounts db ix k1 k2 = runTransaction db $ do
   S.toList s
 
 getAllTopic ::
-  (Eq k, TableKey k) =>
+  (TableKey k) =>
   Database ->
   Index.Index k ->
   k ->
@@ -212,9 +203,7 @@ indexCommitted testSS db = testCase "indexCommitted" $ do
   let topic = makeTopic ss "test" 2 2048
   let (ix :: Index.Index BS.ByteString) = Index.namedIndex topic "testIndex"
   let write pid xs = void $ runTransaction db $ writeTopic topic pid xs
-  let readPid pid =
-        fmap (\(c, x) -> (Topic.checkpointToCoordinate pid c, x))
-          <$> Topic.peekNPastCheckpoint topic pid "x" 100
+  let readPid pid = Topic.peekNPastCheckpoint topic pid "x" 100
   let writeIndices cks = runTransaction db $ for_ cks $
         \(c, k) -> Index.indexCommitted ix k c
   write 0 ["1", "2", "3"]

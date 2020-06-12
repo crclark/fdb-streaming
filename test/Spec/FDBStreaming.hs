@@ -4,23 +4,20 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE DataKinds #-}
 
-module Spec.FDBStreaming where
+module Spec.FDBStreaming (jobTests) where
 
-import Control.Monad ((>=>), void)
+import Control.Monad ((>=>))
 import Data.ByteString (ByteString)
-import qualified Data.ByteString.Char8 as BS
 import Data.Either (fromRight)
-import qualified Data.Map as Map
-import Data.Maybe (catMaybes, fromJust)
+import Data.Maybe (catMaybes)
 import Data.Persist (Persist)
 import qualified Data.Persist as Persist
 import Data.Traversable (for)
-import Data.Word (Word64)
-import Debug.Trace
-import FDBStreaming (Index, Message (fromMessage, toMessage), MonadStream, Stream, indexBy, jobConfigSS, pipe', run, streamTopic)
+import FDBStreaming (Index, Message (fromMessage, toMessage), StreamPersisted(FDB), MonadStream, Stream, indexBy, pipe', run, streamTopic)
 import qualified FDBStreaming.Index as Index
-import FDBStreaming.TableKey (OrdTableKey, TableKey (fromKeyBytes, toKeyBytes))
+import FDBStreaming.TableKey (TableKey)
 import FDBStreaming.Testing (testJobConfig, testOnInput)
 import FDBStreaming.Topic (Topic)
 import qualified FDBStreaming.Topic as Topic
@@ -42,16 +39,8 @@ instance Message TestMsg where
 
   fromMessage = fromRight (error "Failed to decode TestMsg") . Persist.decode
 
-indexGetCount ::
-  (Eq k, TableKey k) =>
-  Database ->
-  Index.Index k ->
-  k ->
-  IO Word64
-indexGetCount db ix k = runTransaction db $ Index.countForKey ix k >>= await
-
 indexGetAll ::
-  (Eq k, TableKey k) =>
+  (TableKey k) =>
   Index.Index k ->
   k ->
   FDB.Transaction [Topic.Coordinate]
@@ -61,7 +50,7 @@ indexGetAll ix k = do
   fmap snd <$> S.toList s
 
 indexGetAllTopic ::
-  (Eq k, TableKey k) =>
+  (TableKey k) =>
   Database ->
   Index.Index k ->
   k ->
@@ -71,7 +60,9 @@ indexGetAllTopic db ix k t = runTransaction db $ do
   coords <- indexGetAll ix k
   catMaybes <$> for coords (Topic.get t >=> await)
 
-ixJob :: forall m. MonadStream m => Stream TestMsg -> m (Index ByteString, (Index ByteString, Stream TestMsg))
+ixJob :: forall m. MonadStream m
+      => Stream 'FDB TestMsg
+      -> m (Index ByteString, (Index ByteString, Stream 'FDB TestMsg))
 ixJob input =
   do
     run "out"
@@ -88,7 +79,7 @@ indexTest testSS db = testCase "index job" $ do
           TestMsg "hihi" "2" "2"
         ]
   (ix1, (ix2, outStream)) <- testOnInput (testJobConfig db ss) testInputs ixJob
-  let Just outTopic = streamTopic outStream
+  let outTopic = streamTopic outStream
   msgs11 <- fmap fromMessage <$> indexGetAllTopic db ix1 "1" outTopic
   fmap payload msgs11
     @?= [ "hi1" :: ByteString,

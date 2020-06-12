@@ -75,7 +75,7 @@ ternaryProperty :: (Show a, Arbitrary a,
                 -> Property
 ternaryProperty x = property $ property $ property x
 
-propOrdTableKey :: (Ord k, OrdTableKey k) => k -> k -> Property
+propOrdTableKey :: (OrdTableKey k) => k -> k -> Property
 propOrdTableKey k l =
   compare k l === compare (toKeyBytes k) (toKeyBytes l)
 

@@ -184,7 +184,10 @@ module FDBStreaming
     listTopics,
 
     -- * Streams
-    Stream (streamTopic),
+    Stream,
+    StreamPersisted(External, FDB),
+    streamTopic,
+    maybeStreamTopic,
     isStreamWatermarked,
     getStreamWatermark,
     StreamStep,
@@ -200,6 +203,7 @@ module FDBStreaming
     -- * Indexing stream contents
     indexBy,
     Ix.Index,
+    eventualIndexBy,
 
     -- * Tables
     AT.AggrTable,
@@ -261,14 +265,19 @@ import FDBStreaming.Joins
   )
 import FDBStreaming.Message (Message (fromMessage, toMessage))
 import FDBStreaming.Stream.Internal
-  (Stream (Stream, streamMinReaderPartitions, streamTopic, streamWatermarkSS),
+  (Stream, streamMinReaderPartitions, streamTopic, streamWatermarkSS,
+  Stream'(Stream'),
    StreamName,
+   StreamPersisted(External,FDB),
    StreamReadAndCheckpoint,
    getStreamWatermark,
    isStreamWatermarked,
    streamConsumerCheckpointSS,
    streamFromTopic,
-   setStreamWatermarkByTopic)
+   setStreamWatermarkByTopic,
+   getStream',
+   putStream',
+   maybeStreamTopic)
 import FDBStreaming.StreamStep.Internal
   ( BatchProcessor(BatchProcessor),
     batchProcessorInputWatermarkSS,
@@ -283,11 +292,11 @@ import FDBStreaming.StreamStep.Internal
     streamProcessorBatchProcessors,
     streamProcessorIndexers,
     streamProcessorStreamStepConfig,
-    tableProcessorGroupedBy,
-    tableProcessorAggregation,
-    tableProcessorWatermarkBy,
+    --tableProcessorGroupedBy,
+    --tableProcessorAggregation,
+    --tableProcessorWatermarkBy,
     --tableProcessorTriggerBy,
-    tableProcessorStreamStepConfig,
+    --tableProcessorStreamStepConfig,
     stepProducesWatermark,
     watermarkBy,
     withBatchSize,
@@ -314,7 +323,6 @@ import FDBStreaming.TaskRegistry as TaskRegistry
 import FDBStreaming.Topic
   ( PartitionId,
     ReaderName,
-    Checkpoint,
     Topic (topicCustomMetadataSS),
     getCheckpoints,
     makeTopic,
@@ -425,7 +433,7 @@ still running the old version of the code?
 -}
 
 -- | Returns the subspace in which the given stream's watermarks are stored.
-watermarkSS :: JobSubspace -> Stream a -> Maybe WatermarkSS
+watermarkSS :: JobSubspace -> Stream t a -> Maybe WatermarkSS
 watermarkSS jobSS stream = case streamWatermarkSS stream of
   Nothing -> Nothing
   Just wmSS -> Just (wmSS jobSS)
@@ -434,16 +442,17 @@ watermarkSS jobSS stream = case streamWatermarkSS stream of
 -- stream is consumed downstream. Return 'Nothing' to filter the stream. Side
 -- effects here should be benign and relatively cheap -- they could be run many
 -- times for the same input.
-benignIO :: (a -> IO (Maybe b)) -> Stream a -> Stream b
-benignIO g (Stream rc np wmSS stc streamName setUp destroy) =
-  build $ \cfg rn pid ss n state -> do
-    xs <- rc cfg rn pid ss n state
-    -- NOTE: functions like this must always be run after checkpointing, or
-    -- we could filter out the last message we see and make no progress forever.
-    xs' <- flip witherM xs $ \(c, x) -> (fmap (c,)) <$> liftIO (g x)
-    return xs'
-  where
-    build x = Stream x np wmSS stc streamName setUp destroy
+benignIO :: (a -> IO (Maybe b)) -> Stream t a -> Stream t b
+benignIO g stream = case getStream' stream of
+  (Stream' rc np wmSS streamName setUp destroy) -> putStream' stream $
+    build $ \cfg rn pid ss n state -> do
+      xs <- rc cfg rn pid ss n state
+      -- NOTE: functions like this must always be run after checkpointing, or
+      -- we could filter out the last message we see and make no progress forever.
+      xs' <- flip witherM xs $ \(c, x) -> (fmap (c,)) <$> liftIO (g x)
+      return xs'
+    where
+      build x = Stream' x np wmSS streamName setUp destroy
 
 -- The reason we are using a tagless final interface like this in addition to
 -- the record types, when it seems like we might only need one, is because we
@@ -499,7 +508,7 @@ watermarkNext t = do
 -- topics and the names of the batch processors reading from them, so that we
 -- can watermark.
 defaultWatermarkUpstreamTopics :: StepName
-                               -> StreamStep outMsg (Stream outMsg)
+                               -> StreamStep outMsg (Stream t outMsg)
                                -> Maybe [(Topic, StepName)]
 defaultWatermarkUpstreamTopics
   sn StreamProcessor {streamProcessorBatchProcessors} =
@@ -542,17 +551,20 @@ instance MonadStream DefaultWatermarker where
         watermarkNext (defaultWatermark xs wmSS)
       _ -> return ()
     return output
-  run sn step@TableProcessor {tableProcessorGroupedBy} = do
+
+  -- Must do this messy nested pattern match because pattern matching on
+  -- existentials elsewhere can cause really confusing spurious type errors.
+  -- https://gitlab.haskell.org/ghc/ghc/issues/15991
+  run sn step@(TableProcessor (GroupedBy inStream _) _ _ _ _) = do
     cfg <- getJobConfig
     let table =
           getAggrTable
             cfg
             sn
             (getStepNumPartitions cfg (getStepConfig step))
-    let inStream = groupedByInStream tableProcessorGroupedBy
     case ( isStepDefaultWatermarked step,
            AT.aggrTableWatermarkSS table,
-           streamTopic inStream,
+           maybeStreamTopic inStream,
            streamWatermarkSS inStream
          ) of
       (True, wmSS, Just inTopic, Just _inWMSS) ->
@@ -621,7 +633,7 @@ defaultWatermark topicsAndReaders wmSS = do
 -- 'isWatermarked' to @True@ on the result if you know that the existing Stream
 -- has a watermark; this function doesn't have enough information to
 -- determine that itself.
-existing :: (Message a, MonadStream m) => Topic -> m (Stream a)
+existing :: (Message a, MonadStream m) => Topic -> m (Stream 'FDB a)
 existing tc =
   return
     $ fmap fromMessage
@@ -631,7 +643,7 @@ existing tc =
 -- | Read messages from an existing stream which is known to be watermarked.
 -- If the existing stream is not watermarked, watermarks will not be propagated
 -- downstream from this stream.
-existingWatermarked :: (Message a, MonadStream m) => Topic -> m (Stream a)
+existingWatermarked :: (Message a, MonadStream m) => Topic -> m (Stream 'FDB a)
 existingWatermarked tc =
   fmap setStreamWatermarkByTopic (existing tc)
 
@@ -645,7 +657,7 @@ existingWatermarked tc =
 
 -- | Produce a side effect at least once for each message in the stream.
 -- TODO: is this going to leave traces of an empty topic in FDB?
-atLeastOnce :: (MonadStream m) => StepName -> Stream a -> (a -> IO ()) -> m ()
+atLeastOnce :: (MonadStream m) => StepName -> Stream t a -> (a -> IO ()) -> m ()
 atLeastOnce sn input f = void $ do
   run sn $
     StreamProcessor
@@ -668,9 +680,10 @@ atLeastOnce sn input f = void $ do
 pipe ::
   (Message b, MonadStream m) =>
   StepName ->
-  Stream a ->
+  -- TODO: don't really understand why I need to add this forall here.
+  Stream t a ->
   (a -> IO (Maybe b)) ->
-  m (Stream b)
+  m (Stream 'FDB b)
 pipe sn input f =
   run sn $
     pipe' input f
@@ -679,9 +692,9 @@ pipe sn input f =
 -- customized before calling 'run' on it.
 pipe' ::
   Message b =>
-  Stream a ->
+  Stream t a ->
   (a -> IO (Maybe b)) ->
-  StreamStep b (Stream b)
+  StreamStep b (Stream 'FDB b)
 pipe' input f =
   StreamProcessor
     { streamProcessorWatermarkBy =
@@ -693,6 +706,35 @@ pipe' input f =
       streamProcessorIndexers = [],
       streamProcessorStreamStepConfig = defaultStreamStepConfig
     }
+
+-- | Index the contents of the topic underlying the given input Stream. Has no
+-- effect if the stream is not persisted to FoundationDB. This is an eventually
+-- consistent indexing operation; it runs as a separate stage of the pipeline,
+-- and is thus more suitable for more resource-intensive indexing operations.
+eventualIndexBy ::
+  (AT.TableKey k, MonadStream m) =>
+  StepName ->
+  (a -> [k]) ->
+  Stream 'FDB a ->
+  m (Ix.Index k)
+eventualIndexBy sn f stream = do
+  let topic = streamTopic stream
+  let ix = Ix.namedIndex topic sn
+  -- TODO: we seem to need a StreamSink type for side effects that don't
+  -- write downstream.
+  let ixer _ batch = do
+        for_ batch $ \case
+          (Just coord, x) -> for_ (f x) \k -> do
+            Ix.indexCommitted ix k coord
+          (Nothing, _) -> return ()
+        return mempty
+  (_s :: Stream 'FDB ()) <- run sn $ StreamProcessor {streamProcessorWatermarkBy = NoWatermark,
+                                                      streamProcessorBatchProcessors =
+                                                        [BatchProcessor stream ixer],
+                                                      streamProcessorIndexers = [],
+                                                      streamProcessorStreamStepConfig = defaultStreamStepConfig}
+  return ix
+
 
 -- | Streaming one-to-one join. If the relationship is not actually one-to-one
 --   (i.e. the input join functions are not injective), some messages in the
@@ -707,12 +749,12 @@ pipe' input f =
 oneToOneJoin ::
   (Message a, Message b, Message c, Message d, MonadStream m) =>
   StepName ->
-  Stream a ->
-  Stream b ->
+  Stream t1 a ->
+  Stream t2 b ->
   (a -> c) ->
   (b -> c) ->
   (a -> b -> d) ->
-  m (Stream d)
+  m (Stream 'FDB d)
 oneToOneJoin sn in1 in2 p1 p2 j =
   run sn $
     oneToOneJoin' in1 in2 p1 p2 j
@@ -721,12 +763,12 @@ oneToOneJoin sn in1 in2 p1 p2 j =
 -- customized before being passed to 'run'.
 oneToOneJoin' ::
   (Message a, Message b, Message c, Message d) =>
-  Stream a ->
-  Stream b ->
+  Stream t1 a ->
+  Stream t2 b ->
   (a -> c) ->
   (b -> c) ->
   (a -> b -> d) ->
-  StreamStep d (Stream d)
+  StreamStep d (Stream 'FDB d)
 oneToOneJoin' inl inr pl pr j =
   let lstep = \topic -> oneToOneJoinStep topic 0 pl j
       rstep = \topic -> oneToOneJoinStep topic 1 pr (flip j)
@@ -746,7 +788,7 @@ oneToOneJoin' inl inr pl pr j =
 -- these buckets can be monoidally reduced by 'aggregate' and 'aggregate''.
 groupBy ::
   (v -> [k]) ->
-  Stream v ->
+  Stream t v ->
   (GroupedBy k v)
 groupBy k t = GroupedBy t k
 
@@ -787,10 +829,10 @@ makeStream ::
   StepName ->
   StreamName ->
   StreamStep b r ->
-  m (Stream b)
+  m (Stream 'FDB b)
 makeStream stepName streamName step = do
   jc <- getJobConfig
-  let streamTopic =
+  let topic =
         makeTopic
           (jobConfigSS jc)
           stepName
@@ -802,9 +844,9 @@ makeStream stepName streamName step = do
           then setStreamWatermarkByTopic
           else id
       )
-    $ streamFromTopic streamTopic streamName
+    $ streamFromTopic topic streamName
 
-forEachPartition :: Monad m => Stream a -> (PartitionId -> m ()) -> m ()
+forEachPartition :: Monad m => Stream t a -> (PartitionId -> m ()) -> m ()
 forEachPartition s = for_ [0 .. fromIntegral $ streamMinReaderPartitions s - 1]
 
 -- | An implementation of the streaming system that uses distributed leases to
@@ -895,11 +937,11 @@ runIndexers ixers outTopic f = do
 outputStreamAndTopic ::
   (HasJobConfig m, Message c, Monad m) =>
   StepName ->
-  StreamStep b (Stream c) ->
-  m (Stream c, Topic)
+  StreamStep b (Stream 'FDB c) ->
+  m (Stream 'FDB c, Topic)
 outputStreamAndTopic stepName step = do
   jc <- getJobConfig
-  let streamTopic =
+  let topic =
         makeTopic
           (jobConfigSS jc)
           stepName
@@ -910,8 +952,8 @@ outputStreamAndTopic stepName step = do
             then setStreamWatermarkByTopic
             else id
         )
-          $ streamFromTopic streamTopic stepName
-  return (fmap fromMessage stream, streamTopic)
+          $ streamFromTopic topic stepName
+  return (fmap fromMessage stream, topic)
 
 -- TODO: find a way to improve the type on this so that we don't need to
 -- return Maybe.
@@ -962,8 +1004,8 @@ instance MonadStream LeaseBasedStreamWorker where
               -- GHC limitation. In 8.6, let gives a very confusing error message about
               -- variables escaping their scopes. In 8.8, it gives a more helpful
               -- "my brain just exploded" message that says to use a case statement.
-              case inStream of
-                Stream streamReadAndCheckpoint _ _ _ _ setUpState destroyState ->
+              case getStream' inStream of
+                Stream' streamReadAndCheckpoint _ _ _ setUpState destroyState ->
                   bracket
                     (runStreamTxn jobConfigDB $ setUpState cfg sn_i pid checkpointSS)
                     destroyState
@@ -994,19 +1036,19 @@ instance MonadStream LeaseBasedStreamWorker where
       return outStream
   run
     sn
-    step@TableProcessor
-      { tableProcessorGroupedBy,
-        tableProcessorAggregation,
-        tableProcessorWatermarkBy,
-        tableProcessorStreamStepConfig
-      } = do
+    step@(TableProcessor
+           tableProcessorGroupedBy@(GroupedBy inStream _)
+           tableProcessorAggregation
+           tableProcessorWatermarkBy
+           _
+           tableProcessorStreamStepConfig)
+       = do
       cfg@JobConfig {jobConfigDB} <- getJobConfig
       let table =
             getAggrTable
               cfg
               sn
               (getStepNumPartitions cfg (getStepConfig step))
-      let (GroupedBy inStream _) = tableProcessorGroupedBy
       metrics <- registerStepMetrics sn
       let checkpointSS =
             streamConsumerCheckpointSS
@@ -1014,8 +1056,8 @@ instance MonadStream LeaseBasedStreamWorker where
               inStream
               sn
       let job pid _stillValid _release =
-            case inStream of
-              Stream streamReadAndCheckpoint _ _ _ _ setUpState destroyState ->
+            case getStream' inStream of
+              Stream' streamReadAndCheckpoint _ _ _ setUpState destroyState ->
                 bracket
                   (runStreamTxn jobConfigDB $ setUpState cfg sn pid checkpointSS)
                   destroyState
@@ -1180,12 +1222,12 @@ pipeStep ::
   (Message b) =>
   JobConfig ->
   StreamStepConfig ->
-  Stream a ->
+  Stream t a ->
   (StreamReadAndCheckpoint a state) ->
   state ->
   Topic ->
   StepName ->
-  (Seq (Maybe Checkpoint, a) -> Transaction (Seq b)) ->
+  (Seq (Maybe Topic.Coordinate, a) -> Transaction (Seq b)) ->
   Maybe StreamEdgeMetrics ->
   PartitionId ->
   Transaction (Int, Seq (Topic.CoordinateUncommitted, b))
@@ -1227,7 +1269,7 @@ oneToOneJoinStep ::
   Int ->
   (a1 -> c) ->
   (a1 -> a2 -> b) ->
-  Seq (Maybe Checkpoint, a1) ->
+  Seq (Maybe Topic.Coordinate, a1) ->
   Transaction (Seq b)
 oneToOneJoinStep joinSS streamJoinIx pl combiner ckptmsgs = do
   -- Read from one of the two join streams, and for each

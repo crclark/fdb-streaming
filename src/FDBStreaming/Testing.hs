@@ -1,3 +1,4 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE OverloadedStrings #-}
 
@@ -11,7 +12,7 @@ import Data.Traversable (for)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async, cancel)
 import Control.Monad (void)
-import FDBStreaming (MonadStream, Stream, runJob, streamFromTopic, runPure, listTopics)
+import FDBStreaming (MonadStream, Stream, StreamPersisted(FDB), runJob, streamFromTopic, runPure, listTopics)
 import FDBStreaming.Topic (Topic(topicName), makeTopic, writeTopicIO, TopicName, getTopicCount)
 import FDBStreaming.Message (Message (fromMessage, toMessage))
 import qualified FDBStreaming.JobConfig as JC
@@ -48,7 +49,7 @@ waitCountUnchanged db cfg topology = do
 testOnInput :: (Message a)
             => JC.JobConfig
             -> [a]
-            -> (forall m . MonadStream m => Stream a -> m b)
+            -> (forall m. MonadStream m => Stream 'FDB a -> m b)
             -> IO b
 testOnInput cfg xs topology = do
   -- TODO: what if user has already named a stream "test_input_stream"?

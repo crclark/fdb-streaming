@@ -1,6 +1,8 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
 
+{-# OPTIONS_GHC -fno-warn-missing-export-lists #-}
+
 import FoundationDB
 import FoundationDB.Layer.Subspace
 import FoundationDB.Layer.Tuple

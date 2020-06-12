@@ -1,4 +1,6 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -6,7 +8,9 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module FDBStreaming.Stream.Internal
-  ( Stream (..),
+  ( Stream' (..),
+    Stream (..),
+    StreamPersisted (..),
     StreamName,
     StreamReadAndCheckpoint,
     isStreamWatermarked,
@@ -14,7 +18,11 @@ module FDBStreaming.Stream.Internal
     getStreamWatermark,
     customStream,
     setStreamWatermarkByTopic,
-    streamFromTopic
+    streamFromTopic,
+    streamTopic, maybeStreamTopic, streamName, streamWatermarkSS,
+    streamMinReaderPartitions,
+    getStream',
+    putStream'
   )
 where
 
@@ -60,7 +68,7 @@ type StreamReadAndCheckpoint a state =
   FDB.Subspace ->
   Word16 ->
   state ->
-  Transaction (Seq (Maybe Topic.Checkpoint, a))
+  Transaction (Seq (Maybe Topic.Coordinate, a))
 
 -- TODO: say we have a topology like
 --
@@ -87,10 +95,11 @@ type StreamReadAndCheckpoint a state =
 -- checkpoint. A workaround would be to do one-time setup in setupState. That
 -- might be enough for all use cases. We shall see.
 
--- | Represents an unbounded stream of messages of type @a@.
-data Stream a
+-- | Contains all the fields that both internal and external streams have in
+-- common. This is an internal detail of the stream implementation.
+data Stream' a
   = forall state.
-    Stream
+    Stream'
       { -- | Given the name of the step consuming the stream, the
         -- partition id of the worker consuming the stream, a subspace
         -- for storing checkpoints, and a desired batch size n,
@@ -99,34 +108,67 @@ data Stream a
         -- again. User-defined stream readers should return 'Nothing' for
         -- the Topic 'Checkpoint'; this value is used to persist watermarks for
         -- streams that are stored inside FoundationDB as 'Topic's.
-        streamReadAndCheckpoint :: StreamReadAndCheckpoint a state,
+        streamReadAndCheckpoint' :: StreamReadAndCheckpoint a state,
         -- | The minimum number of threads that must concurrently read from
         -- the stream in order to maintain real-time throughput.
-        streamMinReaderPartitions :: Integer,
+        streamMinReaderPartitions' :: Integer,
         -- | Computes the subspace storing watermark data for this stream.
         -- If not 'Nothing', guarantees that this stream is watermarked in the
         -- given subspace.
-        streamWatermarkSS :: Maybe (JobSubspace -> WatermarkSS),
+        streamWatermarkSS' :: Maybe (JobSubspace -> WatermarkSS),
         -- | If this stream is the output of a stream step which is persisted to
         -- FoundationDB, then this contains the underlying Topic in which the
         -- stream is persisted. Streams that represent external data sources
         -- (such as Kafka topics) will have this set to 'Nothing'.
-        streamTopic :: Maybe Topic,
-        -- | The unique name of this stream. This is used to persist checkpointing
-        -- data in FoundationDB, so conflicts in these names are very, very bad.
-        streamName :: StreamName,
+        streamName' :: StreamName,
         -- | Set up per-worker state needed by this stream reader. For example, this
         -- could be a connection to a database. A stream reader worker's lifecycle
-        -- will call this once, then streamReadAndCheckpoint many times, then
-        -- 'destroyState' once. This lifecycle will be repeated many times.
+        -- will call this once, then streamReadAndCheckpoint' many times, then
+        -- 'destroyState'' once. This lifecycle will be repeated many times.
         -- Parameters passed to this function
         -- are the same as those passed to the batch read function.
-        setUpState :: JobConfig -> ReaderName -> PartitionId -> FDB.Subspace -> Transaction state,
-        -- | Called once to destroy a worker's state as set up by 'setUpState'. Not
+        setUpState' :: JobConfig -> ReaderName -> PartitionId -> FDB.Subspace -> Transaction state,
+        -- | Called once to destroy a worker's state as set up by 'setUpState''. Not
         -- a transaction because we can't guarantee that we can run transactions if
         -- the worker dies abnormally.
-        destroyState :: state -> IO ()
+        destroyState' :: state -> IO ()
       }
+
+-- | Denotes where the data in a stream is persisted. 'External' indicates that
+-- the data is not stored in FoundationDB. In this case, it's either being
+-- pushed or pulled from an external
+-- source. 'FDB' indicates that it is stored in FoundationDB. Streams stored in
+-- FoundationDB support additional operations, such as indexing, but may have
+-- lower throughput.
+data StreamPersisted = External | FDB
+
+data Stream (t :: StreamPersisted) a where
+  ExternalStream :: Stream' a -> Stream 'External a
+  InternalStream :: Topic -> Stream' a -> Stream 'FDB a
+
+streamTopic :: Stream 'FDB a -> Topic
+streamTopic (InternalStream t _) = t
+
+maybeStreamTopic :: Stream t a -> Maybe Topic
+maybeStreamTopic (ExternalStream _) = Nothing
+maybeStreamTopic (InternalStream t _) = Just t
+
+streamName :: Stream t a -> StreamName
+streamName = streamName' . getStream'
+
+streamWatermarkSS :: Stream t a -> Maybe (JobSubspace -> WatermarkSS)
+streamWatermarkSS = streamWatermarkSS' . getStream'
+
+streamMinReaderPartitions :: Stream t a -> Integer
+streamMinReaderPartitions = streamMinReaderPartitions' . getStream'
+
+getStream' :: Stream t a -> Stream' a
+getStream' (ExternalStream stream) = stream
+getStream' (InternalStream _ stream) = stream
+
+putStream' :: Stream t a -> Stream' b -> Stream t b
+putStream' (ExternalStream _) stream = ExternalStream stream
+putStream' (InternalStream t _) stream = InternalStream t stream
 
 defaultWmSS :: StreamName -> JobSubspace -> WatermarkSS
 defaultWmSS sn ss = FDB.extend ss [C.topics, FDB.Bytes sn, C.customMeta, FDB.Bytes "wm"]
@@ -163,77 +205,80 @@ customStream ::
   (JobConfig -> ReaderName -> PartitionId -> FDB.Subspace -> Transaction state) ->
   -- | Called to destroy the worker state.
   (state -> IO ()) ->
-  Stream a
-customStream readBatch minThreads wmFn streamName setUp destroy =
-  let stream = Stream
-        { streamReadAndCheckpoint = \cfg rn pid ss n state -> do
+  Stream 'External a
+customStream readBatch minThreads wmFn streamName' setUp destroy =
+  let stream = Stream'
+        { streamReadAndCheckpoint' = \cfg rn pid ss n state -> do
             msgs <- readBatch cfg rn pid ss n state
             for_
               ( fmap
                   ($ jobConfigSS cfg)
-                  (streamWatermarkSS stream)
+                  (streamWatermarkSS' stream)
               )
               $ \wmSS ->
                 for_
                   (maximumMay (mapMaybe (fromJust wmFn) msgs))
                   $ \wm -> setWatermark wmSS wm
             return (fmap (Nothing,) msgs),
-          streamMinReaderPartitions = minThreads,
-          streamWatermarkSS = case wmFn of
+          streamMinReaderPartitions' = minThreads,
+          streamWatermarkSS' = case wmFn of
             Nothing -> Nothing
-            Just _ -> Just $ defaultWmSS streamName,
-          streamTopic = Nothing,
-          streamName = streamName,
-          setUpState = setUp,
-          destroyState = destroy
+            Just _ -> Just $ defaultWmSS streamName',
+          streamName' = streamName',
+          setUpState' = setUp,
+          destroyState' = destroy
         }
-   in stream
+      in ExternalStream stream
 
 streamConsumerCheckpointSS ::
   JobSubspace ->
-  Stream a ->
+  Stream t a ->
   ReaderName ->
   FDB.Subspace
-streamConsumerCheckpointSS jobSS stream rn = case streamTopic stream of
-  Nothing ->
+streamConsumerCheckpointSS jobSS stream rn = case stream of
+  ExternalStream stream' ->
     FDB.extend
       jobSS
       [ C.topics,
-        FDB.Bytes (streamName stream),
+        FDB.Bytes (streamName' stream'),
         C.readers,
         FDB.Bytes rn
       ]
-  Just topic -> Topic.readerSS topic rn
+  InternalStream topic _ -> Topic.readerSS topic rn
 
-isStreamWatermarked :: Stream a -> Bool
-isStreamWatermarked = isJust . streamWatermarkSS
+isStreamWatermarked :: Stream t a -> Bool
+isStreamWatermarked = isJust . streamWatermarkSS' . getStream'
 
 -- | The functor instance for streams is lazy -- it will be computed by each
 -- step that consumes a stream. If the function is very expensive, it may be
 -- more efficient to use 'FDBStreaming.pipe' to write the result of the function
 -- to FoundationDB once, then have all downstream steps read from that.
-instance Functor Stream where
-  fmap g Stream {..} =
-    Stream
-      { streamReadAndCheckpoint = \cfg rn pid ss n state ->
-          fmap (fmap g) <$> streamReadAndCheckpoint cfg rn pid ss n state,
+instance Functor Stream' where
+  fmap g Stream'{..} =
+    Stream'
+      { streamReadAndCheckpoint' = \cfg rn pid ss n state ->
+          fmap (fmap g) <$> streamReadAndCheckpoint' cfg rn pid ss n state,
         ..
       }
 
+instance Functor (Stream t) where
+  fmap f (ExternalStream s) = ExternalStream (fmap f s)
+  fmap f (InternalStream t s) = InternalStream t (fmap f s)
+
 -- | Same caveat applies as for the Functor instance. All downstream steps will
 -- read all messages and run the filter logic.
-instance Filterable Stream where
-  mapMaybe g Stream {..} =
-    Stream
-      { streamReadAndCheckpoint = \cfg rdNm pid ss batchSize state ->
+instance Filterable Stream' where
+  mapMaybe g Stream' {..} =
+    Stream'
+      { streamReadAndCheckpoint' = \cfg rdNm pid ss batchSize state ->
           mapMaybe (mapM g)
-            <$> streamReadAndCheckpoint cfg rdNm pid ss batchSize state,
+            <$> streamReadAndCheckpoint' cfg rdNm pid ss batchSize state,
         ..
       }
 
 -- | Returns the current watermark for the given stream, if it can be determined.
-getStreamWatermark :: JobSubspace -> Stream a -> Transaction (Maybe Watermark)
-getStreamWatermark jobSS stream = case streamWatermarkSS stream of
+getStreamWatermark :: JobSubspace -> Stream t a -> Transaction (Maybe Watermark)
+getStreamWatermark jobSS stream = case streamWatermarkSS' (getStream' stream) of
   Nothing -> return Nothing
   Just wmSS -> getCurrentWatermark (wmSS jobSS) >>= await
 
@@ -241,12 +286,9 @@ getStreamWatermark jobSS stream = case streamWatermarkSS stream of
 -- streamTopic. The
 -- step writing to the topic must actually have a watermarking function (or
 -- default watermark) set. Don't export this; too confusing for users.
-setStreamWatermarkByTopic :: Stream a -> Stream a
-setStreamWatermarkByTopic stream =
-  case streamTopic stream of
-    Just tc ->
-      stream {streamWatermarkSS = Just $ \_ -> topicWatermarkSS tc}
-    Nothing -> error "setStreamWatermarkByTopic: stream is not a topic"
+setStreamWatermarkByTopic :: Stream 'FDB a -> Stream 'FDB a
+setStreamWatermarkByTopic (InternalStream tc stream) =
+  InternalStream tc $ stream {streamWatermarkSS' = Just $ \_ -> topicWatermarkSS tc}
 
 -- | Create a stream from a topic. Assumes the topic is not watermarked. If it
 -- is and you want to propagate watermarks downstream, the caller must call
@@ -254,15 +296,14 @@ setStreamWatermarkByTopic stream =
 --
 -- You only need this function if you are trying to access a topic that was
 -- created by another pipeline, or created manually.
-streamFromTopic :: Topic -> StreamName -> Stream ByteString
-streamFromTopic tc streamName =
-  Stream
-    { streamReadAndCheckpoint = \_cfg rn pid _chkptSS n _state ->
+streamFromTopic :: Topic -> StreamName -> Stream 'FDB ByteString
+streamFromTopic tc streamName' = InternalStream tc $
+  Stream'
+    { streamReadAndCheckpoint' = \_cfg rn pid _chkptSS n _state ->
         fmap (fmap (\(c,xs) -> (Just c, xs))) $ Topic.readNAndCheckpoint tc pid rn n,
-      streamMinReaderPartitions = fromIntegral $ Topic.numPartitions tc,
-      streamWatermarkSS = Nothing,
-      streamTopic = Just tc,
-      streamName = streamName,
-      setUpState = \_ _ _ _ -> return (),
-      destroyState = const $ return ()
+      streamMinReaderPartitions' = fromIntegral $ Topic.numPartitions tc,
+      streamWatermarkSS' = Nothing,
+      streamName' = streamName',
+      setUpState' = \_ _ _ _ -> return (),
+      destroyState' = const $ return ()
     }
