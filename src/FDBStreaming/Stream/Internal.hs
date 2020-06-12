@@ -1,11 +1,11 @@
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE KindSignatures #-}
-{-# LANGUAGE GADTs #-}
 {-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TupleSections #-}
-{-# LANGUAGE OverloadedStrings #-}
 
 module FDBStreaming.Stream.Internal
   ( Stream' (..),
@@ -19,10 +19,13 @@ module FDBStreaming.Stream.Internal
     customStream,
     setStreamWatermarkByTopic,
     streamFromTopic,
-    streamTopic, maybeStreamTopic, streamName, streamWatermarkSS,
+    streamTopic,
+    maybeStreamTopic,
+    streamName,
+    streamWatermarkSS,
     streamMinReaderPartitions,
     getStream',
-    putStream'
+    putStream',
   )
 where
 
@@ -36,7 +39,7 @@ import FDBStreaming.JobConfig (JobConfig (jobConfigSS), JobSubspace)
 import FDBStreaming.Topic
   ( PartitionId,
     ReaderName,
-    Topic
+    Topic,
   )
 import qualified FDBStreaming.Topic as Topic
 import qualified FDBStreaming.Topic.Constants as C
@@ -45,7 +48,7 @@ import FDBStreaming.Watermark
     WatermarkSS,
     getCurrentWatermark,
     setWatermark,
-    topicWatermarkSS
+    topicWatermarkSS,
   )
 import FoundationDB as FDB
   ( Transaction,
@@ -228,7 +231,7 @@ customStream readBatch minThreads wmFn streamName' setUp destroy =
           setUpState' = setUp,
           destroyState' = destroy
         }
-      in ExternalStream stream
+   in ExternalStream stream
 
 streamConsumerCheckpointSS ::
   JobSubspace ->
@@ -254,7 +257,7 @@ isStreamWatermarked = isJust . streamWatermarkSS' . getStream'
 -- more efficient to use 'FDBStreaming.pipe' to write the result of the function
 -- to FoundationDB once, then have all downstream steps read from that.
 instance Functor Stream' where
-  fmap g Stream'{..} =
+  fmap g Stream' {..} =
     Stream'
       { streamReadAndCheckpoint' = \cfg rn pid ss n state ->
           fmap (fmap g) <$> streamReadAndCheckpoint' cfg rn pid ss n state,
@@ -300,7 +303,7 @@ streamFromTopic :: Topic -> StreamName -> Stream 'FDB ByteString
 streamFromTopic tc streamName' = InternalStream tc $
   Stream'
     { streamReadAndCheckpoint' = \_cfg rn pid _chkptSS n _state ->
-        fmap (fmap (\(c,xs) -> (Just c, xs))) $ Topic.readNAndCheckpoint tc pid rn n,
+        fmap (fmap (\(c, xs) -> (Just c, xs))) $ Topic.readNAndCheckpoint tc pid rn n,
       streamMinReaderPartitions' = fromIntegral $ Topic.numPartitions tc,
       streamWatermarkSS' = Nothing,
       streamName' = streamName',

@@ -1,15 +1,19 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 
-module Spec.FDBStreaming.Util (utilProps, extendRand) where
+module Spec.FDBStreaming.Util
+  ( utilProps,
+    extendRand,
+  )
+where
 
-import FDBStreaming.Util (chunksOfSize)
-import Test.Tasty (TestTree, testGroup)
-import qualified Test.Tasty.QuickCheck as QC
-import Test.QuickCheck ((===), Arbitrary, Property, property)
 import Data.UUID (toWords)
 import qualified Data.UUID.V4 as UUID
+import FDBStreaming.Util (chunksOfSize)
 import qualified FoundationDB.Layer.Subspace as FDB
 import qualified FoundationDB.Layer.Tuple as FDB
+import Test.QuickCheck ((===), Arbitrary, Property, property)
+import Test.Tasty (TestTree, testGroup)
+import qualified Test.Tasty.QuickCheck as QC
 
 -- | Randomly extends a subspace. This allows us to run tests in parallel
 -- without collisions.
@@ -25,20 +29,24 @@ binaryProperty x = property $ property x
 chunksOfSizeLengthPreserved :: Property
 chunksOfSizeLengthPreserved = binaryProperty $ \n (xs :: [()]) ->
   let chunks = chunksOfSize n (const 1) xs
-      in length xs === length (concat chunks)
+   in length xs === length (concat chunks)
 
 chunksOfSizeRespectsSize :: Property
 chunksOfSizeRespectsSize = binaryProperty $ \n (xs :: [()]) ->
   let sz = const 1
       chunks = chunksOfSize n sz xs
-      in all (\chunk -> length chunk == 1 || sum (map (fromIntegral . sz) chunk) <= n) chunks === True
+   in all (\chunk -> length chunk == 1 || sum (map (fromIntegral . sz) chunk) <= n) chunks === True
 
 chunksOfSizeProps :: TestTree
-chunksOfSizeProps = testGroup "chunksOfSize"
-  [ QC.testProperty "Preserves length" chunksOfSizeLengthPreserved
-  , QC.testProperty "chunk size respected" chunksOfSizeRespectsSize
-  ]
+chunksOfSizeProps =
+  testGroup
+    "chunksOfSize"
+    [ QC.testProperty "Preserves length" chunksOfSizeLengthPreserved,
+      QC.testProperty "chunk size respected" chunksOfSizeRespectsSize
+    ]
 
 utilProps :: TestTree
-utilProps = testGroup "Utility functions"
-  [ chunksOfSizeProps ]
+utilProps =
+  testGroup
+    "Utility functions"
+    [chunksOfSizeProps]

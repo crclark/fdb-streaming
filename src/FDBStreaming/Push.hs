@@ -1,6 +1,6 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE DataKinds #-}
 
 -- (Temporary) module for prototyping an HTTP input/output interface for
 -- stream pipelines.
@@ -156,8 +156,8 @@ import Data.Maybe (fromMaybe, isJust)
 import Data.Word (Word8)
 import qualified FDBStreaming.JobConfig as JC
 import FDBStreaming.Message (Message (fromMessage, toMessage))
-import FDBStreaming.Stream (Stream, StreamName, StreamPersisted(FDB))
-import FDBStreaming.Stream.Internal (streamFromTopic, setStreamWatermarkByTopic)
+import FDBStreaming.Stream (Stream, StreamName, StreamPersisted (FDB))
+import FDBStreaming.Stream.Internal (setStreamWatermarkByTopic, streamFromTopic)
 import FDBStreaming.Topic (makeTopic, randPartition, topicCustomMetadataSS, writeTopic)
 import FDBStreaming.Util.BatchWriter (BatchWriter, BatchWriterConfig, batchWriter, defaultBatchWriterConfig)
 import FDBStreaming.Watermark (Watermark, setWatermark, topicWatermarkSS)
@@ -172,6 +172,7 @@ data PushStreamConfig inMsg
       { -- | A watermarking function for the inputs to the stream.
         pushStreamWatermarkBy :: Maybe (inMsg -> Transaction Watermark),
         -- TODO: reuse StepConfig for options below?
+
         -- | Number of partitions in the Topic that the elements of the stream
         -- will be persisted to. If Nothing, the default in the 'JobConfig' will
         -- be used.
@@ -203,10 +204,12 @@ runPushStream jc sn ps bwc bn = do
           (JC.defaultNumPartitions jc)
           (pushStreamOutputPartitions ps)
   let topic = makeTopic (JC.jobConfigSS jc) sn numPartitions (JC.defaultChunkSizeBytes jc)
-  let stream = (if isJust (pushStreamWatermarkBy ps)
-                   then setStreamWatermarkByTopic
-                   else id)
-                 $ streamFromTopic topic sn
+  let stream =
+        ( if isJust (pushStreamWatermarkBy ps)
+            then setStreamWatermarkByTopic
+            else id
+        )
+          $ streamFromTopic topic sn
   let writeBatch xs = do
         for_ (pushStreamWatermarkBy ps) $ \wf -> case xs of
           (x : _) -> do
@@ -227,5 +230,4 @@ runPushStream' ::
   IO (Stream 'FDB inMsg, BatchWriter inMsg)
 runPushStream' jc sn =
   fmap head <$> runPushStream jc sn defaultPushStreamConfig defaultBatchWriterConfig 1
-
 -- TODO: pushAggrTable interface.

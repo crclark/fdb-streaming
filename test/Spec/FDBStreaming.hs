@@ -1,12 +1,15 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE DataKinds #-}
 
-module Spec.FDBStreaming (jobTests) where
+module Spec.FDBStreaming
+  ( jobTests,
+  )
+where
 
 import Control.Monad ((>=>))
 import Data.ByteString (ByteString)
@@ -15,7 +18,7 @@ import Data.Maybe (catMaybes)
 import Data.Persist (Persist)
 import qualified Data.Persist as Persist
 import Data.Traversable (for)
-import FDBStreaming (Index, Message (fromMessage, toMessage), StreamPersisted(FDB), MonadStream, Stream, indexBy, pipe', run, streamTopic)
+import FDBStreaming (Index, Message (fromMessage, toMessage), MonadStream, Stream, StreamPersisted (FDB), indexBy, pipe', run, streamTopic)
 import qualified FDBStreaming.Index as Index
 import FDBStreaming.TableKey (TableKey)
 import FDBStreaming.Testing (testJobConfig, testOnInput)
@@ -60,9 +63,11 @@ indexGetAllTopic db ix k t = runTransaction db $ do
   coords <- indexGetAll ix k
   catMaybes <$> for coords (Topic.get t >=> await)
 
-ixJob :: forall m. MonadStream m
-      => Stream 'FDB TestMsg
-      -> m (Index ByteString, (Index ByteString, Stream 'FDB TestMsg))
+ixJob ::
+  forall m.
+  MonadStream m =>
+  Stream 'FDB TestMsg ->
+  m (Index ByteString, (Index ByteString, Stream 'FDB TestMsg))
 ixJob input =
   do
     run "out"

@@ -1,41 +1,43 @@
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
 
 -- | Utilities for testing pipelines.
-module FDBStreaming.Testing (
-  testOnInput,
-  testJobConfig
-) where
+module FDBStreaming.Testing
+  ( testOnInput,
+    testJobConfig,
+  )
+where
 
-import Data.Traversable (for)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async, cancel)
+import qualified Control.Logger.Simple as Log
 import Control.Monad (void)
-import FDBStreaming (MonadStream, Stream, StreamPersisted(FDB), runJob, streamFromTopic, runPure, listTopics)
-import FDBStreaming.Topic (Topic(topicName), makeTopic, writeTopicIO, TopicName, getTopicCount)
-import FDBStreaming.Message (Message (fromMessage, toMessage))
-import qualified FDBStreaming.JobConfig as JC
 import qualified Data.Map as Map
 import Data.Map (Map)
-
+import Data.Traversable (for)
+import FDBStreaming (MonadStream, Stream, StreamPersisted (FDB), listTopics, runJob, runPure, streamFromTopic)
+import qualified FDBStreaming.JobConfig as JC
+import FDBStreaming.Message (Message (fromMessage, toMessage))
+import FDBStreaming.Topic (Topic (topicName), TopicName, getTopicCount, makeTopic, writeTopicIO)
 import qualified FoundationDB as FDB
-import qualified Control.Logger.Simple as Log
 
-topicCounts :: FDB.Database
-            -> JC.JobConfig
-            -> (forall m . MonadStream m => m b)
-            -> IO (Map TopicName Int)
+topicCounts ::
+  FDB.Database ->
+  JC.JobConfig ->
+  (forall m. MonadStream m => m b) ->
+  IO (Map TopicName Int)
 topicCounts db cfg topology = do
   let tcs = listTopics cfg topology
   FDB.runTransaction db $ fmap Map.fromList $ for tcs $ \tc -> do
     c <- getTopicCount tc
     return (topicName tc, fromIntegral c)
 
-waitCountUnchanged :: FDB.Database
-                   -> JC.JobConfig
-                   -> (forall m . MonadStream m => m b)
-                   -> IO ()
+waitCountUnchanged ::
+  FDB.Database ->
+  JC.JobConfig ->
+  (forall m. MonadStream m => m b) ->
+  IO ()
 waitCountUnchanged db cfg topology = do
   tc1 <- topicCounts db cfg topology
   threadDelay 1000000
@@ -46,11 +48,12 @@ waitCountUnchanged db cfg topology = do
 -- the same type as input, run the pipeline on that input. Blocks until activity
 -- in the pipeline appears to have stopped. Expect this to take a few seconds to
 -- run.
-testOnInput :: (Message a)
-            => JC.JobConfig
-            -> [a]
-            -> (forall m. MonadStream m => Stream 'FDB a -> m b)
-            -> IO b
+testOnInput ::
+  (Message a) =>
+  JC.JobConfig ->
+  [a] ->
+  (forall m. MonadStream m => Stream 'FDB a -> m b) ->
+  IO b
 testOnInput cfg xs topology = do
   -- TODO: what if user has already named a stream "test_input_stream"?
   let inTopic = makeTopic (JC.jobConfigSS cfg) "test_input_stream" 2 0
@@ -66,14 +69,14 @@ testOnInput cfg xs topology = do
 -- amounts of data.
 testJobConfig :: FDB.Database -> JC.JobSubspace -> JC.JobConfig
 testJobConfig db ss = JC.JobConfig
-  { JC.jobConfigDB = db
-  , JC.jobConfigSS = ss
-  , JC.streamMetricsStore = Nothing
-  , JC.msgsPerBatch = 100
-  , JC.leaseDuration = 5
-  , JC.numStreamThreads = 8
-  , JC.numPeriodicJobThreads = 1
-  , JC.defaultNumPartitions = 2
-  , JC.defaultChunkSizeBytes = 0
-  , JC.logLevel = Log.LogError
+  { JC.jobConfigDB = db,
+    JC.jobConfigSS = ss,
+    JC.streamMetricsStore = Nothing,
+    JC.msgsPerBatch = 100,
+    JC.leaseDuration = 5,
+    JC.numStreamThreads = 8,
+    JC.numPeriodicJobThreads = 1,
+    JC.defaultNumPartitions = 2,
+    JC.defaultChunkSizeBytes = 0,
+    JC.logLevel = Log.LogError
   }

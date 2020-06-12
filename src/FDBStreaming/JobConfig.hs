@@ -1,14 +1,15 @@
 -- | Contains the 'JobConfig' type.
-module FDBStreaming.JobConfig (
-  JobConfig(..),
-  JobSubspace
-) where
+module FDBStreaming.JobConfig
+  ( JobConfig (..),
+    JobSubspace,
+  )
+where
 
-import Data.Word (Word8, Word16)
+import qualified Control.Logger.Simple as Log
+import Data.Word (Word16, Word8)
 import qualified FoundationDB as FDB
 import qualified FoundationDB.Layer.Subspace as FDB
 import qualified System.Metrics as Metrics
-import qualified Control.Logger.Simple as Log
 
 -- | The top-level subspace that contains all state for a given streaming job.
 type JobSubspace = FDB.Subspace

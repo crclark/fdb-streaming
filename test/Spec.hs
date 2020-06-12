@@ -1,6 +1,5 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
-
 {-# OPTIONS_GHC -fno-warn-missing-export-lists #-}
 
 import FoundationDB
@@ -8,12 +7,12 @@ import FoundationDB.Layer.Subspace
 import FoundationDB.Layer.Tuple
 import Spec.FDBStreaming (jobTests)
 import Spec.FDBStreaming.AggrTable (tableProps)
-import Spec.FDBStreaming.TaskLease
-import Spec.FDBStreaming.Watermark (watermarks)
-import Spec.FDBStreaming.Topic (topicTests)
 import Spec.FDBStreaming.Index (indexTests)
-import Spec.FDBStreaming.Util.BatchWriter (batchWriterTests)
+import Spec.FDBStreaming.TaskLease
+import Spec.FDBStreaming.Topic (topicTests)
 import Spec.FDBStreaming.Util (utilProps)
+import Spec.FDBStreaming.Util.BatchWriter (batchWriterTests)
+import Spec.FDBStreaming.Watermark (watermarks)
 import Test.Tasty
 
 testSS :: Subspace

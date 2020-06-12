@@ -1,18 +1,19 @@
 -- | Reusable constants for short tuple keys
-module FDBStreaming.Topic.Constants (
-  topics,
-  messages,
-  metaCount,
-  readers,
-  checkpoint,
-  aggrTable,
-  oneToOneJoin,
-  customMeta,
-  indices,
-  streamStepWorkspace
-) where
+module FDBStreaming.Topic.Constants
+  ( topics,
+    messages,
+    metaCount,
+    readers,
+    checkpoint,
+    aggrTable,
+    oneToOneJoin,
+    customMeta,
+    indices,
+    streamStepWorkspace,
+  )
+where
 
-import FoundationDB.Layer.Tuple (Elem(Int))
+import FoundationDB.Layer.Tuple (Elem (Int))
 
 topics :: Elem
 topics = Int 0

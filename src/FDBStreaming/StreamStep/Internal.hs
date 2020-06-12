@@ -1,34 +1,33 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE ExistentialQuantification #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE RankNTypes #-}
-
--- Internal module; export everything!
+{-# LANGUAGE RecordWildCards #-}
 {-# OPTIONS_GHC -fno-warn-missing-export-lists #-}
 
-module FDBStreaming.StreamStep.Internal  where
+-- Internal module; export everything!
 
-import FDBStreaming.JobConfig (JobSubspace)
-import FDBStreaming.Message(Message)
-import FDBStreaming.Stream.Internal(Stream, streamWatermarkSS, maybeStreamTopic, StreamPersisted(FDB))
-import FDBStreaming.Index (Index, IndexName)
-import FDBStreaming.Topic (Topic, Coordinate)
-import qualified FDBStreaming.AggrTable as AT
-import FDBStreaming.Watermark
-  ( Watermark,
-    WatermarkBy(CustomWatermark),
-    WatermarkSS,
-    producesWatermark,
-    isDefaultWatermark
-  )
+module FDBStreaming.StreamStep.Internal where
 
 import Data.ByteString (ByteString)
 import Data.Sequence (Seq)
-import Data.Word (Word8, Word16)
+import Data.Word (Word16, Word8)
+import qualified FDBStreaming.AggrTable as AT
+import FDBStreaming.Index (Index, IndexName)
+import FDBStreaming.JobConfig (JobSubspace)
+import FDBStreaming.Message (Message)
+import FDBStreaming.Stream.Internal (Stream, StreamPersisted (FDB), maybeStreamTopic, streamWatermarkSS)
+import FDBStreaming.Topic (Coordinate, Topic)
+import FDBStreaming.Watermark
+  ( Watermark,
+    WatermarkBy (CustomWatermark),
+    WatermarkSS,
+    isDefaultWatermark,
+    producesWatermark,
+  )
 import FoundationDB (Transaction)
 import FoundationDB.Layer.Subspace (Subspace)
 
@@ -37,12 +36,13 @@ import FoundationDB.Layer.Subspace (Subspace)
 type StepName = ByteString
 
 data GroupedBy k v
-  -- TODO: we could improve type safety by parametrizing by t, but not sure if
-  -- it would cause problems. Seems like GroupedBy shouldn't care about where
-  -- the stream is.
-  -- NOTE: do not export this constructor to users; it's too easy to hit
-  -- GHC bug: https://gitlab.haskell.org/ghc/ghc/issues/15991
-  = forall t. GroupedBy
+  = -- TODO: we could improve type safety by parametrizing by t, but not sure if
+    -- it would cause problems. Seems like GroupedBy shouldn't care about where
+    -- the stream is.
+    -- NOTE: do not export this constructor to users; it's too easy to hit
+    -- GHC bug: https://gitlab.haskell.org/ghc/ghc/issues/15991
+    forall t.
+    GroupedBy
       { groupedByInStream :: Stream t v,
         groupedByFunction :: v -> [k]
       }
@@ -68,20 +68,21 @@ defaultStreamStepConfig = StreamStepConfig Nothing Nothing
 --
 -- If the input stream is a topic with n partitions, up to n instances of this
 -- processor will be running on n threads simultaneously.
-data BatchProcessor b =
-  -- NOTE: do not export this constructor to users; it's too easy to hit
-  -- GHC bug: https://gitlab.haskell.org/ghc/ghc/issues/15991
-  forall a r. BatchProcessor {
-    batchInStream :: Stream r a,
-    -- | A batch processing function takes a batch of messages as input, along
-    -- with a subspace in which it can store any state it needs to persist to
-    -- operate or communicate. This subspace is shared among all batch
-    -- processors in the same 'StreamStep', which allows heterogeneous workers
-    -- within a step to communicate. For example, this is used to store
-    -- temporary data for joins -- one BatchProcessor is responsible for the
-    -- left side of the join, the other is responsible for the right side.
-    processBatch :: Subspace -> Seq (Maybe Coordinate, a) -> Transaction (Seq b)
-  }
+data BatchProcessor b
+  = -- NOTE: do not export this constructor to users; it's too easy to hit
+    -- GHC bug: https://gitlab.haskell.org/ghc/ghc/issues/15991
+    forall a r.
+    BatchProcessor
+      { batchInStream :: Stream r a,
+        -- | A batch processing function takes a batch of messages as input, along
+        -- with a subspace in which it can store any state it needs to persist to
+        -- operate or communicate. This subspace is shared among all batch
+        -- processors in the same 'StreamStep', which allows heterogeneous workers
+        -- within a step to communicate. For example, this is used to store
+        -- temporary data for joins -- one BatchProcessor is responsible for the
+        -- left side of the join, the other is responsible for the right side.
+        processBatch :: Subspace -> Seq (Maybe Coordinate, a) -> Transaction (Seq b)
+      }
 
 -- | Returns the watermarkSS function from the underlying stream.
 batchProcessorInputWatermarkSS :: BatchProcessor b -> Maybe (JobSubspace -> WatermarkSS)
@@ -92,11 +93,13 @@ batchProcessorInputWatermarkSS (BatchProcessor i _) = streamWatermarkSS i
 batchProcessorInputTopic :: BatchProcessor b -> Maybe Topic
 batchProcessorInputTopic (BatchProcessor i _) = maybeStreamTopic i
 
-data Indexer outMsg =
-  forall k. AT.TableKey k => Indexer {
-    indexerIndexName :: IndexName,
-    indexerIndexBy :: (outMsg -> [k])
-  }
+data Indexer outMsg
+  = forall k.
+    AT.TableKey k =>
+    Indexer
+      { indexerIndexName :: IndexName,
+        indexerIndexBy :: (outMsg -> [k])
+      }
 
 -- TODO: What is a stream step, really? Just seems to be miscellaneous inputs to
 -- 'run', gathered together so we can use a builder style on them.
@@ -109,7 +112,9 @@ data StreamStep outMsg runResult where
     { indexedStreamProcessorInner :: StreamStep b c,
       indexedStreamProcessorIndexName :: IndexName,
       indexedStreamProcessorIndexBy :: (b -> [k])
-    } -> StreamStep b (Index k, c)
+    } ->
+    StreamStep b
+      (Index k, c)
   StreamProcessor ::
     Message b =>
     { streamProcessorWatermarkBy :: WatermarkBy b,
@@ -151,11 +156,12 @@ data StreamStep outMsg runResult where
 class Indexable runResult where
   -- | When writing messages downstream, also index them by the given key
   -- function. This is immediately consistent with the write.
-  indexBy :: (Message outMsg, AT.TableKey k)
-          => IndexName
-          -> (outMsg -> [k])
-          -> StreamStep outMsg runResult
-          -> StreamStep outMsg (Index k, runResult)
+  indexBy ::
+    (Message outMsg, AT.TableKey k) =>
+    IndexName ->
+    (outMsg -> [k]) ->
+    StreamStep outMsg runResult ->
+    StreamStep outMsg (Index k, runResult)
 
 instance Indexable (Stream 'FDB outMsg) where
   indexBy ixnm f stp = IndexedStreamProcessor stp ixnm f
@@ -215,18 +221,19 @@ withBatchSize n = mapStepConfig (\c -> c {stepBatchSize = Just n})
 withOutputPartitions :: Word8 -> StreamStep b r -> StreamStep b r
 withOutputPartitions np = mapStepConfig (\c -> c {stepOutputPartitions = Just np})
 
-consIndexer :: AT.TableKey k
-            => StreamStep outMsg runResult
-            -> IndexName
-            -> (outMsg -> [k])
-            -> StreamStep outMsg runResult
+consIndexer ::
+  AT.TableKey k =>
+  StreamStep outMsg runResult ->
+  IndexName ->
+  (outMsg -> [k]) ->
+  StreamStep outMsg runResult
 consIndexer (IndexedStreamProcessor inner ixnm' f') ixnm f =
   IndexedStreamProcessor (consIndexer inner ixnm f) ixnm' f'
 consIndexer (StreamProcessor wm bps ixers conf) ixnm f =
   StreamProcessor wm bps (Indexer ixnm f : ixers) conf
 -- TODO: make type more precise to indicate that this won't work on
 -- table processors. Had difficulty doing so.
-consIndexer s@TableProcessor{} _ _ = s
+consIndexer s@TableProcessor {} _ _ = s
 
 {- TODO
 triggerBy :: ((Versionstamp 'Complete, v, [k]) -> Transaction [(k,aggr)])
