@@ -13,9 +13,9 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
-{-# LANGUAGE TypeApplications #-}
 
 -- | FDBStreaming is a poorly-named, work-in-progress, proof-of-concept library
 -- for large-scale processing of unbounded data sets and sources. It is inspired
@@ -181,9 +181,13 @@ module FDBStreaming
     JobConfig (..),
     runJob,
     runPure,
+    listTopics,
 
     -- * Streams
-    Stream (streamTopic),
+    Stream,
+    StreamPersisted (External, FDB),
+    streamTopic,
+    maybeStreamTopic,
     isStreamWatermarked,
     getStreamWatermark,
     StreamStep,
@@ -192,10 +196,14 @@ module FDBStreaming
     -- * Creating streams
     existing,
     existingWatermarked,
-    produce,
     atLeastOnce,
     pipe,
     oneToOneJoin,
+
+    -- * Indexing stream contents
+    indexBy,
+    Ix.Index,
+    eventualIndexBy,
 
     -- * Tables
     AT.AggrTable,
@@ -217,7 +225,7 @@ module FDBStreaming
     -- * Advanced Usage
     topicWatermarkSS,
     WatermarkBy,
-    streamFromTopic
+    streamFromTopic,
   )
 where
 
@@ -240,15 +248,16 @@ import qualified Control.Monad.State.Strict as State
 import Control.Monad.State.Strict (MonadState, StateT)
 import qualified Data.ByteString.Char8 as BS8
 import Data.Foldable (for_, toList)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromJust, fromMaybe, isJust)
 import Data.Sequence (Seq ())
 import qualified Data.Sequence as Seq
 import Data.Text.Encoding (decodeUtf8)
 import Data.Traversable (for)
 import Data.Witherable.Class (catMaybes, witherM)
-import Data.Word (Word8, Word16, Word64)
+import Data.Word (Word16, Word64, Word8)
 import qualified FDBStreaming.AggrTable as AT
-import FDBStreaming.JobConfig (JobConfig (JobConfig, defaultNumPartitions, jobConfigDB, jobConfigSS, leaseDuration, logLevel, msgsPerBatch, numPeriodicJobThreads, numStreamThreads, streamMetricsStore, defaultChunkSizeBytes), JobSubspace)
+import qualified FDBStreaming.Index as Ix
+import FDBStreaming.JobConfig (JobConfig (JobConfig, defaultChunkSizeBytes, defaultNumPartitions, jobConfigDB, jobConfigSS, leaseDuration, logLevel, msgsPerBatch, numPeriodicJobThreads, numStreamThreads, streamMetricsStore), JobSubspace)
 import FDBStreaming.Joins
   ( delete1to1JoinData,
     get1to1JoinData,
@@ -256,50 +265,62 @@ import FDBStreaming.Joins
   )
 import FDBStreaming.Message (Message (fromMessage, toMessage))
 import FDBStreaming.Stream.Internal
-  (Stream (Stream, streamMinReaderPartitions, streamTopic, streamWatermarkSS),
-   StreamName,
-   StreamReadAndCheckpoint,
-   getStreamWatermark,
-   isStreamWatermarked,
-   streamConsumerCheckpointSS,
-   streamFromTopic,
-   setStreamWatermarkByTopic)
+  ( Stream,
+    Stream' (Stream'),
+    StreamName,
+    StreamPersisted (External, FDB),
+    StreamReadAndCheckpoint,
+    getStream',
+    getStreamWatermark,
+    isStreamWatermarked,
+    maybeStreamTopic,
+    putStream',
+    setStreamWatermarkByTopic,
+    streamConsumerCheckpointSS,
+    streamFromTopic,
+    streamMinReaderPartitions,
+    streamTopic,
+    streamWatermarkSS,
+  )
 import FDBStreaming.StreamStep.Internal
-  ( StreamStep(WriteOnlyProcessor,
-               StreamProcessor,
-               Stream2Processor,
-               TableProcessor),
-    writeOnlyWatermarkBy,
-    writeOnlyProduce,
-    writeOnlyStreamStepConfig,
-    streamProcessorInStream,
-    streamProcessorWatermarkBy,
-    streamProcessorProcessBatch,
-    streamProcessorStreamStepConfig,
-    stream2ProcessorInStreamL,
-    stream2ProcessorInStreamR,
-    --stream2ProcessorWatermarkBy,
-    --stream2ProcessorRunBatchL,
-    --stream2ProcessorRunBatchR,
-    --stream2ProcessorStreamStepConfig,
-    tableProcessorGroupedBy,
-    tableProcessorAggregation,
-    tableProcessorWatermarkBy,
+  ( BatchProcessor (BatchProcessor),
+    --tableProcessorGroupedBy,
+    --tableProcessorAggregation,
+    --tableProcessorWatermarkBy,
     --tableProcessorTriggerBy,
-    tableProcessorStreamStepConfig,
+    --tableProcessorStreamStepConfig,
+
+    GroupedBy (GroupedBy),
+    Indexer (Indexer),
+    StepName,
+    StreamStep
+      ( IndexedStreamProcessor,
+        StreamProcessor,
+        TableProcessor
+      ),
+    StreamStepConfig (StreamStepConfig),
+    batchProcessorInputTopic,
+    batchProcessorInputWatermarkSS,
+    consIndexer,
+    defaultStreamStepConfig,
+    getStepConfig,
+    groupedByInStream,
+    indexBy,
+    indexedStreamProcessorIndexBy,
+    indexedStreamProcessorIndexName,
+    indexedStreamProcessorInner,
+    isStepDefaultWatermarked,
+    stepBatchSize,
+    stepOutputPartitions,
     stepProducesWatermark,
+    streamProcessorBatchProcessors,
+    streamProcessorIndexers,
+    streamProcessorStreamStepConfig,
+    streamProcessorWatermarkBy,
     watermarkBy,
     withBatchSize,
     withOutputPartitions,
-    StreamStepConfig(StreamStepConfig),
-    defaultStreamStepConfig,
-    stepOutputPartitions,
-    stepBatchSize,
-    getStepConfig,
-    StepName,
-    GroupedBy(GroupedBy),
-    groupedByInStream,
-    isStepDefaultWatermarked)
+  )
 import FDBStreaming.TaskLease (TaskName (TaskName), secondsSinceEpoch)
 import FDBStreaming.TaskRegistry as TaskRegistry
   ( TaskRegistry,
@@ -310,7 +331,6 @@ import FDBStreaming.TaskRegistry as TaskRegistry
 import FDBStreaming.Topic
   ( PartitionId,
     ReaderName,
-    Checkpoint,
     Topic (topicCustomMetadataSS),
     getCheckpoints,
     makeTopic,
@@ -321,11 +341,11 @@ import qualified FDBStreaming.Topic as Topic
 import qualified FDBStreaming.Topic.Constants as C
 import FDBStreaming.Util (logErrors)
 import FDBStreaming.Watermark
-  ( WatermarkSS,
-    WatermarkBy(DefaultWatermark, CustomWatermark, NoWatermark),
+  ( WatermarkBy (CustomWatermark, DefaultWatermark, NoWatermark),
+    WatermarkSS,
     getWatermark,
     setWatermark,
-    topicWatermarkSS
+    topicWatermarkSS,
   )
 import qualified FoundationDB as FDB
 import FoundationDB (Transaction, await, withSnapshot)
@@ -395,9 +415,9 @@ incrTimeouts m = for_ m $ Counter.inc . timeouts
 runStreamTxn :: FDB.Database -> FDB.Transaction a -> IO a
 runStreamTxn =
   FDB.runTransactionWithConfig FDB.TransactionConfig
-    -- NOTE: actually all stream transactions are idempotent, but retries are
-    -- set to zero, so it's moot.
-    { FDB.idempotent = False,
+    { -- NOTE: actually all stream transactions are idempotent, but retries are
+      -- set to zero, so it's moot.
+      FDB.idempotent = False,
       FDB.snapshotReads = False,
       -- No point in retrying since we are running in a loop
       -- anyway.
@@ -421,7 +441,7 @@ still running the old version of the code?
 -}
 
 -- | Returns the subspace in which the given stream's watermarks are stored.
-watermarkSS :: JobSubspace -> Stream a -> Maybe WatermarkSS
+watermarkSS :: JobSubspace -> Stream t a -> Maybe WatermarkSS
 watermarkSS jobSS stream = case streamWatermarkSS stream of
   Nothing -> Nothing
   Just wmSS -> Just (wmSS jobSS)
@@ -430,16 +450,18 @@ watermarkSS jobSS stream = case streamWatermarkSS stream of
 -- stream is consumed downstream. Return 'Nothing' to filter the stream. Side
 -- effects here should be benign and relatively cheap -- they could be run many
 -- times for the same input.
-benignIO :: (a -> IO (Maybe b)) -> Stream a -> Stream b
-benignIO g (Stream rc np wmSS stc streamName setUp destroy) =
-  build $ \cfg rn pid ss n state -> do
-    xs <- rc cfg rn pid ss n state
-    -- NOTE: functions like this must always be run after checkpointing, or
-    -- we could filter out the last message we see and make no progress forever.
-    xs' <- flip witherM xs $ \(c, x) -> (fmap (c,)) <$> liftIO (g x)
-    return xs'
-  where
-    build x = Stream x np wmSS stc streamName setUp destroy
+benignIO :: (a -> IO (Maybe b)) -> Stream t a -> Stream t b
+benignIO g stream = case getStream' stream of
+  (Stream' rc np wmSS streamName setUp destroy) -> putStream' stream
+    $ build
+    $ \cfg rn pid ss n state -> do
+      xs <- rc cfg rn pid ss n state
+      -- NOTE: functions like this must always be run after checkpointing, or
+      -- we could filter out the last message we see and make no progress forever.
+      xs' <- flip witherM xs $ \(c, x) -> (fmap (c,)) <$> liftIO (g x)
+      return xs'
+    where
+      build x = Stream' x np wmSS streamName setUp destroy
 
 -- The reason we are using a tagless final interface like this in addition to
 -- the record types, when it seems like we might only need one, is because we
@@ -491,9 +513,34 @@ watermarkNext t = do
   JobConfig {jobConfigDB} <- getJobConfig
   State.modify \(c, t') -> (c, t' >> runStreamTxn jobConfigDB t)
 
+-- | If it's possible to default watermark a streamstep's output, return the
+-- topics and the names of the batch processors reading from them, so that we
+-- can watermark.
+defaultWatermarkUpstreamTopics ::
+  StepName ->
+  StreamStep outMsg (Stream t outMsg) ->
+  Maybe [(Topic, StepName)]
+defaultWatermarkUpstreamTopics sn StreamProcessor {streamProcessorBatchProcessors} =
+  -- This checks two of the conditions that must be satisfied to apply a default
+  -- watermark to a stream. Specifically, conditions 3 and 4:
+  -- 3. Does the input have a watermark subspace?
+  -- 4. Is the input a stream inside FoundationDB? If not, we can't get the
+  --    checkpoint for this reader that corresponds to a point in the
+  --    watermark function.
+  let wmSSs = map batchProcessorInputWatermarkSS streamProcessorBatchProcessors
+      topics = map batchProcessorInputTopic streamProcessorBatchProcessors
+   in if all isJust wmSSs && all isJust topics
+        then
+          Just $
+            zip
+              (map fromJust topics)
+              [sn <> BS8.pack (show i) | i <- [(0 :: Int) ..]]
+        else Nothing
+
 instance MonadStream DefaultWatermarker where
-  run sn w@WriteOnlyProcessor {} = makeStream sn sn w --writer has no parents, nothing to do
-  run sn step@StreamProcessor {streamProcessorInStream} = do
+  run sn step@IndexedStreamProcessor {} =
+    runIndexedStreamProcessor sn step
+  run sn step@StreamProcessor {} = do
     JobConfig {jobConfigSS} <- getJobConfig
     output <- makeStream sn sn step
     -- TODO: There is a lot of stuff that must be checked before we can default
@@ -509,43 +556,25 @@ instance MonadStream DefaultWatermarker where
     --    watermark function.
     case ( isStepDefaultWatermarked step,
            watermarkSS jobConfigSS output,
-           streamWatermarkSS streamProcessorInStream,
-           streamTopic streamProcessorInStream
+           defaultWatermarkUpstreamTopics sn step
          ) of
-      (True, Just wmSS, Just _inWmSS, Just inTopic) ->
-        watermarkNext (defaultWatermark [(inTopic, sn)] wmSS)
+      (True, Just wmSS, Just xs) ->
+        watermarkNext (defaultWatermark xs wmSS)
       _ -> return ()
     return output
-  run sn step@Stream2Processor {stream2ProcessorInStreamL, stream2ProcessorInStreamR} = do
-    JobConfig {jobConfigSS} <- getJobConfig
-    output <- makeStream sn sn step
-    case ( isStepDefaultWatermarked step,
-           watermarkSS jobConfigSS output,
-           streamWatermarkSS stream2ProcessorInStreamL,
-           streamTopic stream2ProcessorInStreamL,
-           streamWatermarkSS stream2ProcessorInStreamR,
-           streamTopic stream2ProcessorInStreamR
-         ) of
-      (True, Just wmSS, Just _inWmSSL, Just inTopicL, Just _inWmSSR, Just inTopicR) ->
-        watermarkNext $
-          defaultWatermark
-            [ (inTopicL, sn <> "0"),
-              (inTopicR, sn <> "1")
-            ]
-            wmSS
-      _ -> return ()
-    return output
-  run sn step@TableProcessor {tableProcessorGroupedBy} = do
+  -- Must do this messy nested pattern match because pattern matching on
+  -- existentials elsewhere can cause really confusing spurious type errors.
+  -- https://gitlab.haskell.org/ghc/ghc/issues/15991
+  run sn step@(TableProcessor (GroupedBy inStream _) _ _ _ _) = do
     cfg <- getJobConfig
     let table =
           getAggrTable
             cfg
             sn
             (getStepNumPartitions cfg (getStepConfig step))
-    let inStream = groupedByInStream tableProcessorGroupedBy
     case ( isStepDefaultWatermarked step,
            AT.aggrTableWatermarkSS table,
-           streamTopic inStream,
+           maybeStreamTopic inStream,
            streamWatermarkSS inStream
          ) of
       (True, wmSS, Just inTopic, Just _inWMSS) ->
@@ -588,8 +617,11 @@ defaultWatermark topicsAndReaders wmSS = do
     chkptsF <- getCheckpoints parent rn
     return $
       flip fmap chkptsF \ckpts ->
-        (parent, minimumNote "No checkpoints found for topic. Does it have zero partitions?"
-                             ckpts)
+        ( parent,
+          minimumNote
+            "No checkpoints found for topic. Does it have zero partitions?"
+            ckpts
+        )
   minCheckpoints <- for minCheckpointsF await
   parentWMsF <- for minCheckpoints \(parent, Topic.Checkpoint vs _) ->
     getWatermark (topicWatermarkSS parent) $ transactionV $ conservativeVS vs
@@ -598,13 +630,11 @@ defaultWatermark topicsAndReaders wmSS = do
   case minParentWM of
     Nothing -> return ()
     Just newWM -> setWatermark wmSS newWM
-
   where
     conservativeVS :: Versionstamp 'Complete -> Versionstamp 'Complete
     conservativeVS vs@(CompleteVersionstamp (TransactionVersionstamp 0 _) _) = vs
     conservativeVS (CompleteVersionstamp (TransactionVersionstamp v _) _) =
-      CompleteVersionstamp (TransactionVersionstamp (v-1) maxBound) maxBound
-
+      CompleteVersionstamp (TransactionVersionstamp (v -1) maxBound) maxBound
     transactionV :: Versionstamp 'Complete -> Word64
     transactionV (CompleteVersionstamp (TransactionVersionstamp v _) _) = v
 
@@ -614,7 +644,7 @@ defaultWatermark topicsAndReaders wmSS = do
 -- 'isWatermarked' to @True@ on the result if you know that the existing Stream
 -- has a watermark; this function doesn't have enough information to
 -- determine that itself.
-existing :: (Message a, MonadStream m) => Topic -> m (Stream a)
+existing :: (Message a, MonadStream m) => Topic -> m (Stream 'FDB a)
 existing tc =
   return
     $ fmap fromMessage
@@ -624,24 +654,9 @@ existing tc =
 -- | Read messages from an existing stream which is known to be watermarked.
 -- If the existing stream is not watermarked, watermarks will not be propagated
 -- downstream from this stream.
-existingWatermarked :: (Message a, MonadStream m) => Topic -> m (Stream a)
+existingWatermarked :: (Message a, MonadStream m) => Topic -> m (Stream 'FDB a)
 existingWatermarked tc =
   fmap setStreamWatermarkByTopic (existing tc)
-
--- TODO: if this handler type took a batch at a time,
--- it would be easier to optimize -- imagine if it were to
--- to do a get from FDB for each item -- it could do them all
--- in parallel.
--- TODO: produce isn't idempotent in cases of CommitUnknownResult.
--- TODO: for a lot of applications, we won't actually want to blindly persist
--- the raw input unchanged -- imagine if we were reading from Kafka. Totally
--- redundant. This should be wrapped up into a generalized Stream type that can
--- read from non-FDB sources (or just pull in anything). Then we would just
--- need pipe.
-produce :: (Message a, MonadStream m) => StepName -> Transaction (Maybe a) -> m (Stream a)
-produce sn f =
-  run sn $
-    WriteOnlyProcessor NoWatermark f defaultStreamStepConfig
 
 -- TODO: better operation for externally-visible side effects. Perhaps we can
 -- introduce an atMostOnceSideEffect type for these sorts of things, that
@@ -653,13 +668,14 @@ produce sn f =
 
 -- | Produce a side effect at least once for each message in the stream.
 -- TODO: is this going to leave traces of an empty topic in FDB?
-atLeastOnce :: (MonadStream m) => StepName -> Stream a -> (a -> IO ()) -> m ()
+atLeastOnce :: (MonadStream m) => StepName -> Stream t a -> (a -> IO ()) -> m ()
 atLeastOnce sn input f = void $ do
   run sn $
     StreamProcessor
-      { streamProcessorInStream = input,
-        streamProcessorWatermarkBy = NoWatermark,
-        streamProcessorProcessBatch = mapM (liftIO . f . snd),
+      { streamProcessorWatermarkBy = NoWatermark,
+        streamProcessorBatchProcessors =
+          [BatchProcessor input (\_ xs -> mapM (liftIO . f . snd) xs)],
+        streamProcessorIndexers = [],
         streamProcessorStreamStepConfig = defaultStreamStepConfig
       }
 
@@ -675,9 +691,10 @@ atLeastOnce sn input f = void $ do
 pipe ::
   (Message b, MonadStream m) =>
   StepName ->
-  Stream a ->
+  -- TODO: don't really understand why I need to add this forall here.
+  Stream t a ->
   (a -> IO (Maybe b)) ->
-  m (Stream b)
+  m (Stream 'FDB b)
 pipe sn input f =
   run sn $
     pipe' input f
@@ -686,19 +703,50 @@ pipe sn input f =
 -- customized before calling 'run' on it.
 pipe' ::
   Message b =>
-  Stream a ->
+  Stream t a ->
   (a -> IO (Maybe b)) ->
-  StreamStep b (Stream b)
+  StreamStep b (Stream 'FDB b)
 pipe' input f =
   StreamProcessor
-    { streamProcessorInStream = input,
-      streamProcessorWatermarkBy =
+    { streamProcessorWatermarkBy =
         if isStreamWatermarked input
           then DefaultWatermark
           else NoWatermark,
-      streamProcessorProcessBatch = fmap catMaybes . mapM (liftIO . f . snd),
+      streamProcessorBatchProcessors =
+        [BatchProcessor input (\_ xs -> fmap catMaybes $ mapM (liftIO . f . snd) xs)],
+      streamProcessorIndexers = [],
       streamProcessorStreamStepConfig = defaultStreamStepConfig
     }
+
+-- | Index the contents of the topic underlying the given input Stream. Has no
+-- effect if the stream is not persisted to FoundationDB. This is an eventually
+-- consistent indexing operation; it runs as a separate stage of the pipeline,
+-- and is thus more suitable for more resource-intensive indexing operations.
+eventualIndexBy ::
+  (AT.TableKey k, MonadStream m) =>
+  StepName ->
+  (a -> [k]) ->
+  Stream 'FDB a ->
+  m (Ix.Index k)
+eventualIndexBy sn f stream = do
+  let topic = streamTopic stream
+  let ix = Ix.namedIndex topic sn
+  -- TODO: we seem to need a StreamSink type for side effects that don't
+  -- write downstream.
+  let ixer _ batch = do
+        for_ batch $ \case
+          (Just coord, x) -> for_ (f x) \k -> do
+            Ix.indexCommitted ix k coord
+          (Nothing, _) -> return ()
+        return mempty
+  (_s :: Stream 'FDB ()) <- run sn $ StreamProcessor
+    { streamProcessorWatermarkBy = NoWatermark,
+      streamProcessorBatchProcessors =
+        [BatchProcessor stream ixer],
+      streamProcessorIndexers = [],
+      streamProcessorStreamStepConfig = defaultStreamStepConfig
+    }
+  return ix
 
 -- | Streaming one-to-one join. If the relationship is not actually one-to-one
 --   (i.e. the input join functions are not injective), some messages in the
@@ -713,12 +761,12 @@ pipe' input f =
 oneToOneJoin ::
   (Message a, Message b, Message c, Message d, MonadStream m) =>
   StepName ->
-  Stream a ->
-  Stream b ->
+  Stream t1 a ->
+  Stream t2 b ->
   (a -> c) ->
   (b -> c) ->
   (a -> b -> d) ->
-  m (Stream d)
+  m (Stream 'FDB d)
 oneToOneJoin sn in1 in2 p1 p2 j =
   run sn $
     oneToOneJoin' in1 in2 p1 p2 j
@@ -727,24 +775,24 @@ oneToOneJoin sn in1 in2 p1 p2 j =
 -- customized before being passed to 'run'.
 oneToOneJoin' ::
   (Message a, Message b, Message c, Message d) =>
-  Stream a ->
-  Stream b ->
+  Stream t1 a ->
+  Stream t2 b ->
   (a -> c) ->
   (b -> c) ->
   (a -> b -> d) ->
-  StreamStep d (Stream d)
+  StreamStep d (Stream 'FDB d)
 oneToOneJoin' inl inr pl pr j =
-  let lstep = \cfg -> oneToOneJoinStep cfg 0 pl j
-      rstep = \cfg -> oneToOneJoinStep cfg 1 pr (flip j)
-   in Stream2Processor
-        inl
-        inr
+  let lstep = \topic -> oneToOneJoinStep topic 0 pl j
+      rstep = \topic -> oneToOneJoinStep topic 1 pr (flip j)
+   in StreamProcessor
         ( if isStreamWatermarked inl && isStreamWatermarked inr
             then DefaultWatermark
             else NoWatermark
         )
-        lstep
-        rstep
+        [ BatchProcessor inl lstep,
+          BatchProcessor inr rstep
+        ]
+        []
         defaultStreamStepConfig
 
 -- TODO: implement one-to-many joins in terms of this?
@@ -753,7 +801,7 @@ oneToOneJoin' inl inr pl pr j =
 -- these buckets can be monoidally reduced by 'aggregate' and 'aggregate''.
 groupBy ::
   (v -> [k]) ->
-  Stream v ->
+  Stream t v ->
   (GroupedBy k v)
 groupBy k t = GroupedBy t k
 
@@ -794,10 +842,10 @@ makeStream ::
   StepName ->
   StreamName ->
   StreamStep b r ->
-  m (Stream b)
+  m (Stream 'FDB b)
 makeStream stepName streamName step = do
   jc <- getJobConfig
-  let streamTopic =
+  let topic =
         makeTopic
           (jobConfigSS jc)
           stepName
@@ -809,9 +857,9 @@ makeStream stepName streamName step = do
           then setStreamWatermarkByTopic
           else id
       )
-    $ streamFromTopic streamTopic streamName
+    $ streamFromTopic topic streamName
 
-forEachPartition :: Monad m => Stream a -> (PartitionId -> m ()) -> m ()
+forEachPartition :: Monad m => Stream t a -> (PartitionId -> m ()) -> m ()
 forEachPartition s = for_ [0 .. fromIntegral $ streamMinReaderPartitions s - 1]
 
 -- | An implementation of the streaming system that uses distributed leases to
@@ -886,14 +934,28 @@ runCustomWatermark wmSS (CustomWatermark f) t = do
   return (n, xs)
 runCustomWatermark _ _ t = t
 
+runIndexers ::
+  [Indexer outMsg] ->
+  Topic ->
+  Transaction (Int, Seq (Topic.CoordinateUncommitted, outMsg)) ->
+  Transaction (Int, Seq outMsg)
+runIndexers ixers outTopic f = do
+  (n, cmsgs) <- f
+  for_ ixers \(Indexer ixNm ixer) -> do
+    let ix = Ix.namedIndex outTopic ixNm
+    for_ cmsgs \(coord, msg) -> do
+      let ks = ixer msg
+      for_ ks \k -> Ix.index ix k coord
+  return (n, fmap snd cmsgs)
+
 outputStreamAndTopic ::
   (HasJobConfig m, Message c, Monad m) =>
   StepName ->
-  StreamStep b (Stream c) ->
-  m (Stream c, Topic)
+  StreamStep b (Stream 'FDB c) ->
+  m (Stream 'FDB c, Topic)
 outputStreamAndTopic stepName step = do
   jc <- getJobConfig
-  let streamTopic =
+  let topic =
         makeTopic
           (jobConfigSS jc)
           stepName
@@ -904,207 +966,146 @@ outputStreamAndTopic stepName step = do
             then setStreamWatermarkByTopic
             else id
         )
-          $ streamFromTopic streamTopic stepName
-  return (fmap fromMessage stream, streamTopic)
+          $ streamFromTopic topic stepName
+  return (fmap fromMessage stream, topic)
+
+-- TODO: find a way to improve the type on this so that we don't need to
+-- return Maybe.
+
+-- | Returns Nothing if the step doesn't produce a topic (i.e., it's a
+-- TableProcessor).
+outputTopic ::
+  (HasJobConfig m, Monad m) =>
+  StepName ->
+  StreamStep b runResult ->
+  m (Maybe Topic)
+outputTopic stepName IndexedStreamProcessor {indexedStreamProcessorInner} =
+  outputTopic stepName indexedStreamProcessorInner
+outputTopic stepName step@StreamProcessor {} = do
+  jc <- getJobConfig
+  return $ Just $
+    makeTopic
+      (jobConfigSS jc)
+      stepName
+      (getStepNumPartitions jc (getStepConfig step))
+      (defaultChunkSizeBytes jc)
+outputTopic _ TableProcessor {} = return Nothing
 
 instance MonadStream LeaseBasedStreamWorker where
-  run
-    sn
-    s@WriteOnlyProcessor
-      { writeOnlyProduce,
-        writeOnlyWatermarkBy,
-        writeOnlyStreamStepConfig
-      } = do
-      (outStream, outTopic) <- outputStreamAndTopic sn s
-      (cfg@JobConfig {jobConfigDB}, taskReg) <- Reader.ask
-      metrics <- registerStepMetrics sn
-      let job _stillValid _release =
-            doForSeconds (leaseDuration cfg)
-              $ void
-              $ throttleByErrors metrics sn
-              $ runStreamTxn jobConfigDB
-              $ runCustomWatermark (topicWatermarkSS outTopic) writeOnlyWatermarkBy
-              $ produceStep (getMsgsPerBatch cfg writeOnlyStreamStepConfig) outTopic writeOnlyProduce
-      liftIO
-        $ runStreamTxn jobConfigDB
-        $ addTask taskReg (TaskName sn) (leaseDuration cfg) job
-      return outStream
+  run sn step@IndexedStreamProcessor {} =
+    runIndexedStreamProcessor sn step
   run
     sn
     s@StreamProcessor
-      { streamProcessorInStream,
-        streamProcessorWatermarkBy,
-        streamProcessorProcessBatch,
+      { streamProcessorWatermarkBy,
+        streamProcessorBatchProcessors,
+        streamProcessorIndexers,
         streamProcessorStreamStepConfig
       } = do
       (outStream, outTopic) <- outputStreamAndTopic sn s
       (cfg@JobConfig {jobConfigDB}, _) <- Reader.ask
       metrics <- registerStepMetrics sn
-      let checkpointSS =
-            streamConsumerCheckpointSS
-              (jobConfigSS cfg)
-              streamProcessorInStream
-              sn
-      let job pid _stillValid _release =
-            -- NOTE: we must use a case here to do the pattern match to work around a
-            -- GHC limitation. In 8.6, let gives a very confusing error message about
-            -- variables escaping their scopes. In 8.8, it gives a more helpful
-            -- "my brain just exploded" message that says to use a case statement.
-            case streamProcessorInStream of
-              Stream streamReadAndCheckpoint _ _ _ _ setUpState destroyState ->
-                bracket
-                  (runStreamTxn jobConfigDB $ setUpState cfg sn pid checkpointSS)
-                  destroyState
-                  \state ->
-                    doForSeconds (leaseDuration cfg)
-                      $ void
-                      $ throttleByErrors metrics sn
-                      $ runStreamTxn jobConfigDB
-                      $ runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy
-                      $ pipeStep
-                        cfg
-                        streamProcessorStreamStepConfig
-                        streamProcessorInStream
-                        streamReadAndCheckpoint
-                        state
-                        outTopic
-                        sn
-                        streamProcessorProcessBatch
-                        metrics
-                        pid
-      forEachPartition streamProcessorInStream $ \pid -> do
-        let taskName = mkTaskName sn pid
-        taskReg <- taskRegistry
-        liftIO
-          $ runStreamTxn jobConfigDB
-          $ addTask taskReg taskName (leaseDuration cfg) (job pid)
+      let workspaceSS =
+            FDB.extend
+              (topicCustomMetadataSS outTopic)
+              [C.streamStepWorkspace]
+      let processorsWStepNames =
+            zip
+              streamProcessorBatchProcessors
+              [sn <> BS8.pack (show i) | i <- [(0 :: Int) ..]]
+      for_ processorsWStepNames \(BatchProcessor inStream processBatch, sn_i) -> do
+        let checkpointSS =
+              streamConsumerCheckpointSS
+                (jobConfigSS cfg)
+                inStream
+                sn_i
+        let job pid _stillValid _release =
+              -- NOTE: we must use a case here to do the pattern match to work around a
+              -- GHC limitation. In 8.6, let gives a very confusing error message about
+              -- variables escaping their scopes. In 8.8, it gives a more helpful
+              -- "my brain just exploded" message that says to use a case statement.
+              case getStream' inStream of
+                Stream' streamReadAndCheckpoint _ _ _ setUpState destroyState ->
+                  bracket
+                    (runStreamTxn jobConfigDB $ setUpState cfg sn_i pid checkpointSS)
+                    destroyState
+                    \state ->
+                      doForSeconds (leaseDuration cfg)
+                        $ void
+                        $ throttleByErrors metrics sn_i
+                        $ runStreamTxn jobConfigDB
+                        $ runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy
+                        $ runIndexers streamProcessorIndexers outTopic
+                        $ pipeStep
+                          cfg
+                          streamProcessorStreamStepConfig
+                          inStream
+                          streamReadAndCheckpoint
+                          state
+                          outTopic
+                          sn_i
+                          (processBatch workspaceSS)
+                          metrics
+                          pid
+        forEachPartition inStream $ \pid -> do
+          let taskName = mkTaskName sn_i pid
+          taskReg <- taskRegistry
+          liftIO
+            $ runStreamTxn jobConfigDB
+            $ addTask taskReg taskName (leaseDuration cfg) (job pid)
       return outStream
-  run sn s@(Stream2Processor inl inr watermarker ls rs stepCfg) = do
-    cfg@JobConfig {jobConfigDB} <- getJobConfig
-    (outStream, outTopic) <- outputStreamAndTopic sn s
-    metrics <- registerStepMetrics sn
-    let lname = sn <> "0"
-    let rname = sn <> "1"
-    let checkpointSSL =
-          streamConsumerCheckpointSS
-            (jobConfigSS cfg)
-            inl
-            lname
-    let checkpointSSR =
-          streamConsumerCheckpointSS
-            (jobConfigSS cfg)
-            inr
-            rname
-    let ljob pid _stillValid _release =
-          case inl of
-            Stream streamReadAndCheckpoint _ _ _ _ setUpState destroyState ->
-              bracket
-                (runStreamTxn jobConfigDB $ setUpState cfg lname pid checkpointSSL)
-                destroyState
-                \state ->
-                  doForSeconds (leaseDuration cfg)
-                    $ void
-                    $ throttleByErrors metrics sn
-                    $ runStreamTxn jobConfigDB
-                    $ runCustomWatermark (topicWatermarkSS outTopic) watermarker
-                    $ pipeStep
-                      cfg
-                      stepCfg
-                      inl
-                      streamReadAndCheckpoint
-                      state
-                      outTopic
-                      lname
-                      (ls outTopic)
-                      metrics
-                      pid
-    let rjob pid _stillValid _release =
-          case inr of
-            Stream streamReadAndCheckpoint _ _ _ _ setUpState destroyState ->
-              bracket
-                (runStreamTxn jobConfigDB $ setUpState cfg rname pid checkpointSSR)
-                destroyState
-                \state ->
-                  doForSeconds (leaseDuration cfg)
-                    $ void
-                    $ throttleByErrors metrics sn
-                    $ runStreamTxn jobConfigDB
-                    $ runCustomWatermark (topicWatermarkSS outTopic) watermarker
-                    $ pipeStep
-                      cfg
-                      stepCfg
-                      inr
-                      streamReadAndCheckpoint
-                      state
-                      outTopic
-                      rname
-                      (rs outTopic)
-                      metrics
-                      pid
-    forEachPartition inl $ \pid -> do
-      let lTaskName = TaskName $ BS8.pack (show lname ++ "_" ++ show pid)
-      taskReg <- taskRegistry
-      liftIO
-        $ runStreamTxn jobConfigDB
-        $ addTask taskReg lTaskName (leaseDuration cfg) (ljob pid)
-    forEachPartition inr $ \pid -> do
-      let rTaskName = TaskName $ BS8.pack (show rname ++ "_" ++ show pid)
-      taskReg <- taskRegistry
-      liftIO
-        $ runStreamTxn jobConfigDB
-        $ addTask taskReg rTaskName (leaseDuration cfg) (rjob pid)
-    return outStream
   run
     sn
-    step@TableProcessor
-      { tableProcessorGroupedBy,
-        tableProcessorAggregation,
-        tableProcessorWatermarkBy,
-        tableProcessorStreamStepConfig
-      } = do
-      cfg@JobConfig {jobConfigDB} <- getJobConfig
-      let table =
-            getAggrTable
-              cfg
-              sn
-              (getStepNumPartitions cfg (getStepConfig step))
-      let (GroupedBy inStream _) = tableProcessorGroupedBy
-      metrics <- registerStepMetrics sn
-      let checkpointSS =
-            streamConsumerCheckpointSS
-              (jobConfigSS cfg)
-              inStream
-              sn
-      let job pid _stillValid _release =
-            case inStream of
-              Stream streamReadAndCheckpoint _ _ _ _ setUpState destroyState ->
-                bracket
-                  (runStreamTxn jobConfigDB $ setUpState cfg sn pid checkpointSS)
-                  destroyState
-                  \state ->
-                    doForSeconds (leaseDuration cfg)
-                      $ void
-                      $ throttleByErrors metrics sn
-                      $ runStreamTxn jobConfigDB
-                      $ runCustomWatermark (AT.aggrTableWatermarkSS table) tableProcessorWatermarkBy
-                      $ aggregateStep
-                        cfg
-                        tableProcessorStreamStepConfig
-                        sn
-                        tableProcessorGroupedBy
-                        streamReadAndCheckpoint
-                        state
-                        tableProcessorAggregation
-                        table
-                        metrics
-                        pid
-      forEachPartition inStream $ \pid -> do
-        taskReg <- taskRegistry
-        let taskName = TaskName $ BS8.pack (show sn ++ "_" ++ show pid)
-        liftIO
-          $ runStreamTxn jobConfigDB
-          $ addTask taskReg taskName (leaseDuration cfg) (job pid)
-      return table
+    step@( TableProcessor
+             tableProcessorGroupedBy@(GroupedBy inStream _)
+             tableProcessorAggregation
+             tableProcessorWatermarkBy
+             _
+             tableProcessorStreamStepConfig
+           ) =
+      do
+        cfg@JobConfig {jobConfigDB} <- getJobConfig
+        let table =
+              getAggrTable
+                cfg
+                sn
+                (getStepNumPartitions cfg (getStepConfig step))
+        metrics <- registerStepMetrics sn
+        let checkpointSS =
+              streamConsumerCheckpointSS
+                (jobConfigSS cfg)
+                inStream
+                sn
+        let job pid _stillValid _release =
+              case getStream' inStream of
+                Stream' streamReadAndCheckpoint _ _ _ setUpState destroyState ->
+                  bracket
+                    (runStreamTxn jobConfigDB $ setUpState cfg sn pid checkpointSS)
+                    destroyState
+                    \state ->
+                      doForSeconds (leaseDuration cfg)
+                        $ void
+                        $ throttleByErrors metrics sn
+                        $ runStreamTxn jobConfigDB
+                        $ runCustomWatermark (AT.aggrTableWatermarkSS table) tableProcessorWatermarkBy
+                        $ aggregateStep
+                          cfg
+                          tableProcessorStreamStepConfig
+                          sn
+                          tableProcessorGroupedBy
+                          streamReadAndCheckpoint
+                          state
+                          tableProcessorAggregation
+                          table
+                          metrics
+                          pid
+        forEachPartition inStream $ \pid -> do
+          taskReg <- taskRegistry
+          let taskName = TaskName $ BS8.pack (show sn ++ "_" ++ show pid)
+          liftIO
+            $ runStreamTxn jobConfigDB
+            $ addTask taskReg taskName (leaseDuration cfg) (job pid)
+        return table
 
 -- TODO: what if we have recently removed steps from our topology? Old leases
 -- will be registered forever. Need to remove old ones.
@@ -1235,37 +1236,23 @@ throttleByErrors metrics sn x =
       recordBatchLatency metrics timeMillis
       when (numConsumed == 0) (threadDelay 1000000)
 
-produceStep ::
-  Message a =>
-  Word16 ->
-  Topic ->
-  Transaction (Maybe a) ->
-  -- | Number of incoming messages consumed, outgoing messages
-  FDB.Transaction (Int, Seq a)
-produceStep batchSize topic step = do
-  -- TODO: this keeps spinning even if the producer is done and will never
-  -- produce again.
-  xs <- catMaybes <$> replicateM (fromIntegral batchSize) step
-  p' <- liftIO $ randPartition topic
-  void $ writeTopic topic p' (fmap toMessage xs)
-  return (0, Seq.fromList xs)
-
 -- TODO: pipeStep just does a few miscellaneous things. Destroy it.
+
 -- | Returns number of messages consumed from upstream, and
 -- new messages to send downstream.
 pipeStep ::
   (Message b) =>
   JobConfig ->
   StreamStepConfig ->
-  Stream a ->
+  Stream t a ->
   (StreamReadAndCheckpoint a state) ->
   state ->
   Topic ->
   StepName ->
-  (Seq (Maybe Checkpoint, a) -> Transaction (Seq b)) ->
+  (Seq (Maybe Topic.Coordinate, a) -> Transaction (Seq b)) ->
   Maybe StreamEdgeMetrics ->
   PartitionId ->
-  Transaction (Int, Seq b)
+  Transaction (Int, Seq (Topic.CoordinateUncommitted, b))
 pipeStep
   jobCfg
   stepCfg
@@ -1291,32 +1278,31 @@ pipeStep
     ys <- transformBatch inMsgs
     let outMsgs = fmap toMessage ys
     p' <- liftIO $ randPartition outCfg
-    void $ writeTopic outCfg p' (toList outMsgs)
-    return (length inMsgs, ys)
+    coords <- writeTopic outCfg p' (toList outMsgs)
+    return (length inMsgs, (Seq.zip (Seq.fromList coords) ys))
 
 oneToOneJoinStep ::
   forall a1 a2 b c.
   (Message a1, Message a2, Message c) =>
-  Topic ->
+  FDB.Subspace ->
   -- | Index of the stream being consumed. 0 for left side of
   -- join, 1 for right. This will be refactored to support
   -- n-way joins in the future.
   Int ->
   (a1 -> c) ->
   (a1 -> a2 -> b) ->
-  Seq (Maybe Checkpoint, a1) ->
+  Seq (Maybe Topic.Coordinate, a1) ->
   Transaction (Seq b)
-oneToOneJoinStep outputTopic streamJoinIx pl combiner ckptmsgs = do
+oneToOneJoinStep joinSS streamJoinIx pl combiner ckptmsgs = do
   -- Read from one of the two join streams, and for each
   -- message read, compute the join key. Using the join key, look in the
   -- join table to see if the partner is already there. If so, write the tuple
   -- downstream. If not, write the one message we do have to the join table.
   -- TODO: think of a way to garbage collect items that never get joined.
   let sn = "1:1"
-  let joinSS = topicCustomMetadataSS outputTopic
   let otherIx = if streamJoinIx == 0 then 1 else 0
   joinFutures <-
-    for ckptmsgs \(_,msg) -> do
+    for ckptmsgs \(_, msg) -> do
       let k = pl msg
       joinF <- withSnapshot $ get1to1JoinData joinSS sn otherIx k
       return (k, msg, joinF)
@@ -1358,7 +1344,9 @@ aggregateStep
   metrics
   pid = do
     let checkpointSS = streamConsumerCheckpointSS (jobConfigSS jobCfg) inStream sn
-    msgs <- fmap snd <$> streamReadAndCheckpoint
+    msgs <-
+      fmap snd
+        <$> streamReadAndCheckpoint
           jobCfg
           sn
           pid
@@ -1403,9 +1391,9 @@ instance HasJobConfig PureStream where
   getJobConfig = Reader.ask
 
 instance MonadStream PureStream where
-  run sn s@WriteOnlyProcessor {} = makeStream sn sn s
+  run sn step@IndexedStreamProcessor {} =
+    runIndexedStreamProcessor sn step
   run sn s@StreamProcessor {} = makeStream sn sn s
-  run sn s@Stream2Processor {} = makeStream sn sn s
   run sn s@TableProcessor {} = do
     cfg <- getJobConfig
     let table =
@@ -1432,3 +1420,52 @@ getStepNumPartitions JobConfig {defaultNumPartitions} StreamStepConfig {stepOutp
 getMsgsPerBatch :: JobConfig -> StreamStepConfig -> Word16
 getMsgsPerBatch JobConfig {msgsPerBatch} StreamStepConfig {stepBatchSize} =
   fromMaybe msgsPerBatch stepBatchSize
+
+newtype ListTopics a = ListTopics {unListTopics :: ReaderT JobConfig (StateT [Topic] Identity) a}
+  deriving (Functor, Applicative, Monad, MonadReader JobConfig, MonadState [Topic])
+
+instance HasJobConfig ListTopics where
+  getJobConfig = Reader.ask
+
+instance MonadStream ListTopics where
+  run sn step@IndexedStreamProcessor {} = do
+    t <- outputTopic sn step
+    State.modify (fromJust t :)
+    runIndexedStreamProcessor sn step
+  run sn step@StreamProcessor {} = do
+    t <- outputTopic sn step
+    State.modify (fromJust t :)
+    makeStream sn sn step
+  run sn step@TableProcessor {} = do
+    cfg <- getJobConfig
+    let table =
+          getAggrTable
+            cfg
+            sn
+            (getStepNumPartitions cfg (getStepConfig step))
+    return table
+
+-- | List all topics written to by the given stream topology.
+listTopics :: JobConfig -> (forall m. MonadStream m => m a) -> [Topic]
+listTopics cfg f =
+  State.execState (Reader.runReaderT (unListTopics f) cfg) []
+
+runIndexedStreamProcessor :: (HasJobConfig m, MonadStream m) => StepName -> StreamStep outMsg runResult -> m runResult
+runIndexedStreamProcessor
+  sn
+  step@IndexedStreamProcessor
+    { indexedStreamProcessorInner,
+      indexedStreamProcessorIndexName,
+      indexedStreamProcessorIndexBy
+    } = do
+    let step' =
+          consIndexer
+            indexedStreamProcessorInner
+            indexedStreamProcessorIndexName
+            indexedStreamProcessorIndexBy
+    res <- run sn step'
+    mtopic <- outputTopic sn step
+    case mtopic of
+      Nothing -> error "impossible happened"
+      Just topic -> return (Ix.namedIndex topic indexedStreamProcessorIndexName, res)
+runIndexedStreamProcessor _ _ = error "runIndexedStreamProcessor called on wrong constructor"

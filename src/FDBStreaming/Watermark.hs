@@ -13,10 +13,10 @@ module FDBStreaming.Watermark
     getWatermark,
     minWatermark,
     watermarkMillisSinceEpoch,
-    WatermarkBy(..),
+    WatermarkBy (..),
     producesWatermark,
     isDefaultWatermark,
-    topicWatermarkSS
+    topicWatermarkSS,
   )
 where
 
@@ -150,6 +150,7 @@ getWatermark ss version = do
   let sel = FDB.LastLessOrEq k
   fk <- FDB.getKey sel
   return (fmap (parseWatermarkKeyResult ss) fk)
+
 -- TODO: the current watermarking algorithm could take about 10 MB per day per
 -- processing step, if we watermark each batch we process. Could we reduce the
 -- overhead further? Don't watermark every batch? And if batches are extremely

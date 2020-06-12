@@ -1,6 +1,8 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TupleSections #-}
@@ -15,12 +17,17 @@ module FDBStreaming.Topic
     makeTopic,
     randPartition,
     watchPartition,
-    Checkpoint(..),
+    Checkpoint (..),
     getCheckpoint,
     getCheckpoints,
     readNAndCheckpoint,
     readNAndCheckpointIO,
     writeTopic,
+    CoordinateUncommitted (..),
+    Coordinate (..),
+    checkpointToCoordinate,
+    coordinateToCheckpoint,
+    get,
     writeTopicIO,
     getPartitionCount,
     getTopicCount,
@@ -28,7 +35,10 @@ module FDBStreaming.Topic
     watchTopic,
     watchTopicIO,
     awaitTopicOrTimeout,
-    getEntireTopic
+
+    -- * Advanced usage
+    getEntireTopic,
+    peekNPastCheckpoint,
   )
 where
 
@@ -62,9 +72,8 @@ import Data.Word
     Word64,
     Word8,
   )
-
-import FDBStreaming.Util (chunksOfSize, streamlyRangeResult)
 import qualified FDBStreaming.Topic.Constants as C
+import FDBStreaming.Util (chunksOfSize, streamlyRangeResult)
 import qualified FoundationDB as FDB
 import FoundationDB as FDB (Database, FutureIO, KeySelector (FirstGreaterOrEq, FirstGreaterThan), Range (Range), Transaction, atomicOp, await, awaitIO, getKey, runTransaction, watch)
 import qualified FoundationDB.Layer.Subspace as FDB
@@ -75,8 +84,9 @@ import FoundationDB.Versionstamp
   ( Versionstamp
       ( IncompleteVersionstamp
       ),
-    VersionstampCompleteness (Complete),
+    VersionstampCompleteness (Complete, Incomplete),
   )
+import GHC.Generics (Generic)
 import qualified Streamly.Prelude as S
 import System.Random (randomRIO)
 
@@ -97,6 +107,59 @@ type ReaderName = ByteString
 -- separate partitions, readers are able to maintain a separate checkpoint per
 -- partition, and reads scale better.
 type PartitionId = Word8
+
+-- | Identifies a single message in a topic. This must be committed by passing
+-- it to an indexing function in the same transaction in which this coordinate
+-- was created with 'writeTopic'. After the transaction is committed, other
+-- indexing functions can be used to fetch the coordinate as a 'Coordinate',
+-- which can be passed to 'get'.
+data CoordinateUncommitted
+  = CoordinateUncommitted PartitionId (Versionstamp 'Incomplete) Int
+  deriving (Eq, Show, Ord, Generic)
+
+-- | Identifies a single message in a topic.
+data Coordinate = Coordinate PartitionId (Versionstamp 'Complete) Int
+  deriving (Eq, Show, Ord, Generic)
+
+-- | A checkpoint consists of a versionstamp, indicating which key we last read
+-- from, and an integer. The integer is an index inside of the list of
+-- bytestrings stored at the versionstamp key, indicating the last bytestring we
+-- read within that key.
+--
+-- Recall that we pack multiple messages into each FDB key/value pair using a
+-- chunking scheme (see 'desiredChunkSizeBytes'). So when the reader of the
+-- topic asks for the next n messages, the batch of messages might stop in the
+-- middle of a chunk. Thus, we need to remember where within the chunk we
+-- stopped. This of course has the downside that we transmit some extra data
+-- on each read and throw it away, but the hope is that the efficiency gain of
+-- packing more data into each key/value pair makes up for it.
+--
+-- For example, if our topic key/values look like
+--
+-- @k1, [b0, b1, b2]@
+-- @k2, [b0, b1, b2]@
+-- @k3, [b0, b1, b2]@
+--
+-- Where each k is a versionstamp key and each b is a message within that key's
+-- value (chunk), then if the current checkpoint is (k2, 1), we have already
+-- seen all messages up to and including k2,b1. The next batch of messages we
+-- read will start at k2,b2.
+data Checkpoint = Checkpoint (Versionstamp 'Complete) Int
+  deriving (Show, Eq, Ord, Bounded)
+
+-- TODO: it seems that Coordinates are more general than checkpoints. Can we
+-- remove checkpoints as a separate type? Or make checkpoints a newtype for
+-- coordinates? They do serve two different purposes, but they both ultimately
+-- point at a particular message.
+
+-- | Convert a coordinate to a checkpoint. The difference between the two is
+-- that a coordinate contains a PartitionId and a checkpoint does not, because
+-- checkpoints are stored per partition.
+coordinateToCheckpoint :: Coordinate -> Checkpoint
+coordinateToCheckpoint (Coordinate _ vs i) = Checkpoint vs i
+
+checkpointToCoordinate :: PartitionId -> Checkpoint -> Coordinate
+checkpointToCoordinate pid (Checkpoint vs i) = Coordinate pid vs i
 
 -- TODO: consider switching to the directory layer so the subspace strings
 -- are shorter
@@ -121,6 +184,8 @@ data Topic
         topicName :: TopicName,
         -- | Returns the subspace containing messages for a given partition.
         partitionMsgsSS :: PartitionId -> FDB.Subspace,
+        -- | Subspace containing all partitions.
+        msgsSS :: FDB.Subspace,
         -- | Key containing the count of messages for a given partition.
         partitionCountKey :: PartitionId -> ByteString,
         -- | Desired number of bytes to pack into each FDB value storing the
@@ -141,20 +206,21 @@ data Topic
 -- | Create a new topic, contained within the given subspace and with the given
 -- name. You may reuse the same subspace for any number of topics -- each topic
 -- will be stored in a separate subspace below it.
-makeTopic :: FDB.Subspace
-          -- ^ Top-level subspace containing all topics used by this application.
-          -> TopicName
-          -- ^ Name of the topic. Must be unique to the given subspace.
-          -> Word8
-          -- ^ Number of partitions in this topic. The number of partitions
-          -- bounds the number of consumers that may concurrently read from this
-          -- topic.
-          -> Word
-          -- ^ Desired number of bytes to pack into each FDB value storing the
-          -- messages of this topic. For small messages, this can greatly
-          -- increase throughput and reduce FDB storage usage. Set to 0
-          -- to disable this behavior.
-          -> Topic
+makeTopic ::
+  -- | Top-level subspace containing all topics used by this application.
+  FDB.Subspace ->
+  -- | Name of the topic. Must be unique to the given subspace.
+  TopicName ->
+  -- | Number of partitions in this topic. The number of partitions
+  -- bounds the number of consumers that may concurrently read from this
+  -- topic.
+  Word8 ->
+  -- | Desired number of bytes to pack into each FDB value storing the
+  -- messages of this topic. For small messages, this can greatly
+  -- increase throughput and reduce FDB storage usage. Set to 0
+  -- to disable this behavior.
+  Word ->
+  Topic
 makeTopic topicSS topicName p desiredChunkSizeBytes = Topic {..}
   where
     partitionMsgsSS i = FDB.extend msgsSS [FDB.Int (fromIntegral i)]
@@ -172,6 +238,7 @@ randPartition :: Topic -> IO PartitionId
 randPartition Topic {..} = randomRIO (0, numPartitions - 1)
 
 -- TODO: not efficient from either a Haskell or FDB perspective.
+
 -- | Returns all topics that currently exist in the given subspace. This function
 -- is not particularly efficient and shouldn't be used too heavily.
 --
@@ -206,7 +273,6 @@ getTopicCount topic = do
   cs <- traverse await fs
   return (sum cs)
 
-
 -- | Increments the count of messages in a given topic partition.
 incrPartitionCountBy :: Topic -> PartitionId -> Word64 -> Transaction ()
 incrPartitionCountBy topic pid n = do
@@ -238,29 +304,43 @@ readerCheckpointKey topic i rn =
 -- Danger!! It's possible to write multiple messages with the same key
 -- if this is called more than once in a single transaction.
 --
--- Returns the FDB keys (containing incomplete versionstamps) corresponding to
--- where each item in the input batch was written, along with the integer index
--- describing where in the array of values written to that key the item was
--- placed (see 'desiredChunkSizeBytes' for details).
+-- Returns the coordinate corresponding to
+-- where each item in the input batch was written.
+--
+-- Because the returned Coordinate contains an incomplete versionstamp, the only
+-- way to
+-- remember where each message was written is to write the keys somewhere else
+-- in the same transaction, or to get the committed version of the transaction
+-- after it completes. Once you have a Coordinate with a complete versionstamp,
+-- you can pass it to 'get' to recover the message.
 writeTopic ::
   Topic ->
   PartitionId ->
   --TODO watch for regression from switching to list here
   [ByteString] ->
-  Transaction [(ByteString, Int)]
+  Transaction [CoordinateUncommitted]
 writeTopic topic@Topic {..} p bss = do
   incrPartitionCountBy topic p (fromIntegral $ length bss)
   let chunks = chunksOfSize desiredChunkSizeBytes BS.length bss
-  let mkKey i = FDB.pack
-                  (partitionMsgsSS p)
-                  [FDB.IncompleteVS (IncompleteVersionstamp i)]
-  let keyedIndexedChunks = [ (mkKey i, zip [0..] chunk)
-                           | (i, chunk) <- zip [0..] chunks
-                           ]
-  forM_ keyedIndexedChunks $ \(k, bs) -> do
+  let mkTuple i =
+        [ FDB.Int $ fromIntegral p,
+          FDB.IncompleteVS (IncompleteVersionstamp i)
+        ]
+  let mkCoord pid i = CoordinateUncommitted pid (IncompleteVersionstamp i)
+  let keyedIndexedChunks =
+        [ (mkCoord p i, FDB.pack msgsSS t, zip [0 ..] chunk)
+          | (i, chunk) <- zip [0 ..] chunks,
+            let t = mkTuple i
+        ]
+  forM_ keyedIndexedChunks $ \(_, k, bs) -> do
+    -- TODO: this has the unhappy side effect of increasing the size of
+    -- messages encoded by the persist library significantly. persist pads with
+    -- \x00, which FDB's tuple layer uses as a marker for the end of bytes, so
+    -- all the \x00 bytes get escaped with \ff by the tuple layer encoding.
+    -- In other words, every \x00 needs two bytes to encode.
     let v = FDB.encodeTupleElems (map (FDB.Bytes . snd) bs)
     FDB.atomicOp k (Mut.setVersionstampedKey v)
-  return [(k, i) | (k,cs) <- keyedIndexedChunks, (i,_) <- cs]
+  return [m i | (m, _, cs) <- keyedIndexedChunks, (i, _) <- cs]
 
 -- TODO: support messages larger than FDB size limit, via chunking.
 
@@ -274,46 +354,46 @@ writeTopicIO ::
   FDB.Database ->
   Topic ->
   [ByteString] ->
-  IO [(ByteString, Int)]
+  IO [CoordinateUncommitted]
 writeTopicIO db topic@Topic {..} bss = do
   p <- randPartition topic
   FDB.runTransaction db $ writeTopic topic p bss
 
+parseTopicV :: ByteString -> [ByteString]
+parseTopicV vals = case FDB.decodeTupleElems vals of
+  Right bs | allBytes bs -> unBytes bs
+  _ -> error $ "parseTopicV: unexpected topic chunk format"
+  where
+    allBytes [] = True
+    allBytes (FDB.Bytes _ : xs) = allBytes xs
+    allBytes _ = False
+    unBytes [] = []
+    unBytes (FDB.Bytes x : xs) = x : unBytes xs
+    unBytes _ = error "unreachable case in parseTopicKV"
+
 parseTopicKV ::
+  Topic ->
+  (ByteString, ByteString) ->
+  (Versionstamp 'Complete, [ByteString])
+parseTopicKV Topic {..} (k, v) =
+  case (FDB.unpack msgsSS k, parseTopicV v) of
+    (Right [FDB.Int _, FDB.CompleteVS vs], bs) -> (vs, bs)
+    (Right t, _) -> error $ "unexpected key tuple: " ++ show t
+    (Left err, _) -> error $ "failed to decode " ++ show k ++ "with msgsSS " ++ show msgsSS ++ " because " ++ show err
+
+-- | Parse a topic key/value pair (in the format (versionstamp, sequence of
+-- messages)) to a list of messages, each paired with the Coordinate that points
+-- to that message. This coordinate can be used to produce the checkpoint that
+-- we would use if we were to stop reading at that message.
+topicKVToCoordinateMessage ::
   Topic ->
   PartitionId ->
   (ByteString, ByteString) ->
-  (Versionstamp 'Complete, [ByteString])
-parseTopicKV Topic {..} p (k, v) =
-  case (FDB.unpack (partitionMsgsSS p) k, FDB.decodeTupleElems v) of
-    (Right [FDB.CompleteVS vs], Right bs) | allBytes bs -> (vs, unBytes bs)
-    (Right [FDB.CompleteVS _], Right _) -> error "unexpected topic chunk format"
-    (Right t, _) -> error $ "unexpected tuple: " ++ show t
-    (Left err, _) -> error $ "failed to decode " ++ show k ++ " because " ++ show err
-
-
-    where
-      allBytes []                 = True
-      allBytes (FDB.Bytes _ : xs) = allBytes xs
-      allBytes _                  = False
-
-      unBytes []                 = []
-      unBytes (FDB.Bytes x : xs) = x : unBytes xs
-      unBytes _                  = error "unreachable case in parseTopicKV"
-
--- | Parse a topic key/value pair (in the format (versionstamp, sequence of
--- messages)) to a list of messages, each paired with the Checkpoint that points
--- to that message. This checkpoint is the checkpoint that we
--- would use if we were to stop reading at that message.
-topicKVToCheckpointMessage ::
-  Topic ->
-  PartitionId ->
-  (ByteString, ByteString)
-  -> [(Checkpoint, ByteString)]
-topicKVToCheckpointMessage t pid kv =
-  let (vs, msgs) = parseTopicKV t pid kv
-      imsgs = zip [0..] msgs
-      in [(Checkpoint vs i, msg) | (i, msg) <- imsgs]
+  [(Coordinate, ByteString)]
+topicKVToCoordinateMessage t pid kv =
+  let (vs, msgs) = parseTopicKV t kv
+      imsgs = zip [0 ..] msgs
+   in [(Coordinate pid vs i, msg) | (i, msg) <- imsgs]
 
 newtype TopicWatch = TopicWatch {unTopicWatch :: [FutureIO PartitionId]}
   deriving (Show)
@@ -368,32 +448,6 @@ watchTopicIO db topic = do
   ws <- runTransaction db (watchTopic topic)
   awaitTopic ws
 
--- | A checkpoint consists of a versionstamp, indicating which key we last read
--- from, and an integer. The integer is an index inside of the list of
--- bytestrings stored at the versionstamp key, indicating the last bytestring we
--- read within that key.
---
--- Recall that we pack multiple messages into each FDB key/value pair using a
--- chunking scheme (see 'desiredChunkSizeBytes'). So when the reader of the
--- topic asks for the next n messages, the batch of messages might stop in the
--- middle of a chunk. Thus, we need to remember where within the chunk we
--- stopped. This of course has the downside that we transmit some extra data
--- on each read and throw it away, but the hope is that the efficiency gain of
--- packing more data into each key/value pair makes up for it.
---
--- For example, if our topic key/values look like
---
--- @k1, [b0, b1, b2]@
--- @k2, [b0, b1, b2]@
--- @k3, [b0, b1, b2]@
---
--- Where each k is a versionstamp key and each b is a message within that key's
--- value (chunk), then if the current checkpoint is (k2, 1), we have already
--- seen all messages up to and including k2,b1. The next batch of messages we
--- read will start at k2,b2.
-data Checkpoint = Checkpoint (Versionstamp 'Complete) Int
-  deriving (Show, Eq, Ord, Bounded)
-
 checkpoint ::
   Topic ->
   PartitionId ->
@@ -440,25 +494,28 @@ getCheckpoints topic rn = do
   let pids = Seq.fromList [0 .. numPartitions topic - 1]
   sequenceA <$> traverse (\pid -> getCheckpoint' topic pid rn) pids
 
--- | Read n messages past the given checkpoint. The message pointed to by the
--- checkpoint is not included in the results -- remember that checkpoints point
--- at the last message acknowledged to have been read.
--- Returns a sequence of messages, and a Checkpoint pointing at the last
--- message in that sequence.
--- WARNING: wrapping readNPastCheckpoint with 'withSnapshot' breaks the
--- exactly-once guarantee.
--- TODO: in some cases this will return a checkpoint that points at the last
--- message of a chunk. In that case, when we read again, we unnecessarily read
--- that key again, even though there are no more unread messages in it. Could we
--- make Checkpoint a sum type that can encode when we should only read the next
--- key, not including the one of the current checkpoint?
-readNPastCheckpoint ::
+-- | Read n messages past 'ReaderName''s current checkpoint. Does not update the
+-- checkpoint.
+peekNPastCheckpoint ::
+  -- The message pointed to by the
+  -- checkpoint is not included in the results -- remember that checkpoints point
+  -- at the last message acknowledged to have been read.
+  -- Returns a sequence of messages, and a Checkpoint pointing at the last
+  -- message in that sequence.
+  -- WARNING: wrapping peekNPastCheckpoint with 'withSnapshot' breaks the
+  -- exactly-once guarantee.
+  -- TODO: in some cases this will return a checkpoint that points at the last
+  -- message of a chunk. In that case, when we read again, we unnecessarily read
+  -- that key again, even though there are no more unread messages in it. Could we
+  -- make Checkpoint a sum type that can encode when we should only read the next
+  -- key, not including the one of the current checkpoint?
+
   Topic ->
   PartitionId ->
   ReaderName ->
   Word16 ->
-  Transaction (Seq (Checkpoint, ByteString))
-readNPastCheckpoint topic pid rn n = do
+  Transaction (Seq (Coordinate, ByteString))
+peekNPastCheckpoint topic pid rn n = do
   ckpt@(Checkpoint cpvs _) <- getCheckpoint topic pid rn
   let begin = FDB.pack (partitionMsgsSS topic pid) [FDB.CompleteVS cpvs]
   let end = prefixRangeEnd $ FDB.subspaceKey (partitionMsgsSS topic pid)
@@ -472,12 +529,12 @@ readNPastCheckpoint topic pid rn n = do
         }
   rr <- FDB.withSnapshot (FDB.getRange' r FDB.StreamingModeSmall) >>= FDB.await
   streamlyRangeResult rr
-    -- Parse bytestrings to Stream of chunks: Stream [(Checkpoint, ByteString)]
-    & fmap (topicKVToCheckpointMessage topic pid)
-    -- flatten chunks into top-level stream: Stream (Checkpoint, ByteString)
+    -- Parse bytestrings to Stream of chunks: Stream [(Coordinate, ByteString)]
+    & fmap (topicKVToCoordinateMessage topic pid)
+    -- flatten chunks into top-level stream: Stream (Coordinate, ByteString)
     & S.concatMap S.fromFoldable
     -- Drop msgs that we have already processed
-    & S.dropWhile ((<= ckpt) . fst)
+    & S.dropWhile ((<= ckpt) . coordinateToCheckpoint . fst)
     -- take the requested number of msgs
     & S.take (fromIntegral n)
     & S.toList
@@ -485,19 +542,35 @@ readNPastCheckpoint topic pid rn n = do
 
 -- | Read N messages from the given topic partition. These messages are guaranteed
 -- to be previously unseen for the given ReaderName, and will be checkpointed so
---that they are never seen again.
+-- that they are never seen again.
 readNAndCheckpoint ::
   Topic ->
   PartitionId ->
   ReaderName ->
   Word16 ->
-  Transaction (Seq (Checkpoint, ByteString))
+  Transaction (Seq (Coordinate, ByteString))
 readNAndCheckpoint topic@Topic {..} p rn n =
-  readNPastCheckpoint topic p rn n >>= \case
-    x@(_ :|> (ckpt, _)) -> do
-      checkpoint topic p rn ckpt
+  peekNPastCheckpoint topic p rn n >>= \case
+    x@(_ :|> (coord, _)) -> do
+      checkpoint topic p rn (coordinateToCheckpoint coord)
       return x
     x -> return x
+
+-- | Given a 'Coordinate' pointing at a message, get that message. See 'writeTopic'
+-- for more details on how to get a coordinate to pass to this function. Returns
+-- 'Nothing' if the message does not exist in the topic. If that happens,
+-- perhaps you passed a coordinate from one topic to another topic.
+-- Note: there is probably no need for further optimization to support the use
+-- case of fetching many Coordinates that are packed into the same key/value
+-- pair, because the FDB client already caches reads of the same key within a
+-- transaction.
+get :: Topic -> Coordinate -> Transaction (FDB.Future (Maybe ByteString))
+get Topic {msgsSS} (Coordinate pid vs i) = do
+  let k = FDB.pack msgsSS [FDB.Int $ fromIntegral pid, FDB.CompleteVS vs]
+  fv <- FDB.get k
+  return $ fmap (fmap getFrom) fv
+  where
+    getFrom bs = (!! i) $ parseTopicV bs
 
 -- | Read N messages from a random partition of the given topic, and checkpoints
 -- so that they will never be seen by the same reader again.
@@ -506,7 +579,7 @@ readNAndCheckpointIO ::
   Topic ->
   ReaderName ->
   Word16 ->
-  IO (Seq (Checkpoint, ByteString))
+  IO (Seq (Coordinate, ByteString))
 readNAndCheckpointIO db topic@Topic {..} rn n = do
   p <- randPartition topic
   FDB.runTransaction db (readNAndCheckpoint topic p rn n)
@@ -526,5 +599,5 @@ getEntireTopic topic@Topic {..} = do
             rangeLimit = Nothing,
             rangeReverse = False
           }
-    (pid,) . fmap (parseTopicKV topic pid) <$> FDB.getEntireRange r
+    (pid,) . fmap (parseTopicKV topic) <$> FDB.getEntireRange r
   return $ Map.fromList partitions

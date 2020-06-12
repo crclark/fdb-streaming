@@ -1,3 +1,4 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
 
@@ -152,11 +153,11 @@ import Control.Monad (replicateM, void)
 import Control.Monad.IO.Class (liftIO)
 import Data.Foldable (for_)
 import Data.Maybe (fromMaybe, isJust)
-import Data.Word (Word16, Word8)
+import Data.Word (Word8)
 import qualified FDBStreaming.JobConfig as JC
 import FDBStreaming.Message (Message (fromMessage, toMessage))
-import FDBStreaming.Stream (Stream, StreamName)
-import FDBStreaming.Stream.Internal (streamFromTopic, setStreamWatermarkByTopic)
+import FDBStreaming.Stream (Stream, StreamName, StreamPersisted (FDB))
+import FDBStreaming.Stream.Internal (setStreamWatermarkByTopic, streamFromTopic)
 import FDBStreaming.Topic (makeTopic, randPartition, topicCustomMetadataSS, writeTopic)
 import FDBStreaming.Util.BatchWriter (BatchWriter, BatchWriterConfig, batchWriter, defaultBatchWriterConfig)
 import FDBStreaming.Watermark (Watermark, setWatermark, topicWatermarkSS)
@@ -168,14 +169,18 @@ import qualified FoundationDB.Layer.Tuple as FDB
 -- messages to it from outside the pipeline system.
 data PushStreamConfig inMsg
   = PushStreamConfig
-      { pushStreamWatermarkBy :: Maybe (inMsg -> Transaction Watermark),
+      { -- | A watermarking function for the inputs to the stream.
+        pushStreamWatermarkBy :: Maybe (inMsg -> Transaction Watermark),
         -- TODO: reuse StepConfig for options below?
-        pushStreamOutputPartitions :: Maybe Word8,
-        pushStreamBatchSize :: Maybe Word16
+
+        -- | Number of partitions in the Topic that the elements of the stream
+        -- will be persisted to. If Nothing, the default in the 'JobConfig' will
+        -- be used.
+        pushStreamOutputPartitions :: Maybe Word8
       }
 
 defaultPushStreamConfig :: PushStreamConfig a
-defaultPushStreamConfig = PushStreamConfig Nothing Nothing Nothing
+defaultPushStreamConfig = PushStreamConfig Nothing Nothing
 
 -- | Set up a stream that messages can be pushed to from outside the pipeline.
 -- Returns the stream and a set of BatchWriters for writing to it. The stream
@@ -192,17 +197,19 @@ runPushStream ::
   BatchWriterConfig ->
   -- | Number of batch writers to create
   Word ->
-  IO (Stream inMsg, [BatchWriter inMsg])
+  IO (Stream 'FDB inMsg, [BatchWriter inMsg])
 runPushStream jc sn ps bwc bn = do
   let numPartitions =
         fromMaybe
           (JC.defaultNumPartitions jc)
           (pushStreamOutputPartitions ps)
   let topic = makeTopic (JC.jobConfigSS jc) sn numPartitions (JC.defaultChunkSizeBytes jc)
-  let stream = (if isJust (pushStreamWatermarkBy ps)
-                   then setStreamWatermarkByTopic
-                   else id)
-                 $ streamFromTopic topic sn
+  let stream =
+        ( if isJust (pushStreamWatermarkBy ps)
+            then setStreamWatermarkByTopic
+            else id
+        )
+          $ streamFromTopic topic sn
   let writeBatch xs = do
         for_ (pushStreamWatermarkBy ps) $ \wf -> case xs of
           (x : _) -> do
@@ -220,8 +227,7 @@ runPushStream' ::
   Message inMsg =>
   JC.JobConfig ->
   StreamName ->
-  IO (Stream inMsg, BatchWriter inMsg)
+  IO (Stream 'FDB inMsg, BatchWriter inMsg)
 runPushStream' jc sn =
   fmap head <$> runPushStream jc sn defaultPushStreamConfig defaultBatchWriterConfig 1
-
 -- TODO: pushAggrTable interface.

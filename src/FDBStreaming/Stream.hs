@@ -1,16 +1,28 @@
-module FDBStreaming.Stream (
-  Stream,
-  StreamName,
-  isStreamWatermarked,
-  getStreamWatermark,
-  customStream
-) where
-
-import FDBStreaming.Stream.Internal
-  (
-    Stream,
+module FDBStreaming.Stream
+  ( Stream,
+    StreamPersisted (External, FDB),
     StreamName,
     isStreamWatermarked,
     getStreamWatermark,
-    customStream
+    customStream,
+    streamTopic,
+    maybeStreamTopic,
+    streamName,
+    streamWatermarkSS,
+    streamFromTopic,
+  )
+where
+
+import FDBStreaming.Stream.Internal
+  ( Stream,
+    StreamName,
+    StreamPersisted (External, FDB),
+    customStream,
+    getStreamWatermark,
+    isStreamWatermarked,
+    maybeStreamTopic,
+    streamFromTopic,
+    streamName,
+    streamTopic,
+    streamWatermarkSS,
   )
