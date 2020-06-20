@@ -2,6 +2,7 @@
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedLists #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
@@ -17,11 +18,13 @@ import Data.Either (fromRight)
 import Data.Maybe (catMaybes)
 import Data.Persist (Persist)
 import qualified Data.Persist as Persist
+import qualified Data.Set as Set
 import Data.Traversable (for)
-import FDBStreaming (Index, Message (fromMessage, toMessage), MonadStream, Stream, StreamPersisted (FDB), indexBy, pipe', run, streamTopic)
+import FDBStreaming (Index, Message (fromMessage, toMessage), MonadStream, Stream, StreamPersisted (FDB), indexBy, pipe', run, streamTopic, oneToOneJoin)
 import qualified FDBStreaming.Index as Index
+import qualified FDBStreaming.JobConfig as JC
 import FDBStreaming.TableKey (TableKey)
-import FDBStreaming.Testing (testJobConfig, testOnInput)
+import FDBStreaming.Testing (testJobConfig, testOnInput, testOnInput2, dumpStream)
 import FDBStreaming.Topic (Topic)
 import qualified FDBStreaming.Topic as Topic
 import qualified FoundationDB as FDB
@@ -34,7 +37,7 @@ import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit ((@?=), testCase)
 
 data TestMsg = TestMsg {payload :: ByteString, k1 :: ByteString, k2 :: ByteString}
-  deriving (Eq, Show, Generic, Persist)
+  deriving (Eq, Show, Ord, Generic, Persist)
 
 instance Message TestMsg where
 
@@ -102,5 +105,46 @@ indexTest testSS db = testCase "index job" $ do
   msgs23 <- fmap fromMessage <$> indexGetAllTopic db ix2 "3" outTopic
   fmap payload msgs23 @?= ["bye1" :: ByteString]
 
+oneToOneSelfJoinJob ::
+  forall m. MonadStream m =>
+  Stream 'FDB TestMsg ->
+  m (Stream 'FDB (TestMsg, TestMsg))
+oneToOneSelfJoinJob input =
+  oneToOneJoin "out" input input payload payload (,)
+
+oneToOneSelfJoinTest :: Subspace -> Database -> TestTree
+oneToOneSelfJoinTest testSS db = testCase "oneToOneSelfJoin" $ do
+  ss <- extendRand testSS
+  let testInputs = [ TestMsg "joinKey1" "1" "2"
+                   , TestMsg "joinKey2" "5" "6"
+                   , TestMsg "joinKey3" "5" "6"]
+  outStream <- testOnInput (testJobConfig db ss) testInputs oneToOneSelfJoinJob
+  results <- Set.fromList <$> dumpStream db outStream
+  length results @?= 3
+  Set.map (payload . fst) results @?= ["joinKey1", "joinKey2", "joinKey3"]
+
+oneToOneJoinJob ::
+  forall m. MonadStream m =>
+  Stream 'FDB TestMsg ->
+  Stream 'FDB TestMsg ->
+  m (Stream 'FDB (TestMsg, TestMsg))
+oneToOneJoinJob l r = do
+  oneToOneJoin "out" l r payload payload (,)
+
+oneToOneJoinTest :: Subspace -> Database -> TestTree
+oneToOneJoinTest testSS db = testCase "oneToOneJoin" $ do
+  ss <- extendRand testSS
+  let in1 = [ TestMsg "k1" "1" "2"
+            , TestMsg "k2" "5" "6"
+            , TestMsg "k3" "7" "8"]
+  let in2 = [ TestMsg "k1" "1" "3"
+            , TestMsg "k2" "5" "7"
+            , TestMsg "k3" "7" "9"]
+  outStream <- testOnInput2 ((testJobConfig db ss) {JC.msgsPerBatch = 1}) in1 in2 oneToOneJoinJob
+  results <- Set.fromList <$> dumpStream db outStream
+  results @?= Set.fromList (zip in1 in2)
+
 jobTests :: Subspace -> Database -> TestTree
-jobTests testSS db = testGroup "Jobs" [indexTest testSS db]
+jobTests testSS db = testGroup "Jobs" [indexTest testSS db,
+                                       oneToOneSelfJoinTest testSS db,
+                                       oneToOneJoinTest testSS db]

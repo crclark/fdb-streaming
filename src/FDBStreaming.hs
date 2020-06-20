@@ -259,7 +259,9 @@ import qualified FDBStreaming.AggrTable as AT
 import qualified FDBStreaming.Index as Ix
 import FDBStreaming.JobConfig (JobConfig (JobConfig, defaultChunkSizeBytes, defaultNumPartitions, jobConfigDB, jobConfigSS, leaseDuration, logLevel, msgsPerBatch, numPeriodicJobThreads, numStreamThreads, streamMetricsStore), JobSubspace)
 import FDBStreaming.Joins
-  ( delete1to1JoinData,
+  ( OneToOneJoinSS,
+    oneToOneJoinSS,
+    delete1to1JoinData,
     get1to1JoinData,
     write1to1JoinData,
   )
@@ -782,8 +784,8 @@ oneToOneJoin' ::
   (a -> b -> d) ->
   StreamStep d (Stream 'FDB d)
 oneToOneJoin' inl inr pl pr j =
-  let lstep = \topic -> oneToOneJoinStep topic 0 pl j
-      rstep = \topic -> oneToOneJoinStep topic 1 pr (flip j)
+  let lstep = \workSS -> oneToOneJoinStep (oneToOneJoinSS workSS) 0 pl j
+      rstep = \workSS -> oneToOneJoinStep (oneToOneJoinSS workSS) 1 pr (flip j)
    in StreamProcessor
         ( if isStreamWatermarked inl && isStreamWatermarked inr
             then DefaultWatermark
@@ -1217,7 +1219,7 @@ throttleByErrors metrics sn x =
               threadDelay 15000
             Error (MaxRetriesExceeded (CError NotCommitted)) -> do
               incrConflicts metrics
-              logWarn (showText sn <> " conflicted with another transaction. If this happens frequently, it may be a bug in fdb-streaming.")
+              logWarn (showText sn <> " conflicted with another transaction. If this happens frequently, it may be a bug in fdb-streaming. If this step is a join, occasional conflicts are expected and shouldn't impact performance.")
               threadDelay 15000
             e -> throw e
         ),
@@ -1284,7 +1286,7 @@ pipeStep
 oneToOneJoinStep ::
   forall a1 a2 b c.
   (Message a1, Message a2, Message c) =>
-  FDB.Subspace ->
+  OneToOneJoinSS->
   -- | Index of the stream being consumed. 0 for left side of
   -- join, 1 for right. This will be refactored to support
   -- n-way joins in the future.
@@ -1299,12 +1301,27 @@ oneToOneJoinStep joinSS streamJoinIx pl combiner ckptmsgs = do
   -- join table to see if the partner is already there. If so, write the tuple
   -- downstream. If not, write the one message we do have to the join table.
   -- TODO: think of a way to garbage collect items that never get joined.
-  let sn = "1:1"
   let otherIx = if streamJoinIx == 0 then 1 else 0
   joinFutures <-
     for ckptmsgs \(_, msg) -> do
       let k = pl msg
-      joinF <- withSnapshot $ get1to1JoinData joinSS sn otherIx k
+      -- TODO: this algorithm can cause conflicts if both sides of the join are
+      -- processed at exactly the same time. We originally used a snapshot read
+      -- here, but that was incorrect -- if both messages for a key are
+      -- processed simultaneously, they miss each other and get stuck forever.
+      -- It's possible that this isn't a big problem -- perhaps it will reach an
+      -- equilibrium where one side of the join is a little behind the other.
+      -- The other alternative is to add a partitionByKey operation before the
+      -- join step. It would hash the key of each message, modulate that hash
+      -- and use it to choose which partition to write the message downstream
+      -- to. This would ensure that all messages that will be joined together
+      -- are thrown in the same partition. However, that could easily be slower
+      -- than occasional conflicts -- we'd need to write every message to FDB
+      -- again. OTOH, there is a lot of opportunity for avoiding a lot of writes
+      -- in joins if we do that -- we could even conceivably hold join state in
+      -- the memory of the join processor, or send messages by some other
+      -- mechanism than FDB.
+      joinF <- get1to1JoinData joinSS otherIx k
       return (k, msg, joinF)
   joinData <- for joinFutures \(k, msg, joinF) -> do
     d <- await joinF
@@ -1312,10 +1329,10 @@ oneToOneJoinStep joinSS streamJoinIx pl combiner ckptmsgs = do
   fmap catMaybes $ for joinData \(k, lmsg, d) -> do
     case d of
       Just (rmsg :: a2) -> do
-        delete1to1JoinData joinSS sn k
+        delete1to1JoinData joinSS k
         return $ Just $ combiner lmsg rmsg
       Nothing -> do
-        write1to1JoinData joinSS sn k streamJoinIx (lmsg :: a1)
+        write1to1JoinData joinSS k streamJoinIx (lmsg :: a1)
         return Nothing
 
 aggregateStep ::

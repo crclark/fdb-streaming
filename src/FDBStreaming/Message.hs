@@ -70,6 +70,10 @@ class Message a where
   -- thread.
   fromMessage :: ByteString -> a
 
+instance Message ByteString where
+  toMessage = id
+  fromMessage = id
+
 instance Message Void where
 
   toMessage = absurd
