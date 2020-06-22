@@ -21,6 +21,100 @@ import FoundationDB.Layer.Tuple (Elem (Bytes, Int))
 newtype OneToOneJoinSS = OneToOneJoinSS Subspace
   deriving (Show, Eq, Ord)
 
+{-
+There is a potential for conflicts in the one-to-one join design. The current
+algorithm is:
+
+1. Read a batch of messages
+2. Compute the join key of each message
+3. Look in FDB to see if the other message(s) for this key is already in the
+   join storage (key: join key, join side id (0 left, 1 right); value: message).
+   a. If it is, join the two messages and write downstream.
+   b. If it is not, write the one message we do have to join storage.
+
+This works nicely to minimize reads, but it can conflict. Imagine that both
+messages for a key k are processed at the same time by threads A and B. Then
+they both perform the following operations from the algorithm above.
+
+1.
+2.
+3.b.
+
+But if they both do that, then the joined message will never be written
+downstream! Luckily, serializability saves us. One of the two transactions will
+conflict, because the read in step 3. is reading a key that the other
+transaction is writing.
+
+So is there some other algorithm that is conflict-free and always makes
+progress? One method I have thought of is to separate the "staging" step (where
+we write to join storage) from the "flushing" step (where we write downstream).
+
+How could this work?
+
+Staging algorithm:
+
+1. Read a batch of messages
+2. Compute the join key of each message
+3. Write the message into join storage. Same key/value format as above.
+4. Write another key that signals to the flusher that this join key needs to be
+   checked for completeness. This is basically a topic all over again. Key
+   format would be (versionstamp, join key).
+
+Flushing algorithm:
+
+1. Read a checkpoint of how far into the flush queue we have already read.
+2. Read n flush signals past that checkpoint.
+3. For each flush signal's join key, range read the join storage for the join
+   key. If all n messages (or message pointers if we want to save space) are
+   present, we can flush. If not, we will check it again the next time a flush
+   signal is received for that key.
+4. Update the checkpoint.
+
+This has pros and cons:
+
+pros: no conflicts, potential to partition the joining work by join key,
+      join key computation and joining computation scale separately.
+cons: more serial reads, more workers (meaning more threads needed).
+
+How does the number of reads for each algorithm compare? Use + to mean
+potentially concurrent reads, and ⊞ to mean we must block before proceeding to
+the next read. Let k be the batch size. Let p be the probability of conflict.
+Let n be the arity of the join. We further subscript a variable with _random if
+the reads are separate random-access reads rather than a contiguous range read.
+
+Current algorithm:
+
+E(reads_curr) = k ⊞ n*k_random ⊞ p*reads_curr
+
+the last term is meant to signify that we must retry the entire transaction if
+a conflict occurs. It's not entirely precise, because we will never need to
+retry more than k times (because the other join worker will eventually have
+written all the corresponding messages on the other side of the join). I've
+never seen more than one retry in practice.
+
+So we can simplify with the assumption that there will be only one retry and
+say
+
+E(reads_curr) = k ⊞ n*k_random ⊞ p*(k ⊞ n*k_random)
+
+Proposed algorithm:
+
+reads_staging_proposed = k
+reads_flushing_proposed = 1 ⊞ k ⊞ n*k_random
+
+So, from a latency perspective, we have an additional blocking read to get the
+checkpoint, and an additional range read of length k.
+
+From a practical point of view, we can also think of this as adding an entire
+extra stream processing step to the pipeline compared to the old implementation.
+Is guaranteed progress worth the extra read/write and thread overhead?
+
+Given the apparently low probability of conflict, I currently think the answer
+is no. If the probability were 50% or higher, then it would be worth switching
+to the new algorithm. Perhaps we will find a workload in the future where the
+probability is that high. At that time, we should implement the new algorithm.
+-}
+
 oneToOneJoinSS :: Subspace -> OneToOneJoinSS
 oneToOneJoinSS prefixSS = OneToOneJoinSS $ extend prefixSS [C.oneToOneJoin]
 
@@ -58,3 +152,42 @@ get1to1JoinData joinSS upstreamIx k = do
   let key = pack ss [Int $ fromIntegral upstreamIx]
   f <- get key
   return (fmap (fmap fromMessage) f)
+
+{-
+One-to-many joins. In this case, we have stream l and r. Each message in l must
+be joined to many messages in r, and each message in r must be joined to exactly
+one message in l.
+
+There are a few cases when we are consuming these two streams.
+
+l cases:
+1. We receive a new message and there are no r-messages waiting for it. We write
+   the l-message to the l-message store.
+2. We receive a new message and there are r-messages waiting for it. We write
+   the l-message to the l-message store, and we write it to the list of
+   l-messages whose backlogs need to be flushed downstream.
+
+r cases:
+1. We receive a new r-message and there is no l-message waiting for it. We write
+   the r-message to the l's message backlog.
+2. We receive a new r-message and there is an l-message waiting for it. We
+   immediately write the joined pair downstream.
+
+These two workers' tasks are straightforward. The interesting part, however, is
+how to work through a large backlog of r-messages. There could be a huge number,
+so it can't be done in one transaction. We have a list of l-messages with
+backlogs, so what this backlog worker should do is:
+
+1. Read the first item of the l-messages-with-backlogs list.
+2. Read and delete a chunk of its backlog.
+3. Join up the part of the backlog that was read, and write it downstream.
+4. If the read of the backlog chunk was empty, delete the item from the list of
+   l-messages-with-backlogs.
+
+Open questions:
+
+1. Should this work be done as part of the l or r transaction, or as a totally
+   separate transactional job?
+2.
+
+-}
