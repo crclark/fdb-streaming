@@ -35,6 +35,7 @@ library
       FDBStreaming.Index,
       FDBStreaming.JobConfig
       FDBStreaming.Joins,
+      FDBStreaming.Joins.OneToMany,
       FDBStreaming.Util,
       FDBStreaming.Util.BatchWriter,
       FDBStreaming.Watermark,
