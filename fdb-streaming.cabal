@@ -119,6 +119,7 @@ test-suite fdb-streaming-test
       Spec.FDBStreaming.Util.BatchWriter
       Spec.FDBStreaming.Topic
       Spec.FDBStreaming.Index
+      Spec.FDBStreaming.Joins.OneToMany
   hs-source-dirs:
       test
   ghc-options: -threaded -rtsopts -with-rtsopts=-N -Wall -g

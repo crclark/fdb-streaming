@@ -60,6 +60,7 @@ import GHC.Natural (Natural)
 -- Laws:
 --
 -- prop> fromMessage (toMessage x) == x
+-- prop>  toMessage x == toMessage y iff x == y
 class Message a where
 
   -- | Serialize a message.

@@ -2,29 +2,34 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE TypeApplications #-}
 
 module FDBStreaming.Joins.OneToMany where
 
 import Control.Monad (when)
+import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Foldable (for_)
+import qualified Data.Set as Set
+import qualified Data.Map as Map
+import qualified Data.Sequence as Seq
 import Data.Sequence (Seq ((:<|), (:|>), Empty))
 import Data.Traversable (for)
 import Data.Word (Word16)
-import FDBStreaming.JobConfig (PartitionCount)
 import FDBStreaming.Message (Message (fromMessage, toMessage))
 import FDBStreaming.Topic (PartitionId)
 import qualified FDBStreaming.Topic.Constants as C
 import qualified FoundationDB as FDB
-import FoundationDB (Future, Range (Range, rangeBegin), Transaction, atomicOp, clear, clearRange, get, getKey, rangeKeys, set)
+import FoundationDB (Future, Range (Range, rangeBegin), Transaction, atomicOp, clear, clearRange, get, getKey, set)
 import qualified FoundationDB.Layer.Subspace as FDB
 import FoundationDB.Layer.Subspace (Subspace, extend, pack, rawPrefix, subspaceRange, subspaceRange)
 import FoundationDB.Layer.Tuple (Elem (Bytes, CompleteVS, IncompleteVS, Int))
 import qualified FoundationDB.Options.MutationType as Mut
-import FoundationDB.Versionstamp
-  ( TransactionVersionstamp (TransactionVersionstamp),
-    Versionstamp (CompleteVersionstamp, IncompleteVersionstamp),
+import FoundationDB.Versionstamp (
+    Versionstamp (IncompleteVersionstamp),
   )
+import GHC.Exts (IsList (fromList, toList))
+import Data.Maybe (catMaybes)
 
 {-
 One-to-many joins. In this case, we have streams l and r.
@@ -128,14 +133,14 @@ rBacklogSS :: Message k => OneToManyJoinSS -> k -> Subspace
 rBacklogSS (OneToManyJoinSS ss) k =
   extend ss [C.oneToManyJoinBacklog, Bytes (toMessage k)]
 
-setRBacklogMessage ::
+addRBacklogMessage ::
   (Message k, Message r) =>
   OneToManyJoinSS ->
   k ->
   r ->
   Word16 ->
   Transaction ()
-setRBacklogMessage ss k r n = do
+addRBacklogMessage ss k r n = do
   let rSS = rBacklogSS ss k
   let vs = IncompleteVersionstamp n
   let kbs = pack rSS [IncompleteVS vs]
@@ -228,22 +233,25 @@ addFlushableBackloggedKey ss pid k =
 -- | Get an arbitrary key for which a backlog of r-messages exists, and for
 -- which an l-message exists in lStoreSS. Returns
 -- Nothing if no backlogged keys exist.
+-- For performance and type ambiguity reasons, does not parse the key. Relies on
+-- the fact that toMessage for ByteStrings is id.
 getArbitraryFlushableBackloggedKey ::
-  Message k =>
   OneToManyJoinSS ->
   PartitionId ->
-  -- TODO: parsing to a key may actually be unnecessary.
-  Transaction (Future (Maybe k))
+  Transaction (Future (Maybe ByteString))
 getArbitraryFlushableBackloggedKey ss pid = do
   let backloggedSS = flushableBackloggedKeysSS ss pid
   let Range {rangeBegin} = subspaceRange backloggedSS
   -- TODO: if this is too much load on one key, we could randomly select either
   -- the begin or end of the range to get a key.
   f <- getKey rangeBegin
+  let prefix = rawPrefix backloggedSS
   let f' = flip fmap f $ \bs ->
-        if BS.isPrefixOf (rawPrefix backloggedSS) bs
-          then Just $ fromMessage bs
-          else Nothing
+        case (BS.isPrefixOf prefix bs, FDB.unpack backloggedSS bs) of
+          (False, _) -> Nothing
+          (True, Left err) -> error $ "error decoding backlog key: " ++ show err
+          (True, Right [Bytes kbs]) -> Just kbs
+          (True, Right _) -> error "Failed to unpack backlog key in getArbitraryFlushableBackloggedKey"
   return f'
 
 -- | Remove a key from the set of flushable backlogged keys.
@@ -274,3 +282,55 @@ lMessageJob ss pid f ls = do
   for_ backlogExistencePerKey $
     \future -> FDB.await future
       >>= \case (k, exists) -> when exists (addFlushableBackloggedKey ss pid k)
+
+-- | The "main" function for the job that processes r-messages. See the long
+-- comment above for more details.
+rMessageJob ::
+  (Message k, Message l, Message r) =>
+  OneToManyJoinSS ->
+  (r -> k) ->
+  [r] ->
+  (l -> r -> Transaction c) ->
+  Transaction [c]
+rMessageJob ss toKey rs joinFn = do
+  -- NOTE: this code is a bit ugly because I want to avoid an Eq constraint
+  -- on k. To avoid it, I use the Message instance to use equality on the keys
+  -- instead. This also saves some redundant toMessage calls by exploiting the
+  -- fact that toMessage for ByteString is 'id'.
+  let rsWithKeyBytes = map (\r -> (r, toMessage $ toKey r)) rs
+  let keyBytesToFetch = fromList @ (Set.Set ByteString)
+                        $ map snd rsWithKeyBytes
+  -- TODO: do we have a conflict with lMessageJob here between setLStoreMsg
+  -- and getLStoreMsg?
+  lStoreMsgFutures <- for (toList keyBytesToFetch)
+                      $ \kbs -> (kbs,) <$> getLStoreMsg ss kbs
+  lStoreMsgs <- fmap fromMessage . Map.fromList . catMaybes
+                <$> for lStoreMsgFutures
+                    (\(k, fl) -> fmap (k,) <$> FDB.await fl)
+  fmap catMaybes $ for (zip rsWithKeyBytes [0..]) $ \((r, kbs), i) ->
+    case Map.lookup kbs lStoreMsgs of
+      Nothing -> addRBacklogMessage ss kbs (toMessage r) i >> return Nothing
+      Just l -> Just <$> joinFn l r
+
+-- | The main function for the job that flushes backlogged r-messages.
+flushBacklogJob ::
+  (Message l, Message r) =>
+  OneToManyJoinSS ->
+  PartitionId ->
+  (l -> r -> Transaction c) ->
+  Int -> --batch size
+  Transaction [c]
+flushBacklogJob ss pid joinFn batchSize =
+  getArbitraryFlushableBackloggedKey ss pid >>= FDB.await >>= \case
+    Nothing -> return []
+    Just flushableKey -> do
+      lf <- getLStoreMsg ss flushableKey
+      rs <- getAndDeleteRBacklogMessages ss flushableKey batchSize
+      FDB.await lf >>= \case
+        -- if l has not been written yet, the key is not flushable, so it
+        -- shouldn't have been returned by getArbitraryFlushableBackloggedKey.
+        Nothing -> error "impossible case in flushBacklogJob"
+        Just l -> do
+          when (Seq.null rs) (removeFlushableBackloggedKey ss pid flushableKey)
+          joined <- for rs (joinFn l)
+          return $ toList joined

@@ -13,6 +13,7 @@ import Spec.FDBStreaming.Topic (topicTests)
 import Spec.FDBStreaming.Util (utilProps)
 import Spec.FDBStreaming.Util.BatchWriter (batchWriterTests)
 import Spec.FDBStreaming.Watermark (watermarks)
+import Spec.FDBStreaming.Joins.OneToMany (oneToManyJoinTests)
 import Test.Tasty
 
 testSS :: Subspace
@@ -34,7 +35,8 @@ allTests db =
       batchWriterTests testSS db,
       indexTests testSS db,
       utilProps,
-      jobTests testSS db
+      jobTests testSS db,
+      oneToManyJoinTests testSS db
     ]
 
 main :: IO ()
