@@ -503,7 +503,7 @@ registerDefaultWatermarker ::
   TaskRegistry ->
   DefaultWatermarker a ->
   IO ()
-registerDefaultWatermarker cfg@(JobConfig {jobConfigDB = db}) taskReg x = do
+registerDefaultWatermarker cfg@JobConfig {jobConfigDB = db} taskReg x = do
   let job = snd $ State.execState (runDefaultWatermarker x) (cfg, return ())
   runStreamTxn db $ addTask taskReg "dfltWM" 1 \_ _ -> job
 

@@ -13,27 +13,12 @@ module Spec.FDBStreaming.Joins.OneToMany
 where
 
 import Data.Maybe (isJust, isNothing, fromJust)
-import Control.Monad ((>=>), void)
-import Data.ByteString (ByteString)
-import qualified Data.ByteString.Char8 as BS
-import Data.Foldable (for_)
-import Data.Maybe (catMaybes, fromJust)
-import Data.Traversable (for)
-import Data.Word (Word64)
-import qualified FDBStreaming.Index as Index
-import FDBStreaming.TableKey (OrdTableKey, TableKey)
-import FDBStreaming.Topic (Topic)
 import FDBStreaming.Message (Message (fromMessage))
 import qualified FDBStreaming.Joins.OneToMany as OTM
-import qualified FDBStreaming.Topic as Topic
 import qualified FoundationDB as FDB
-import FoundationDB (Database, await, runTransaction)
-import FoundationDB.Layer.Subspace (Subspace)
+import FoundationDB (runTransaction)
 import qualified FoundationDB.Layer.Subspace as FDB
-import qualified FoundationDB.Layer.Tuple as FDB
-import qualified FoundationDB.Versionstamp as FDB
 import Spec.FDBStreaming.Util (extendRand)
-import qualified Streamly.Prelude as S
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit ((@?=), assertBool, testCase)
 
@@ -66,13 +51,13 @@ flushableBackloggedKeys testSS db = testCase "flushableBackloggedKeys" $ do
   noKey <- runTransaction db $ OTM.getArbitraryFlushableBackloggedKey ss 0 >>= FDB.await
   noKey @?= Nothing
 
-  addFlushableBackloggedKey <- runTransaction db $ OTM.addFlushableBackloggedKey ss 0 k
+  runTransaction db $ OTM.addFlushableBackloggedKey ss 0 k
 
   result <- runTransaction db $ OTM.getArbitraryFlushableBackloggedKey ss 0 >>= FDB.await
   assertBool "got flushable key" (isJust result)
   fromMessage (fromJust result) @?= k
 
-  removeFlushableBackloggedKey <- runTransaction db $ OTM.removeFlushableBackloggedKey ss 0 k
+  runTransaction db $ OTM.removeFlushableBackloggedKey ss 0 k
 
   result2 <- runTransaction db $ OTM.getArbitraryFlushableBackloggedKey ss 0 >>= FDB.await
   assertBool "didn't get flushable key" (isNothing result2)
