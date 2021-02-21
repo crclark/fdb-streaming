@@ -61,6 +61,9 @@ data StreamStepConfig
 defaultStreamStepConfig :: StreamStepConfig
 defaultStreamStepConfig = StreamStepConfig Nothing Nothing
 
+-- TODO: instead of the Maybe in batchInStream, we should really have two
+-- constructors for BatchProcessor.
+
 -- | Contains all the information we need to pull data out of a stream and
 -- transform it. Uses an existential so that we can more easily implement
 -- joins and other operations that pull from multiple streams. This type is an
@@ -73,7 +76,12 @@ data BatchProcessor b
     -- GHC bug: https://gitlab.haskell.org/ghc/ghc/issues/15991
     forall a r.
     BatchProcessor
-      { batchInStream :: Stream r a,
+      { -- | The input stream that this processor reads from. Some processors
+        -- do not read from a stream -- instead, they only work on the internal
+        -- state used by the stream step they take part in. Garbage collection,
+        -- flushing join data, etc. are examples of such cases. In those cases,
+        -- batchInStream will be 'Nothing'.
+        batchInStream :: Maybe (Stream r a),
         -- | A batch processing function takes a batch of messages as input, along
         -- with a subspace in which it can store any state it needs to persist to
         -- operate or communicate. This subspace is shared among all batch
@@ -81,17 +89,48 @@ data BatchProcessor b
         -- within a step to communicate. For example, this is used to store
         -- temporary data for joins -- one BatchProcessor is responsible for the
         -- left side of the join, the other is responsible for the right side.
-        processBatch :: Subspace -> Seq (Maybe Coordinate, a) -> Transaction (Seq b)
+        -- If your processor does not take input (batchInStream is Nothing),
+        -- this function will be passed an empty sequence.
+        processBatch :: Subspace -> Seq (Maybe Coordinate, a) -> Transaction (Seq b),
+        -- | Number of distinct partitions (threads) that this processor should
+        -- run on concurrently.
+        batchNumPartitions :: Word8
       }
 
--- | Returns the watermarkSS function from the underlying stream.
-batchProcessorInputWatermarkSS :: BatchProcessor b -> Maybe (JobSubspace -> WatermarkSS)
-batchProcessorInputWatermarkSS (BatchProcessor i _) = streamWatermarkSS i
+-- | Datatype describing the outputs of batchProcessorInputWatermarkSS.
+data BatchProcessorInputWatermarkSS =
+  BatchProcessorHasNoInput
+  | BatchProcessorInputNotWatermarked
+  | BatchProcessorInputWatermarkSS (JobSubspace -> WatermarkSS)
 
--- | Returns a topic if the input stream to this batch processor is persisted
--- inside FoundationDB as a 'Topic'.
+batchProcessorHasInput :: BatchProcessor a -> Bool
+batchProcessorHasInput (BatchProcessor (Just _) _ _) = True
+batchProcessorHasInput _ = False
+
+isBatchProcessorInputWatermarked :: BatchProcessor a -> Bool
+isBatchProcessorInputWatermarked x = case batchProcessorInputWatermarkSS x of
+  BatchProcessorInputWatermarkSS _ -> True
+  _ -> False
+
+-- | Returns the watermarkSS function from the underlying stream of the given
+-- batch processor. There are three cases: the batch processor has no input,
+-- or the batch procesor input is not watermarked, or the input is watermarked,
+-- in which case we return the function that creates the WatermarkSS for that
+-- input.
+batchProcessorInputWatermarkSS
+  :: BatchProcessor b
+  -> BatchProcessorInputWatermarkSS
+batchProcessorInputWatermarkSS (BatchProcessor Nothing _ _) = BatchProcessorHasNoInput
+batchProcessorInputWatermarkSS (BatchProcessor (Just i) _ _) =
+  maybe
+    BatchProcessorInputNotWatermarked
+    BatchProcessorInputWatermarkSS (streamWatermarkSS i)
+
+-- | Returns a topic if this batch processor has an input stream, and that
+-- input stream is persisted in FDB.
 batchProcessorInputTopic :: BatchProcessor b -> Maybe Topic
-batchProcessorInputTopic (BatchProcessor i _) = maybeStreamTopic i
+batchProcessorInputTopic (BatchProcessor (Just i) _ _) = maybeStreamTopic i
+batchProcessorInputTopic (BatchProcessor Nothing _ _) = Nothing
 
 data Indexer outMsg
   = forall k.

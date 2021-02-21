@@ -302,7 +302,6 @@ import FDBStreaming.StreamStep.Internal
       ),
     StreamStepConfig (StreamStepConfig),
     batchProcessorInputTopic,
-    batchProcessorInputWatermarkSS,
     consIndexer,
     defaultStreamStepConfig,
     getStepConfig,
@@ -322,6 +321,8 @@ import FDBStreaming.StreamStep.Internal
     watermarkBy,
     withBatchSize,
     withOutputPartitions,
+    batchProcessorHasInput,
+    isBatchProcessorInputWatermarked
   )
 import FDBStreaming.TaskLease (TaskName (TaskName), secondsSinceEpoch)
 import FDBStreaming.TaskRegistry as TaskRegistry
@@ -529,9 +530,9 @@ defaultWatermarkUpstreamTopics sn StreamProcessor {streamProcessorBatchProcessor
   -- 4. Is the input a stream inside FoundationDB? If not, we can't get the
   --    checkpoint for this reader that corresponds to a point in the
   --    watermark function.
-  let wmSSs = map batchProcessorInputWatermarkSS streamProcessorBatchProcessors
-      topics = map batchProcessorInputTopic streamProcessorBatchProcessors
-   in if all isJust wmSSs && all isJust topics
+  let withInput = filter batchProcessorHasInput streamProcessorBatchProcessors
+      topics = map batchProcessorInputTopic withInput
+   in if all isBatchProcessorInputWatermarked withInput && all isJust topics
         then
           Just $
             zip
@@ -676,7 +677,10 @@ atLeastOnce sn input f = void $ do
     StreamProcessor
       { streamProcessorWatermarkBy = NoWatermark,
         streamProcessorBatchProcessors =
-          [BatchProcessor input (\_ xs -> mapM (liftIO . f . snd) xs)],
+          [BatchProcessor
+            (Just input)
+            (\_ xs -> mapM (liftIO . f . snd) xs)
+            (fromIntegral $ streamMinReaderPartitions input)],
         streamProcessorIndexers = [],
         streamProcessorStreamStepConfig = defaultStreamStepConfig
       }
@@ -693,7 +697,6 @@ atLeastOnce sn input f = void $ do
 pipe ::
   (Message b, MonadStream m) =>
   StepName ->
-  -- TODO: don't really understand why I need to add this forall here.
   Stream t a ->
   (a -> IO (Maybe b)) ->
   m (Stream 'FDB b)
@@ -715,7 +718,10 @@ pipe' input f =
           then DefaultWatermark
           else NoWatermark,
       streamProcessorBatchProcessors =
-        [BatchProcessor input (\_ xs -> fmap catMaybes $ mapM (liftIO . f . snd) xs)],
+        [BatchProcessor
+          (Just input)
+          (\_ xs -> fmap catMaybes $ mapM (liftIO . f . snd) xs)
+          (fromIntegral $ streamMinReaderPartitions input)],
       streamProcessorIndexers = [],
       streamProcessorStreamStepConfig = defaultStreamStepConfig
     }
@@ -744,7 +750,7 @@ eventualIndexBy sn f stream = do
   (_s :: Stream 'FDB ()) <- run sn $ StreamProcessor
     { streamProcessorWatermarkBy = NoWatermark,
       streamProcessorBatchProcessors =
-        [BatchProcessor stream ixer],
+        [BatchProcessor (Just stream) ixer (fromIntegral $ streamMinReaderPartitions stream)],
       streamProcessorIndexers = [],
       streamProcessorStreamStepConfig = defaultStreamStepConfig
     }
@@ -791,13 +797,11 @@ oneToOneJoin' inl inr pl pr j =
             then DefaultWatermark
             else NoWatermark
         )
-        [ BatchProcessor inl lstep,
-          BatchProcessor inr rstep
+        [ BatchProcessor (Just inl) lstep (fromIntegral $ streamMinReaderPartitions inl),
+          BatchProcessor (Just inr) rstep (fromIntegral $ streamMinReaderPartitions inr)
         ]
         []
         defaultStreamStepConfig
-
--- TODO: implement one-to-many joins in terms of this?
 
 -- | Assigns each element of a stream to zero or more buckets. The contents of
 -- these buckets can be monoidally reduced by 'aggregate' and 'aggregate''.
@@ -861,8 +865,11 @@ makeStream stepName streamName step = do
       )
     $ streamFromTopic topic streamName
 
-forEachPartition :: Monad m => Stream t a -> (PartitionId -> m ()) -> m ()
+forEachPartition :: Applicative m => Stream t a -> (PartitionId -> m ()) -> m ()
 forEachPartition s = for_ [0 .. fromIntegral $ streamMinReaderPartitions s - 1]
+
+forEachPartition' :: (Applicative m, Integral a) => a -> (PartitionId -> m ()) -> m ()
+forEachPartition' x = for_ [0 .. fromIntegral x - 1]
 
 -- | An implementation of the streaming system that uses distributed leases to
 -- ensure mutual exclusion for each worker process. This reduces DB conflicts
@@ -1015,19 +1022,29 @@ instance MonadStream LeaseBasedStreamWorker where
             zip
               streamProcessorBatchProcessors
               [sn <> BS8.pack (show i) | i <- [(0 :: Int) ..]]
-      for_ processorsWStepNames \(BatchProcessor inStream processBatch, sn_i) -> do
-        let checkpointSS =
-              streamConsumerCheckpointSS
-                (jobConfigSS cfg)
-                inStream
-                sn_i
+      for_ processorsWStepNames \(BatchProcessor mInStream processBatch numBatchPartitions, sn_i) -> do
         let job pid _stillValid _release =
               -- NOTE: we must use a case here to do the pattern match to work around a
               -- GHC limitation. In 8.6, let gives a very confusing error message about
               -- variables escaping their scopes. In 8.8, it gives a more helpful
               -- "my brain just exploded" message that says to use a case statement.
-              case getStream' inStream of
-                Stream' streamReadAndCheckpoint _ _ _ setUpState destroyState ->
+              case fmap getStream' mInStream of
+
+                -- Case 1: This job has no input stream, but does produce
+                -- output.
+                Nothing ->
+                  doForSeconds (leaseDuration cfg)
+                    $ void
+                    $ throttleByErrors metrics sn_i
+                    $ runStreamTxn jobConfigDB
+                    $ runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy
+                    $ runIndexers streamProcessorIndexers outTopic
+                    $ writeToRandomPartition outTopic
+                    $ addLength
+                    $ processBatch workspaceSS mempty
+
+                -- Case 2: this job has an input stream, and produces output.
+                Just (Stream' streamReadAndCheckpoint _ _ _ setUpState destroyState) ->
                   bracket
                     (runStreamTxn jobConfigDB $ setUpState cfg sn_i pid checkpointSS)
                     destroyState
@@ -1038,18 +1055,28 @@ instance MonadStream LeaseBasedStreamWorker where
                         $ runStreamTxn jobConfigDB
                         $ runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy
                         $ runIndexers streamProcessorIndexers outTopic
-                        $ pipeStep
+                        $ writeToRandomPartition outTopic
+                        $ transformBatch (processBatch workspaceSS)
+                        $ addLength
+                        $ recordInputBatchMetrics metrics
+                        $ streamReadAndCheckpoint
                           cfg
-                          streamProcessorStreamStepConfig
-                          inStream
-                          streamReadAndCheckpoint
-                          state
-                          outTopic
                           sn_i
-                          (processBatch workspaceSS)
-                          metrics
                           pid
-        forEachPartition inStream $ \pid -> do
+                          checkpointSS
+                          (getMsgsPerBatch cfg streamProcessorStreamStepConfig)
+                          state
+                  where checkpointSS =
+                          streamConsumerCheckpointSS
+                           (jobConfigSS cfg)
+                           inStream
+                           sn_i
+                        -- proved safe above. TODO: refactor to eliminate.
+                        inStream = fromJust mInStream
+
+                -- TODO: case 3: no input and no output.
+
+        forEachPartition' numBatchPartitions $ \pid -> do
           let taskName = mkTaskName sn_i pid
           taskReg <- taskRegistry
           liftIO
@@ -1238,50 +1265,56 @@ throttleByErrors metrics sn x =
       recordBatchLatency metrics timeMillis
       when (numConsumed == 0) (threadDelay 1000000)
 
--- TODO: pipeStep just does a few miscellaneous things. Destroy it.
+-- TODO: the next few functions were split apart from one large messy function.
+-- Their types are partially lies -- they don't really need to take Transactions
+-- as input, and they pass along an Int that many of them don't use. This needs
+-- to be further refactored and simplified.
+-- =======================================
 
--- | Returns number of messages consumed from upstream, and
--- new messages to send downstream.
-pipeStep ::
-  (Message b) =>
-  JobConfig ->
-  StreamStepConfig ->
-  Stream t a ->
-  (StreamReadAndCheckpoint a state) ->
-  state ->
-  Topic ->
-  StepName ->
-  (Seq (Maybe Topic.Coordinate, a) -> Transaction (Seq b)) ->
-  Maybe StreamEdgeMetrics ->
-  PartitionId ->
-  Transaction (Int, Seq (Topic.CoordinateUncommitted, b))
-pipeStep
-  jobCfg
-  stepCfg
-  inStream
-  readAndCheckpoint
-  state
-  outCfg
-  sn
-  transformBatch
-  metrics
-  pid = do
-    let checkpointSS = streamConsumerCheckpointSS (jobConfigSS jobCfg) inStream sn
-    inMsgs <-
-      readAndCheckpoint
-        jobCfg
-        sn
-        pid
-        checkpointSS
-        (getMsgsPerBatch jobCfg stepCfg)
-        state
-    liftIO $ when (Seq.null inMsgs) (incrEmptyBatchCount metrics)
-    liftIO $ recordMsgsPerBatch metrics (Seq.length inMsgs)
-    ys <- transformBatch inMsgs
-    let outMsgs = fmap toMessage ys
-    p' <- liftIO $ randPartition outCfg
-    coords <- writeTopic outCfg p' (toList outMsgs)
-    return (length inMsgs, (Seq.zip (Seq.fromList coords) ys))
+
+-- | Utility function to record metrics for an input batch of messages.
+-- Returns the sequence of input messages unchanged.
+recordInputBatchMetrics ::
+  MonadIO m
+  => (Maybe StreamEdgeMetrics)
+  -> m (Seq (Maybe Topic.Coordinate, a))
+  -> m (Seq (Maybe Topic.Coordinate, a))
+recordInputBatchMetrics metrics getMsgs = do
+  inMsgs <- getMsgs
+  liftIO $ when (Seq.null inMsgs) (incrEmptyBatchCount metrics)
+  liftIO $ recordMsgsPerBatch metrics (Seq.length inMsgs)
+  return inMsgs
+
+addLength :: Monad m => m (Seq a) -> m (Int, Seq a)
+addLength m = do
+  xs <- m
+  return (length xs, xs)
+
+-- | Utility function to write output messages to a random partition of
+-- the given topic. Returns the written messages unchanged.
+writeToRandomPartition ::
+  Message b
+  => Topic
+  -> Transaction (Int, Seq b)
+  -> Transaction (Int, Seq (Topic.CoordinateUncommitted, b))
+writeToRandomPartition outTopic getInput = do
+  (numInputMsgs, outputMsgs) <- getInput
+  let outMsgs = fmap toMessage outputMsgs
+  p' <- liftIO $ randPartition outTopic
+  coords <- writeTopic outTopic p' (toList outMsgs)
+  return (numInputMsgs, (Seq.zip (Seq.fromList coords) outputMsgs))
+
+transformBatch ::
+  (Seq (Maybe Topic.Coordinate, a) -> Transaction (Seq b))
+  -> Transaction (Int, Seq (Maybe Topic.Coordinate, a))
+  -> Transaction (Int, Seq b)
+transformBatch f getBatch = do
+  (n, xs) <- getBatch
+  ys <- f xs
+  return (n, ys)
+
+-- END stupid functions that need to be refactored.
+-- ===============================================
 
 oneToOneJoinStep ::
   forall a1 a2 b c.

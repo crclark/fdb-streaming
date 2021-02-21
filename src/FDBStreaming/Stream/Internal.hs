@@ -233,9 +233,13 @@ customStream readBatch minThreads wmFn streamName' setUp destroy =
         }
    in ExternalStream stream
 
+-- | Creates a subspace in which a consumer can checkpoint their progress.
 streamConsumerCheckpointSS ::
+  -- | Subspace containing the entire job.
   JobSubspace ->
+  -- | input stream that we are checkpointing the consumption of.
   Stream t a ->
+  -- | Name of the reader who is consuming from the input stream.
   ReaderName ->
   FDB.Subspace
 streamConsumerCheckpointSS jobSS stream rn = case stream of

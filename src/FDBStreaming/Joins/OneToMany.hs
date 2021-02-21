@@ -313,6 +313,7 @@ rMessageJob ss toKey rs joinFn = do
       Just l -> Just <$> joinFn l r
 
 -- | The main function for the job that flushes backlogged r-messages.
+-- NOTE: this must be run with the same number of partitions as lMessageJob.
 flushBacklogJob ::
   (Message l, Message r) =>
   OneToManyJoinSS ->
