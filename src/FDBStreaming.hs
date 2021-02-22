@@ -4,8 +4,6 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE InstanceSigs #-}
-{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -13,9 +11,7 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE TypeOperators #-}
 
 -- | FDBStreaming is a poorly-named, work-in-progress, proof-of-concept library
 -- for large-scale processing of unbounded data sets and sources. It is inspired
@@ -199,6 +195,7 @@ module FDBStreaming
     atLeastOnce,
     pipe,
     oneToOneJoin,
+    oneToManyJoin,
 
     -- * Indexing stream contents
     indexBy,
@@ -220,6 +217,7 @@ module FDBStreaming
     withOutputPartitions,
     pipe',
     oneToOneJoin',
+    oneToManyJoin',
     aggregate',
 
     -- * Advanced Usage
@@ -242,10 +240,10 @@ import Control.Logger.Simple (LogConfig (LogConfig), logError, logInfo, logWarn,
 import Control.Monad (forever, replicateM, void, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Identity (Identity)
-import qualified Control.Monad.Reader as Reader
 import Control.Monad.Reader (MonadReader, ReaderT)
-import qualified Control.Monad.State.Strict as State
+import qualified Control.Monad.Reader as Reader
 import Control.Monad.State.Strict (MonadState, StateT)
+import qualified Control.Monad.State.Strict as State
 import qualified Data.ByteString.Char8 as BS8
 import Data.Foldable (for_, toList)
 import Data.Maybe (fromJust, fromMaybe, isJust)
@@ -260,11 +258,12 @@ import qualified FDBStreaming.Index as Ix
 import FDBStreaming.JobConfig (JobConfig (JobConfig, defaultChunkSizeBytes, defaultNumPartitions, jobConfigDB, jobConfigSS, leaseDuration, logLevel, msgsPerBatch, numPeriodicJobThreads, numStreamThreads, streamMetricsStore), JobSubspace)
 import FDBStreaming.Joins
   ( OneToOneJoinSS,
-    oneToOneJoinSS,
     delete1to1JoinData,
     get1to1JoinData,
+    oneToOneJoinSS,
     write1to1JoinData,
   )
+import qualified FDBStreaming.Joins.OneToMany as OTM
 import FDBStreaming.Message (Message (fromMessage, toMessage))
 import FDBStreaming.Stream.Internal
   ( Stream,
@@ -285,7 +284,7 @@ import FDBStreaming.Stream.Internal
     streamWatermarkSS,
   )
 import FDBStreaming.StreamStep.Internal
-  ( BatchProcessor (BatchProcessor),
+  ( BatchProcessor (BatchProcessor, batchInStream, batchNumPartitions, processBatch),
     --tableProcessorGroupedBy,
     --tableProcessorAggregation,
     --tableProcessorWatermarkBy,
@@ -301,6 +300,7 @@ import FDBStreaming.StreamStep.Internal
         TableProcessor
       ),
     StreamStepConfig (StreamStepConfig),
+    batchProcessorHasInput,
     batchProcessorInputTopic,
     consIndexer,
     defaultStreamStepConfig,
@@ -310,6 +310,7 @@ import FDBStreaming.StreamStep.Internal
     indexedStreamProcessorIndexBy,
     indexedStreamProcessorIndexName,
     indexedStreamProcessorInner,
+    isBatchProcessorInputWatermarked,
     isStepDefaultWatermarked,
     stepBatchSize,
     stepOutputPartitions,
@@ -321,8 +322,6 @@ import FDBStreaming.StreamStep.Internal
     watermarkBy,
     withBatchSize,
     withOutputPartitions,
-    batchProcessorHasInput,
-    isBatchProcessorInputWatermarked
   )
 import FDBStreaming.TaskLease (TaskName (TaskName), secondsSinceEpoch)
 import FDBStreaming.TaskRegistry as TaskRegistry
@@ -350,8 +349,8 @@ import FDBStreaming.Watermark
     setWatermark,
     topicWatermarkSS,
   )
-import qualified FoundationDB as FDB
 import FoundationDB (Transaction, await, withSnapshot)
+import qualified FoundationDB as FDB
 import FoundationDB.Error as FDB
   ( CError (NotCommitted, TransactionTimedOut),
     Error (CError, Error),
@@ -461,8 +460,7 @@ benignIO g stream = case getStream' stream of
       xs <- rc cfg rn pid ss n state
       -- NOTE: functions like this must always be run after checkpointing, or
       -- we could filter out the last message we see and make no progress forever.
-      xs' <- flip witherM xs $ \(c, x) -> (fmap (c,)) <$> liftIO (g x)
-      return xs'
+      flip witherM xs $ \(c, x) -> fmap (c,) <$> liftIO (g x)
     where
       build x = Stream' x np wmSS streamName setUp destroy
 
@@ -677,10 +675,11 @@ atLeastOnce sn input f = void $ do
     StreamProcessor
       { streamProcessorWatermarkBy = NoWatermark,
         streamProcessorBatchProcessors =
-          [BatchProcessor
-            (Just input)
-            (\_ xs -> mapM (liftIO . f . snd) xs)
-            (fromIntegral $ streamMinReaderPartitions input)],
+          [ BatchProcessor
+              (Just input)
+              (\_ss _pid xs -> mapM (liftIO . f . snd) xs)
+              (fromIntegral $ streamMinReaderPartitions input)
+          ],
         streamProcessorIndexers = [],
         streamProcessorStreamStepConfig = defaultStreamStepConfig
       }
@@ -718,10 +717,11 @@ pipe' input f =
           then DefaultWatermark
           else NoWatermark,
       streamProcessorBatchProcessors =
-        [BatchProcessor
-          (Just input)
-          (\_ xs -> fmap catMaybes $ mapM (liftIO . f . snd) xs)
-          (fromIntegral $ streamMinReaderPartitions input)],
+        [ BatchProcessor
+            (Just input)
+            (\_ss _pid xs -> catMaybes <$> mapM (liftIO . f . snd) xs)
+            (fromIntegral $ streamMinReaderPartitions input)
+        ],
       streamProcessorIndexers = [],
       streamProcessorStreamStepConfig = defaultStreamStepConfig
     }
@@ -741,19 +741,21 @@ eventualIndexBy sn f stream = do
   let ix = Ix.namedIndex topic sn
   -- TODO: we seem to need a StreamSink type for side effects that don't
   -- write downstream.
-  let ixer _ batch = do
+  let ixer _ss _pid batch = do
         for_ batch $ \case
           (Just coord, x) -> for_ (f x) \k -> do
             Ix.indexCommitted ix k coord
           (Nothing, _) -> return ()
         return mempty
-  (_s :: Stream 'FDB ()) <- run sn $ StreamProcessor
-    { streamProcessorWatermarkBy = NoWatermark,
-      streamProcessorBatchProcessors =
-        [BatchProcessor (Just stream) ixer (fromIntegral $ streamMinReaderPartitions stream)],
-      streamProcessorIndexers = [],
-      streamProcessorStreamStepConfig = defaultStreamStepConfig
-    }
+  (_s :: Stream 'FDB ()) <-
+    run sn $
+      StreamProcessor
+        { streamProcessorWatermarkBy = NoWatermark,
+          streamProcessorBatchProcessors =
+            [BatchProcessor (Just stream) ixer (fromIntegral $ streamMinReaderPartitions stream)],
+          streamProcessorIndexers = [],
+          streamProcessorStreamStepConfig = defaultStreamStepConfig
+        }
   return ix
 
 -- | Streaming one-to-one join. If the relationship is not actually one-to-one
@@ -790,8 +792,8 @@ oneToOneJoin' ::
   (a -> b -> d) ->
   StreamStep d (Stream 'FDB d)
 oneToOneJoin' inl inr pl pr j =
-  let lstep = \workSS -> oneToOneJoinStep (oneToOneJoinSS workSS) 0 pl j
-      rstep = \workSS -> oneToOneJoinStep (oneToOneJoinSS workSS) 1 pr (flip j)
+  let lstep = \workSS _pid -> oneToOneJoinStep (oneToOneJoinSS workSS) 0 pl j
+      rstep = \workSS _pid -> oneToOneJoinStep (oneToOneJoinSS workSS) 1 pr (flip j)
    in StreamProcessor
         ( if isStreamWatermarked inl && isStreamWatermarked inr
             then DefaultWatermark
@@ -803,17 +805,96 @@ oneToOneJoin' inl inr pl pr j =
         []
         defaultStreamStepConfig
 
+-- Streaming one-to-many join. Each message in the left stream may be joined
+-- to arbtrarily many messages in the right stream. However, each message in
+-- the right stream may only be assigned to one message in the left stream.
+-- In other words, the keying function for the left stream must be injective,
+-- but the right keying function need not be injective.
+oneToManyJoin ::
+  (Message a, Message b, Message c, Message d, MonadStream m) =>
+  StepName ->
+  Stream t1 a ->
+  Stream t2 b ->
+  (a -> c) ->
+  (b -> c) ->
+  (a -> b -> d) ->
+  m (Stream 'FDB d)
+oneToManyJoin sn inl inr pl pr j =
+  run sn $ oneToManyJoin' inl inr pl pr j
+
+-- Like 'oneToManyJoin', but returns a 'StreamStep', which can be further
+-- customized before being passed to 'run'.
+oneToManyJoin' ::
+  (Message a, Message b, Message c, Message d) =>
+  Stream t1 a ->
+  Stream t2 b ->
+  (a -> c) ->
+  (b -> c) ->
+  (a -> b -> d) ->
+  StreamStep d (Stream 'FDB d)
+oneToManyJoin' inl inr pl pr j =
+  let watermarker =
+        if isStreamWatermarked inl && isStreamWatermarked inr
+          then DefaultWatermark
+          else NoWatermark
+      joinFn = (\l r -> return (j l r))
+      lstep =
+        BatchProcessor
+          { batchInStream = Just inl,
+            -- TODO: looks like we also need a BatchProcessor type that doesn't produce output to avoid needless work.
+            -- then we can remove `>> return mempty` here.
+            processBatch = \workSS pid lmsgs ->
+                             OTM.lMessageJob (OTM.oneToManyJoinSS workSS)
+                                             pid
+                                             pl
+                                             (fmap snd lmsgs)
+                             >> return mempty,
+            batchNumPartitions = fromIntegral $ streamMinReaderPartitions inl
+          }
+      rstep =
+        BatchProcessor
+          { batchInStream = Just inr,
+            processBatch = \workSS _pid rmsgs ->
+                             OTM.rMessageJob (OTM.oneToManyJoinSS workSS)
+                                             pr
+                                             (fmap snd rmsgs)
+                                             joinFn,
+            batchNumPartitions = fromIntegral $ streamMinReaderPartitions inr
+          }
+      flushBacklog =
+        BatchProcessor
+          { batchInStream = Nothing,
+            -- TODO: pass job config into processBatch, too? Need batch size
+            -- info to replace the 256 magic number below.
+            processBatch = \workSS pid _msgs ->
+                             OTM.flushBacklogJob (OTM.oneToManyJoinSS workSS)
+                                                 pid
+                                                 joinFn
+                                                 256,
+            batchNumPartitions = fromIntegral $ streamMinReaderPartitions inl
+          }
+   in StreamProcessor
+        { streamProcessorWatermarkBy = watermarker,
+          streamProcessorBatchProcessors =
+            [ lstep,
+              rstep,
+              flushBacklog
+            ],
+          streamProcessorIndexers = [],
+          streamProcessorStreamStepConfig = defaultStreamStepConfig
+        }
+
 -- | Assigns each element of a stream to zero or more buckets. The contents of
 -- these buckets can be monoidally reduced by 'aggregate' and 'aggregate''.
 groupBy ::
   (v -> [k]) ->
   Stream t v ->
-  (GroupedBy k v)
+  GroupedBy k v
 groupBy k t = GroupedBy t k
 
 -- | Given a grouped stream created by 'groupBy', convert all values in each
 -- bucket into a monoidal value, then monoidally combine them. The result is
--- an 'AT.AggrTable' data structure in FoundationDB.
+-- an 'AT.AggrTable' data structure stored in FoundationDB.
 aggregate ::
   (Ord k, AT.TableKey k, AT.TableSemigroup aggr, MonadStream m) =>
   StepName ->
@@ -992,8 +1073,9 @@ outputTopic stepName IndexedStreamProcessor {indexedStreamProcessorInner} =
   outputTopic stepName indexedStreamProcessorInner
 outputTopic stepName step@StreamProcessor {} = do
   jc <- getJobConfig
-  return $ Just $
-    makeTopic
+  return
+    $ Just
+    $ makeTopic
       (jobConfigSS jc)
       stepName
       (getStepNumPartitions jc (getStepConfig step))
@@ -1029,7 +1111,6 @@ instance MonadStream LeaseBasedStreamWorker where
               -- variables escaping their scopes. In 8.8, it gives a more helpful
               -- "my brain just exploded" message that says to use a case statement.
               case fmap getStream' mInStream of
-
                 -- Case 1: This job has no input stream, but does produce
                 -- output.
                 Nothing ->
@@ -1041,8 +1122,7 @@ instance MonadStream LeaseBasedStreamWorker where
                     $ runIndexers streamProcessorIndexers outTopic
                     $ writeToRandomPartition outTopic
                     $ addLength
-                    $ processBatch workspaceSS mempty
-
+                    $ processBatch workspaceSS pid mempty
                 -- Case 2: this job has an input stream, and produces output.
                 Just (Stream' streamReadAndCheckpoint _ _ _ setUpState destroyState) ->
                   bracket
@@ -1056,7 +1136,7 @@ instance MonadStream LeaseBasedStreamWorker where
                         $ runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy
                         $ runIndexers streamProcessorIndexers outTopic
                         $ writeToRandomPartition outTopic
-                        $ transformBatch (processBatch workspaceSS)
+                        $ transformBatch (processBatch workspaceSS pid)
                         $ addLength
                         $ recordInputBatchMetrics metrics
                         $ streamReadAndCheckpoint
@@ -1066,15 +1146,15 @@ instance MonadStream LeaseBasedStreamWorker where
                           checkpointSS
                           (getMsgsPerBatch cfg streamProcessorStreamStepConfig)
                           state
-                  where checkpointSS =
-                          streamConsumerCheckpointSS
-                           (jobConfigSS cfg)
-                           inStream
-                           sn_i
-                        -- proved safe above. TODO: refactor to eliminate.
-                        inStream = fromJust mInStream
-
-                -- TODO: case 3: no input and no output.
+                  where
+                    checkpointSS =
+                      streamConsumerCheckpointSS
+                        (jobConfigSS cfg)
+                        inStream
+                        sn_i
+                    -- proved safe above. TODO: refactor to eliminate.
+                    inStream = fromJust mInStream
+        -- TODO: case 3: no input and no output.
 
         forEachPartition' numBatchPartitions $ \pid -> do
           let taskName = mkTaskName sn_i pid
@@ -1271,14 +1351,13 @@ throttleByErrors metrics sn x =
 -- to be further refactored and simplified.
 -- =======================================
 
-
 -- | Utility function to record metrics for an input batch of messages.
 -- Returns the sequence of input messages unchanged.
 recordInputBatchMetrics ::
-  MonadIO m
-  => (Maybe StreamEdgeMetrics)
-  -> m (Seq (Maybe Topic.Coordinate, a))
-  -> m (Seq (Maybe Topic.Coordinate, a))
+  MonadIO m =>
+  (Maybe StreamEdgeMetrics) ->
+  m (Seq (Maybe Topic.Coordinate, a)) ->
+  m (Seq (Maybe Topic.Coordinate, a))
 recordInputBatchMetrics metrics getMsgs = do
   inMsgs <- getMsgs
   liftIO $ when (Seq.null inMsgs) (incrEmptyBatchCount metrics)
@@ -1293,10 +1372,10 @@ addLength m = do
 -- | Utility function to write output messages to a random partition of
 -- the given topic. Returns the written messages unchanged.
 writeToRandomPartition ::
-  Message b
-  => Topic
-  -> Transaction (Int, Seq b)
-  -> Transaction (Int, Seq (Topic.CoordinateUncommitted, b))
+  Message b =>
+  Topic ->
+  Transaction (Int, Seq b) ->
+  Transaction (Int, Seq (Topic.CoordinateUncommitted, b))
 writeToRandomPartition outTopic getInput = do
   (numInputMsgs, outputMsgs) <- getInput
   let outMsgs = fmap toMessage outputMsgs
@@ -1305,9 +1384,9 @@ writeToRandomPartition outTopic getInput = do
   return (numInputMsgs, (Seq.zip (Seq.fromList coords) outputMsgs))
 
 transformBatch ::
-  (Seq (Maybe Topic.Coordinate, a) -> Transaction (Seq b))
-  -> Transaction (Int, Seq (Maybe Topic.Coordinate, a))
-  -> Transaction (Int, Seq b)
+  (Seq (Maybe Topic.Coordinate, a) -> Transaction (Seq b)) ->
+  Transaction (Int, Seq (Maybe Topic.Coordinate, a)) ->
+  Transaction (Int, Seq b)
 transformBatch f getBatch = do
   (n, xs) <- getBatch
   ys <- f xs
@@ -1319,7 +1398,7 @@ transformBatch f getBatch = do
 oneToOneJoinStep ::
   forall a1 a2 b c.
   (Message a1, Message a2, Message c) =>
-  OneToOneJoinSS->
+  OneToOneJoinSS ->
   -- | Index of the stream being consumed. 0 for left side of
   -- join, 1 for right. This will be refactored to support
   -- n-way joins in the future.
@@ -1418,17 +1497,25 @@ runJob
     logInfo "Starting main loop"
     -- Run threads for continuously-running stream steps
     (_pureResult, continuousTaskReg) <- registerContinuousLeases cfg topology
-    continuousThreads <- replicateM numStreamThreads $ async $ forever $ logErrors "Continuous job" $
-      runRandomTask jobConfigDB continuousTaskReg >>= \case
-        False -> threadDelay (leaseDuration cfg * 1000000 `div` 2)
-        True -> return ()
+    continuousThreads <-
+      replicateM numStreamThreads
+        $ async
+        $ forever
+        $ logErrors "Continuous job"
+        $ runRandomTask jobConfigDB continuousTaskReg >>= \case
+          False -> threadDelay (leaseDuration cfg * 1000000 `div` 2)
+          True -> return ()
     -- Run threads for periodic jobs (watermarking, cleanup, etc)
     periodicTaskReg <- TaskRegistry.empty (periodicTaskRegSS cfg)
     registerDefaultWatermarker cfg periodicTaskReg topology
-    periodicThreads <- replicateM numPeriodicJobThreads $ async $ forever $ logErrors "Periodic job" $
-      runRandomTask jobConfigDB periodicTaskReg >>= \case
-        False -> threadDelay 1000000
-        True -> return ()
+    periodicThreads <-
+      replicateM numPeriodicJobThreads
+        $ async
+        $ forever
+        $ logErrors "Periodic job"
+        $ runRandomTask jobConfigDB periodicTaskReg >>= \case
+          False -> threadDelay 1000000
+          True -> return ()
     _ <- waitAny (continuousThreads ++ periodicThreads)
     return ()
 

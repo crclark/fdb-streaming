@@ -20,7 +20,7 @@ import FDBStreaming.Index (Index, IndexName)
 import FDBStreaming.JobConfig (JobSubspace)
 import FDBStreaming.Message (Message)
 import FDBStreaming.Stream.Internal (Stream, StreamPersisted (FDB), maybeStreamTopic, streamWatermarkSS)
-import FDBStreaming.Topic (Coordinate, Topic)
+import FDBStreaming.Topic (Coordinate, Topic, PartitionId)
 import FDBStreaming.Watermark
   ( Watermark,
     WatermarkBy (CustomWatermark),
@@ -91,7 +91,7 @@ data BatchProcessor b
         -- left side of the join, the other is responsible for the right side.
         -- If your processor does not take input (batchInStream is Nothing),
         -- this function will be passed an empty sequence.
-        processBatch :: Subspace -> Seq (Maybe Coordinate, a) -> Transaction (Seq b),
+        processBatch :: Subspace -> PartitionId -> Seq (Maybe Coordinate, a) -> Transaction (Seq b),
         -- | Number of distinct partitions (threads) that this processor should
         -- run on concurrently.
         batchNumPartitions :: Word8
@@ -150,14 +150,15 @@ data StreamStep outMsg runResult where
     (Indexable c, Message b, AT.TableKey k) =>
     { indexedStreamProcessorInner :: StreamStep b c,
       indexedStreamProcessorIndexName :: IndexName,
-      indexedStreamProcessorIndexBy :: (b -> [k])
+      indexedStreamProcessorIndexBy :: b -> [k]
     } ->
     StreamStep b
       (Index k, c)
   StreamProcessor ::
     Message b =>
     { streamProcessorWatermarkBy :: WatermarkBy b,
-      --TODO: we should probably move all the logic in 'pipeStep' into
+      --TODO: we should probably move all the logic in the small wrappers in
+      -- FDBStreaming.hs like 'runIndexers', 'writeToRandomPartition', etc into
       -- the batch processors, with a default value of StreamProcessor for 'pipe'. Then
       -- add a function to compose more behavior onto this function. There's no
       -- reason I can see that pipeStep and this callback both need to exist.

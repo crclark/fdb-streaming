@@ -4,7 +4,22 @@
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
 
-module FDBStreaming.Joins.OneToMany where
+module FDBStreaming.Joins.OneToMany (
+  oneToManyJoinSS,
+  OneToManyJoinSS,
+  lMessageJob,
+  rMessageJob,
+  flushBacklogJob,
+  -- * Exported for tests only
+  setLStoreMsg,
+  getLStoreMsg,
+  existsRBacklog,
+  addRBacklogMessage,
+  getAndDeleteRBacklogMessages,
+  getArbitraryFlushableBackloggedKey,
+  addFlushableBackloggedKey,
+  removeFlushableBackloggedKey
+) where
 
 import Control.Monad (when)
 import Data.ByteString (ByteString)
@@ -15,6 +30,7 @@ import qualified Data.Map as Map
 import qualified Data.Sequence as Seq
 import Data.Sequence (Seq ((:<|), (:|>), Empty))
 import Data.Traversable (for)
+import Data.Witherable.Class (catMaybes)
 import Data.Word (Word16)
 import FDBStreaming.Message (Message (fromMessage, toMessage))
 import FDBStreaming.Topic (PartitionId)
@@ -29,7 +45,6 @@ import FoundationDB.Versionstamp (
     Versionstamp (IncompleteVersionstamp),
   )
 import GHC.Exts (IsList (fromList, toList))
-import Data.Maybe (catMaybes)
 
 {-
 One-to-many joins. In this case, we have streams l and r.
@@ -271,12 +286,12 @@ lMessageJob ::
   OneToManyJoinSS ->
   PartitionId ->
   (l -> k) ->
-  [l] ->
+  Seq l ->
   Transaction ()
 lMessageJob ss pid f ls = do
   for_ ls $ \l -> do
     setLStoreMsg ss (f l) l
-  backlogExistencePerKey <- for (map f ls) $ \k -> do
+  backlogExistencePerKey <- for (fmap f ls) $ \k -> do
     b <- existsRBacklog ss k
     return (fmap (k,) b)
   for_ backlogExistencePerKey $
@@ -289,17 +304,18 @@ rMessageJob ::
   (Message k, Message l, Message r) =>
   OneToManyJoinSS ->
   (r -> k) ->
-  [r] ->
+  Seq r ->
   (l -> r -> Transaction c) ->
-  Transaction [c]
+  Transaction (Seq c)
 rMessageJob ss toKey rs joinFn = do
   -- NOTE: this code is a bit ugly because I want to avoid an Eq constraint
   -- on k. To avoid it, I use the Message instance to use equality on the keys
   -- instead. This also saves some redundant toMessage calls by exploiting the
   -- fact that toMessage for ByteString is 'id'.
-  let rsWithKeyBytes = map (\r -> (r, toMessage $ toKey r)) rs
+  let rsWithKeyBytes = fmap (\r -> (r, toMessage $ toKey r)) rs
   let keyBytesToFetch = fromList @ (Set.Set ByteString)
-                        $ map snd rsWithKeyBytes
+                        $ toList
+                        $ fmap snd rsWithKeyBytes
   -- TODO: do we have a conflict with lMessageJob here between setLStoreMsg
   -- and getLStoreMsg?
   lStoreMsgFutures <- for (toList keyBytesToFetch)
@@ -307,9 +323,10 @@ rMessageJob ss toKey rs joinFn = do
   lStoreMsgs <- fmap fromMessage . Map.fromList . catMaybes
                 <$> for lStoreMsgFutures
                     (\(k, fl) -> fmap (k,) <$> FDB.await fl)
-  fmap catMaybes $ for (zip rsWithKeyBytes [0..]) $ \((r, kbs), i) ->
+  let forWithIndex = flip Seq.traverseWithIndex
+  fmap catMaybes $ forWithIndex rsWithKeyBytes $ \i (r, kbs) ->
     case Map.lookup kbs lStoreMsgs of
-      Nothing -> addRBacklogMessage ss kbs (toMessage r) i >> return Nothing
+      Nothing -> addRBacklogMessage ss kbs (toMessage r) (fromIntegral i) >> return Nothing
       Just l -> Just <$> joinFn l r
 
 -- | The main function for the job that flushes backlogged r-messages.
@@ -320,10 +337,10 @@ flushBacklogJob ::
   PartitionId ->
   (l -> r -> Transaction c) ->
   Int -> --batch size
-  Transaction [c]
+  Transaction (Seq c)
 flushBacklogJob ss pid joinFn batchSize =
   getArbitraryFlushableBackloggedKey ss pid >>= FDB.await >>= \case
-    Nothing -> return []
+    Nothing -> return mempty
     Just flushableKey -> do
       lf <- getLStoreMsg ss flushableKey
       rs <- getAndDeleteRBacklogMessages ss flushableKey batchSize
@@ -333,5 +350,4 @@ flushBacklogJob ss pid joinFn batchSize =
         Nothing -> error "impossible case in flushBacklogJob"
         Just l -> do
           when (Seq.null rs) (removeFlushableBackloggedKey ss pid flushableKey)
-          joined <- for rs (joinFn l)
-          return $ toList joined
+          for rs (joinFn l)

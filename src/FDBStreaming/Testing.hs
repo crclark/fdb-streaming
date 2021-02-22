@@ -7,7 +7,7 @@ module FDBStreaming.Testing
   ( testOnInput,
     testOnInput2,
     testJobConfig,
-    dumpStream
+    dumpStream,
   )
 where
 
@@ -39,7 +39,7 @@ topicCounts db cfg topology = do
 -- | Returns True if at least one topic count is nonzero, or if there are no
 -- topics.
 topicCountsNonZero :: Map TopicName Int -> Bool
-topicCountsNonZero m = Map.null m || any (>0) (Map.elems m)
+topicCountsNonZero m = Map.null m || any (> 0) (Map.elems m)
 
 waitCountUnchanged ::
   FDB.Database ->
@@ -54,8 +54,8 @@ waitCountUnchanged db cfg topology maxIter = do
   threadDelay 5000000
   tc2 <- topicCounts db cfg topology
   if tc1 == tc2 && topicCountsNonZero tc2
-     then return ()
-     else waitCountUnchanged db cfg topology (maxIter - 1)
+    then return ()
+    else waitCountUnchanged db cfg topology (maxIter - 1)
 
 -- | Given a small collection of input, and a topology that takes a stream of
 -- the same type as input, run the pipeline on that input. Blocks until activity
