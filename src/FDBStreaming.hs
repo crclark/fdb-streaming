@@ -1015,28 +1015,28 @@ doForSeconds n f = do
 mkTaskName :: StepName -> PartitionId -> TaskName
 mkTaskName sn pid = TaskName $ BS8.pack (show sn ++ "_" ++ show pid)
 
-runCustomWatermark :: WatermarkSS -> WatermarkBy a -> Transaction (Int, Seq a) -> Transaction (Int, Seq a)
+runCustomWatermark :: WatermarkSS -> WatermarkBy a -> Transaction (Seq a) -> Transaction (Seq a)
 runCustomWatermark wmSS (CustomWatermark f) t = do
-  (n, xs) <- t
+  xs <- t
   case xs of
     (_ Seq.:|> x) -> f x >>= setWatermark wmSS
     _ -> return ()
-  return (n, xs)
+  return xs
 runCustomWatermark _ _ t = t
 
 runIndexers ::
   [Indexer outMsg] ->
   Topic ->
-  Transaction (Int, Seq (Topic.CoordinateUncommitted, outMsg)) ->
-  Transaction (Int, Seq outMsg)
+  Transaction (Seq (Topic.CoordinateUncommitted, outMsg)) ->
+  Transaction (Seq outMsg)
 runIndexers ixers outTopic f = do
-  (n, cmsgs) <- f
+  cmsgs <- f
   for_ ixers \(Indexer ixNm ixer) -> do
     let ix = Ix.namedIndex outTopic ixNm
     for_ cmsgs \(coord, msg) -> do
       let ks = ixer msg
       for_ ks \k -> Ix.index ix k coord
-  return (n, fmap snd cmsgs)
+  return (fmap snd cmsgs)
 
 outputStreamAndTopic ::
   (HasJobConfig m, Message c, Monad m) =>
@@ -1121,7 +1121,6 @@ instance MonadStream LeaseBasedStreamWorker where
                     $ runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy
                     $ runIndexers streamProcessorIndexers outTopic
                     $ writeToRandomPartition outTopic
-                    $ addLength
                     $ processBatch workspaceSS pid mempty
                 -- Case 2: this job has an input stream, and produces output.
                 Just (Stream' streamReadAndCheckpoint _ _ _ setUpState destroyState) ->
@@ -1137,7 +1136,6 @@ instance MonadStream LeaseBasedStreamWorker where
                         $ runIndexers streamProcessorIndexers outTopic
                         $ writeToRandomPartition outTopic
                         $ transformBatch (processBatch workspaceSS pid)
-                        $ addLength
                         $ recordInputBatchMetrics metrics
                         $ streamReadAndCheckpoint
                           cfg
@@ -1309,7 +1307,7 @@ periodicTaskRegSS cfg = FDB.extend (jobConfigSS cfg) [FDB.Bytes "leasep"]
 throttleByErrors ::
   Maybe StreamEdgeMetrics ->
   StepName ->
-  IO (Int, Seq a) ->
+  IO (Seq a) ->
   IO ()
 throttleByErrors metrics sn x =
   flip
@@ -1339,11 +1337,14 @@ throttleByErrors metrics sn x =
     $ do
       threadDelay 150
       t1 <- getTime Monotonic
-      (numConsumed, _) <- x
+      _ <- x
       t2 <- getTime Monotonic
       let timeMillis = (`div` 1000000) $ toNanoSecs $ diffTimeSpec t2 t1
       recordBatchLatency metrics timeMillis
-      when (numConsumed == 0) (threadDelay 1000000)
+      -- TODO: reinstate this logic in a way that doesn't require passing
+      -- an int through ninety functions. And make sure it works correctly
+      -- with BatchProcessors that intentionally don't take input!
+      -- when (numConsumed == 0) (threadDelay 1000000)
 
 -- TODO: the next few functions were split apart from one large messy function.
 -- Their types are partially lies -- they don't really need to take Transactions
@@ -1364,33 +1365,27 @@ recordInputBatchMetrics metrics getMsgs = do
   liftIO $ recordMsgsPerBatch metrics (Seq.length inMsgs)
   return inMsgs
 
-addLength :: Monad m => m (Seq a) -> m (Int, Seq a)
-addLength m = do
-  xs <- m
-  return (length xs, xs)
-
 -- | Utility function to write output messages to a random partition of
 -- the given topic. Returns the written messages unchanged.
 writeToRandomPartition ::
   Message b =>
   Topic ->
-  Transaction (Int, Seq b) ->
-  Transaction (Int, Seq (Topic.CoordinateUncommitted, b))
-writeToRandomPartition outTopic getInput = do
-  (numInputMsgs, outputMsgs) <- getInput
+  Transaction (Seq b) ->
+  Transaction (Seq (Topic.CoordinateUncommitted, b))
+writeToRandomPartition outTopic t = do
+  outputMsgs <- t
   let outMsgs = fmap toMessage outputMsgs
   p' <- liftIO $ randPartition outTopic
   coords <- writeTopic outTopic p' (toList outMsgs)
-  return (numInputMsgs, (Seq.zip (Seq.fromList coords) outputMsgs))
+  return (Seq.zip (Seq.fromList coords) outputMsgs)
 
 transformBatch ::
   (Seq (Maybe Topic.Coordinate, a) -> Transaction (Seq b)) ->
-  Transaction (Int, Seq (Maybe Topic.Coordinate, a)) ->
-  Transaction (Int, Seq b)
+  Transaction (Seq (Maybe Topic.Coordinate, a)) ->
+  Transaction (Seq b)
 transformBatch f getBatch = do
-  (n, xs) <- getBatch
-  ys <- f xs
-  return (n, ys)
+  xs <- getBatch
+  f xs
 
 -- END stupid functions that need to be refactored.
 -- ===============================================
@@ -1460,7 +1455,7 @@ aggregateStep ::
   AT.AggrTable k aggr ->
   Maybe StreamEdgeMetrics ->
   PartitionId ->
-  FDB.Transaction (Int, Seq (k, aggr))
+  FDB.Transaction (Seq (k, aggr))
 aggregateStep
   jobCfg
   stepCfg
@@ -1486,7 +1481,7 @@ aggregateStep
     liftIO $ recordMsgsPerBatch metrics (Seq.length msgs)
     let kvs = Seq.fromList [(k, toAggr v) | v <- toList msgs, k <- toKeys v]
     AT.mappendBatch table pid kvs
-    return (length msgs, kvs)
+    return kvs
 
 -- | Runs a stream processing job forever. Blocks indefinitely.
 runJob :: JobConfig -> (forall m. MonadStream m => m a) -> IO ()
