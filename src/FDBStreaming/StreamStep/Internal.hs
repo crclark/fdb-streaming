@@ -75,13 +75,9 @@ data BatchProcessor b
   = -- NOTE: do not export this constructor to users; it's too easy to hit
     -- GHC bug: https://gitlab.haskell.org/ghc/ghc/issues/15991
     forall a r.
-    BatchProcessor
-      { -- | The input stream that this processor reads from. Some processors
-        -- do not read from a stream -- instead, they only work on the internal
-        -- state used by the stream step they take part in. Garbage collection,
-        -- flushing join data, etc. are examples of such cases. In those cases,
-        -- batchInStream will be 'Nothing'.
-        batchInStream :: Maybe (Stream r a),
+    IOBatchProcessor
+      { -- | The input stream that this processor reads from.
+        ioBatchInStream :: Stream r a,
         -- | A batch processing function takes a batch of messages as input, along
         -- with a subspace in which it can store any state it needs to persist to
         -- operate or communicate. This subspace is shared among all batch
@@ -89,13 +85,47 @@ data BatchProcessor b
         -- within a step to communicate. For example, this is used to store
         -- temporary data for joins -- one BatchProcessor is responsible for the
         -- left side of the join, the other is responsible for the right side.
-        -- If your processor does not take input (batchInStream is Nothing),
-        -- this function will be passed an empty sequence.
-        processBatch :: Subspace -> PartitionId -> Seq (Maybe Coordinate, a) -> Transaction (Seq b),
+        ioProcessBatch :: Subspace
+                       -> PartitionId
+                       -> Seq (Maybe Coordinate, a)
+                       -> Transaction (Seq b),
         -- | Number of distinct partitions (threads) that this processor should
         -- run on concurrently.
-        batchNumPartitions :: Word8
+        ioBatchNumPartitions :: Word8
       }
+    -- | A batch processing function that reads input but has no output.
+    | forall a r. IBatchProcessor
+        {
+          iBatchInStream :: Stream r a,
+          iProcessBatch :: Subspace
+                        -> PartitionId
+                        -> Seq (Maybe Coordinate, a)
+                        -> Transaction (),
+          iBatchNumPartitions :: Word8
+        }
+    -- | A batch processing function that does not read from an input stream but
+    -- produces output. This sounds weird, but it can be useful in more complex
+    -- use cases, such as streaming joins, where multiple IBatchProcessors
+    -- receive input and store them in the step's private subspace until all of
+    -- the data needed for the join has been received. Then an OBatchProcessor
+    -- detects that all the data has been received, and flushes the data
+    -- downstream. See the OneToMany join namespace for more details.
+    | OBatchProcessor
+        {
+          oProcessBatch :: Subspace
+                        -> PartitionId
+                        -> Transaction (Seq b),
+          oBatchNumPartitions :: Word8
+        }
+    -- | A batch processor that is run purely for side effects. No input stream,
+    -- no output stream.
+    | BatchProcessor
+        {
+          processBatch :: Subspace
+                       -> PartitionId
+                       -> Transaction (),
+          batchNumPartitions :: Word8
+        }
 
 -- | Datatype describing the outputs of batchProcessorInputWatermarkSS.
 data BatchProcessorInputWatermarkSS =
@@ -104,7 +134,8 @@ data BatchProcessorInputWatermarkSS =
   | BatchProcessorInputWatermarkSS (JobSubspace -> WatermarkSS)
 
 batchProcessorHasInput :: BatchProcessor a -> Bool
-batchProcessorHasInput (BatchProcessor (Just _) _ _) = True
+batchProcessorHasInput IOBatchProcessor{} = True
+batchProcessorHasInput IBatchProcessor{} = True
 batchProcessorHasInput _ = False
 
 isBatchProcessorInputWatermarked :: BatchProcessor a -> Bool
@@ -120,24 +151,37 @@ isBatchProcessorInputWatermarked x = case batchProcessorInputWatermarkSS x of
 batchProcessorInputWatermarkSS
   :: BatchProcessor b
   -> BatchProcessorInputWatermarkSS
-batchProcessorInputWatermarkSS (BatchProcessor Nothing _ _) = BatchProcessorHasNoInput
-batchProcessorInputWatermarkSS (BatchProcessor (Just i) _ _) =
+batchProcessorInputWatermarkSS IOBatchProcessor{ioBatchInStream} =
   maybe
     BatchProcessorInputNotWatermarked
-    BatchProcessorInputWatermarkSS (streamWatermarkSS i)
+    BatchProcessorInputWatermarkSS (streamWatermarkSS ioBatchInStream)
+batchProcessorInputWatermarkSS IBatchProcessor{iBatchInStream} =
+  maybe
+    BatchProcessorInputNotWatermarked
+    BatchProcessorInputWatermarkSS (streamWatermarkSS iBatchInStream)
+batchProcessorInputWatermarkSS _ = BatchProcessorHasNoInput
 
 -- | Returns a topic if this batch processor has an input stream, and that
 -- input stream is persisted in FDB.
 batchProcessorInputTopic :: BatchProcessor b -> Maybe Topic
-batchProcessorInputTopic (BatchProcessor (Just i) _ _) = maybeStreamTopic i
-batchProcessorInputTopic (BatchProcessor Nothing _ _) = Nothing
+batchProcessorInputTopic IOBatchProcessor{ioBatchInStream} =
+  maybeStreamTopic ioBatchInStream
+batchProcessorInputTopic IBatchProcessor{iBatchInStream} =
+  maybeStreamTopic iBatchInStream
+batchProcessorInputTopic _ = Nothing
+
+numBatchPartitions :: BatchProcessor b -> Word8
+numBatchPartitions IOBatchProcessor{ioBatchNumPartitions} = ioBatchNumPartitions
+numBatchPartitions IBatchProcessor{iBatchNumPartitions} = iBatchNumPartitions
+numBatchPartitions OBatchProcessor{oBatchNumPartitions} = oBatchNumPartitions
+numBatchPartitions BatchProcessor{batchNumPartitions} = batchNumPartitions
 
 data Indexer outMsg
   = forall k.
     AT.TableKey k =>
     Indexer
       { indexerIndexName :: IndexName,
-        indexerIndexBy :: (outMsg -> [k])
+        indexerIndexBy :: outMsg -> [k]
       }
 
 -- TODO: What is a stream step, really? Just seems to be miscellaneous inputs to

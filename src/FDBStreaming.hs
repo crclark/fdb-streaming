@@ -284,7 +284,20 @@ import FDBStreaming.Stream.Internal
     streamWatermarkSS,
   )
 import FDBStreaming.StreamStep.Internal
-  ( BatchProcessor (BatchProcessor, batchInStream, batchNumPartitions, processBatch),
+  ( BatchProcessor (IOBatchProcessor,
+                    ioBatchInStream,
+                    ioProcessBatch,
+                    ioBatchNumPartitions,
+                    IBatchProcessor,
+                    iBatchInStream,
+                    iProcessBatch,
+                    iBatchNumPartitions,
+                    OBatchProcessor,
+                    oProcessBatch,
+                    oBatchNumPartitions,
+                    BatchProcessor,
+                    processBatch),
+    numBatchPartitions,
     --tableProcessorGroupedBy,
     --tableProcessorAggregation,
     --tableProcessorWatermarkBy,
@@ -675,8 +688,8 @@ atLeastOnce sn input f = void $ do
     StreamProcessor
       { streamProcessorWatermarkBy = NoWatermark,
         streamProcessorBatchProcessors =
-          [ BatchProcessor
-              (Just input)
+          [ IOBatchProcessor
+              input
               (\_ss _pid xs -> mapM (liftIO . f . snd) xs)
               (fromIntegral $ streamMinReaderPartitions input)
           ],
@@ -717,8 +730,8 @@ pipe' input f =
           then DefaultWatermark
           else NoWatermark,
       streamProcessorBatchProcessors =
-        [ BatchProcessor
-            (Just input)
+        [ IOBatchProcessor
+            input
             (\_ss _pid xs -> catMaybes <$> mapM (liftIO . f . snd) xs)
             (fromIntegral $ streamMinReaderPartitions input)
         ],
@@ -752,7 +765,7 @@ eventualIndexBy sn f stream = do
       StreamProcessor
         { streamProcessorWatermarkBy = NoWatermark,
           streamProcessorBatchProcessors =
-            [BatchProcessor (Just stream) ixer (fromIntegral $ streamMinReaderPartitions stream)],
+            [IOBatchProcessor stream ixer (fromIntegral $ streamMinReaderPartitions stream)],
           streamProcessorIndexers = [],
           streamProcessorStreamStepConfig = defaultStreamStepConfig
         }
@@ -799,8 +812,8 @@ oneToOneJoin' inl inr pl pr j =
             then DefaultWatermark
             else NoWatermark
         )
-        [ BatchProcessor (Just inl) lstep (fromIntegral $ streamMinReaderPartitions inl),
-          BatchProcessor (Just inr) rstep (fromIntegral $ streamMinReaderPartitions inr)
+        [ IOBatchProcessor inl lstep (fromIntegral $ streamMinReaderPartitions inl),
+          IOBatchProcessor inr rstep (fromIntegral $ streamMinReaderPartitions inr)
         ]
         []
         defaultStreamStepConfig
@@ -839,39 +852,35 @@ oneToManyJoin' inl inr pl pr j =
           else NoWatermark
       joinFn = (\l r -> return (j l r))
       lstep =
-        BatchProcessor
-          { batchInStream = Just inl,
-            -- TODO: looks like we also need a BatchProcessor type that doesn't produce output to avoid needless work.
-            -- then we can remove `>> return mempty` here.
-            processBatch = \workSS pid lmsgs ->
+        IBatchProcessor
+          { iBatchInStream = inl,
+            iProcessBatch = \workSS pid lmsgs ->
                              OTM.lMessageJob (OTM.oneToManyJoinSS workSS)
                                              pid
                                              pl
-                                             (fmap snd lmsgs)
-                             >> return mempty,
-            batchNumPartitions = fromIntegral $ streamMinReaderPartitions inl
+                                             (fmap snd lmsgs),
+            iBatchNumPartitions = fromIntegral $ streamMinReaderPartitions inl
           }
       rstep =
-        BatchProcessor
-          { batchInStream = Just inr,
-            processBatch = \workSS _pid rmsgs ->
+        IOBatchProcessor
+          { ioBatchInStream = inr,
+            ioProcessBatch = \workSS _pid rmsgs ->
                              OTM.rMessageJob (OTM.oneToManyJoinSS workSS)
                                              pr
                                              (fmap snd rmsgs)
                                              joinFn,
-            batchNumPartitions = fromIntegral $ streamMinReaderPartitions inr
+            ioBatchNumPartitions = fromIntegral $ streamMinReaderPartitions inr
           }
       flushBacklog =
-        BatchProcessor
-          { batchInStream = Nothing,
-            -- TODO: pass job config into processBatch, too? Need batch size
+        OBatchProcessor
+          { -- TODO: pass job config into processBatch, too? Need batch size
             -- info to replace the 256 magic number below.
-            processBatch = \workSS pid _msgs ->
+            oProcessBatch = \workSS pid ->
                              OTM.flushBacklogJob (OTM.oneToManyJoinSS workSS)
                                                  pid
                                                  joinFn
                                                  256,
-            batchNumPartitions = fromIntegral $ streamMinReaderPartitions inl
+            oBatchNumPartitions = fromIntegral $ streamMinReaderPartitions inl
           }
    in StreamProcessor
         { streamProcessorWatermarkBy = watermarker,
@@ -1104,55 +1113,83 @@ instance MonadStream LeaseBasedStreamWorker where
             zip
               streamProcessorBatchProcessors
               [sn <> BS8.pack (show i) | i <- [(0 :: Int) ..]]
-      for_ processorsWStepNames \(BatchProcessor mInStream processBatch numBatchPartitions, sn_i) -> do
+      for_ processorsWStepNames \(batchProcessor, sn_i) -> do
         let job pid _stillValid _release =
-              -- NOTE: we must use a case here to do the pattern match to work around a
-              -- GHC limitation. In 8.6, let gives a very confusing error message about
-              -- variables escaping their scopes. In 8.8, it gives a more helpful
-              -- "my brain just exploded" message that says to use a case statement.
-              case fmap getStream' mInStream of
-                -- Case 1: This job has no input stream, but does produce
-                -- output.
-                Nothing ->
+              case batchProcessor of
+                IOBatchProcessor{ioBatchInStream, ioProcessBatch} ->
+                  -- NOTE: we must use a case here to do the pattern match to
+                  -- work around a GHC limitation. In 8.6, let gives a very
+                  -- confusing error message about variables escaping their
+                  -- scopes. In 8.8, it gives a more helpful "my brain just
+                  -- exploded" message that says to use a case statement.
+                  case getStream' ioBatchInStream of
+                    (Stream' streamReadAndCheckpoint _ _ _ setUpState destroyState) -> do
+                      bracket
+                        (runStreamTxn jobConfigDB $ setUpState cfg sn_i pid checkpointSS)
+                        destroyState
+                        (doForSeconds (leaseDuration cfg)
+                          . void
+                          . throttleByErrors metrics sn_i
+                          . runStreamTxn jobConfigDB
+                          . runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy
+                          . runIndexers streamProcessorIndexers outTopic
+                          . writeToRandomPartition outTopic
+                          . transformBatch (ioProcessBatch workspaceSS pid)
+                          . recordInputBatchMetrics metrics
+                          . streamReadAndCheckpoint
+                            cfg
+                            sn_i
+                            pid
+                            checkpointSS
+                            (getMsgsPerBatch cfg streamProcessorStreamStepConfig))
+                      where
+                        -- TODO: DRY out
+                        checkpointSS =
+                          streamConsumerCheckpointSS
+                            (jobConfigSS cfg)
+                            ioBatchInStream
+                            sn_i
+                IBatchProcessor{iBatchInStream, iProcessBatch} ->
+                  case getStream' iBatchInStream of
+                    (Stream' streamReadAndCheckpoint _ _ _ setUpState destroyState) -> do
+                      bracket
+                        (runStreamTxn jobConfigDB $ setUpState cfg sn_i pid checkpointSS)
+                        destroyState
+                        (doForSeconds (leaseDuration cfg)
+                          . void
+                          . throttleByErrors metrics sn_i
+                          . runStreamTxn jobConfigDB
+                          . fmap (iProcessBatch workspaceSS pid)
+                          . recordInputBatchMetrics metrics
+                          . streamReadAndCheckpoint
+                            cfg
+                            sn_i
+                            pid
+                            checkpointSS
+                            (getMsgsPerBatch cfg streamProcessorStreamStepConfig))
+                      where
+                        checkpointSS =
+                          streamConsumerCheckpointSS
+                            (jobConfigSS cfg)
+                            iBatchInStream
+                            sn_i
+                OBatchProcessor{oProcessBatch} ->
                   doForSeconds (leaseDuration cfg)
-                    $ void
-                    $ throttleByErrors metrics sn_i
-                    $ runStreamTxn jobConfigDB
-                    $ runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy
-                    $ runIndexers streamProcessorIndexers outTopic
-                    $ writeToRandomPartition outTopic
-                    $ processBatch workspaceSS pid mempty
-                -- Case 2: this job has an input stream, and produces output.
-                Just (Stream' streamReadAndCheckpoint _ _ _ setUpState destroyState) ->
-                  bracket
-                    (runStreamTxn jobConfigDB $ setUpState cfg sn_i pid checkpointSS)
-                    destroyState
-                    (doForSeconds (leaseDuration cfg)
-                      . void
-                      . throttleByErrors metrics sn_i
-                      . runStreamTxn jobConfigDB
-                      . runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy
-                      . runIndexers streamProcessorIndexers outTopic
-                      . writeToRandomPartition outTopic
-                      . transformBatch (processBatch workspaceSS pid)
-                      . recordInputBatchMetrics metrics
-                      . streamReadAndCheckpoint
-                        cfg
-                        sn_i
-                        pid
-                        checkpointSS
-                        (getMsgsPerBatch cfg streamProcessorStreamStepConfig))
-                  where
-                    checkpointSS =
-                      streamConsumerCheckpointSS
-                        (jobConfigSS cfg)
-                        inStream
-                        sn_i
-                    -- proved safe above. TODO: refactor to eliminate.
-                    inStream = fromJust mInStream
-        -- TODO: case 3: no input and no output.
+                          $ void
+                          $ throttleByErrors metrics sn_i
+                          $ runStreamTxn jobConfigDB
+                          $ runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy
+                          $ runIndexers streamProcessorIndexers outTopic
+                          $ writeToRandomPartition outTopic
+                          $ oProcessBatch workspaceSS pid
+                BatchProcessor{processBatch} ->
+                  doForSeconds (leaseDuration cfg)
+                          $ void
+                          $ throttleByErrors metrics sn_i
+                          $ runStreamTxn jobConfigDB
+                          $ processBatch workspaceSS pid
 
-        forEachPartition' numBatchPartitions $ \pid -> do
+        forEachPartition' (numBatchPartitions batchProcessor) $ \pid -> do
           let taskName = mkTaskName sn_i pid
           taskReg <- taskRegistry
           liftIO
@@ -1305,7 +1342,7 @@ periodicTaskRegSS cfg = FDB.extend (jobConfigSS cfg) [FDB.Bytes "leasep"]
 throttleByErrors ::
   Maybe StreamEdgeMetrics ->
   StepName ->
-  IO (Seq a) ->
+  IO a ->
   IO ()
 throttleByErrors metrics sn x =
   flip
