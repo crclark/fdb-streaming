@@ -65,7 +65,7 @@ instance TableKey Integer where
   fromKeyBytes bs = case FDB.decodeTupleElems bs of
     Left err -> error $ "Failed to decode Integer TableKey: " ++ show err
     Right [FDB.Int x] -> x
-    Right _ -> error $ "Expected Integer when decoding TableKey"
+    Right _ -> error "Expected Integer when decoding TableKey"
 
 instance OrdTableKey Integer
 
@@ -76,7 +76,7 @@ instance TableKey Int where
   fromKeyBytes bs = case FDB.decodeTupleElems bs of
     Left err -> error $ "Failed to decode Int TableKey: " ++ show err
     Right [FDB.Int x] -> fromIntegral x
-    Right _ -> error $ "Expected Int when decoding TableKey"
+    Right _ -> error "Expected Int when decoding TableKey"
 
 instance OrdTableKey Int
 

@@ -86,7 +86,7 @@ backlogs, so what this backlog worker should do is:
 Open questions:
 
 1. Should this work be done as part of the l or r transaction, or as a totally
-   separate transactional job?
+   separate transactional job? Answer: separate job.
 2. What if we keep getting more r-messages while clearing the backlog for an
    l-message? Answer: no problem. Remember that after we have seen the l-msg,
    we never write to the backlog for that key again. We immediately join and
@@ -95,7 +95,8 @@ Open questions:
    in the backlog, we could get stuck just emitting messages for that key for
    a really long time. Should we try to guarantee fairness? We could select
    random items from the backlog list on each iteration, but we would need
-   to partition the backlog. See 4.
+   to partition the backlog. See 4. Answer: not a problem. Backlog flush is a
+   separate job.
 4. How do we distribute the backlog task across multiple workers? I guess we
    can partition it by a hash of the join key, or something.
 

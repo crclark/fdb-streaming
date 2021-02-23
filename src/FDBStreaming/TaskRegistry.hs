@@ -56,9 +56,7 @@ empty ::
   Subspace ->
   IO TaskRegistry
 empty ss =
-  TaskRegistry
-    <$> pure (taskSpace $ FDB.extend ss [FDB.Bytes "TS"])
-    <*> newIORef mempty
+  TaskRegistry (taskSpace $ FDB.extend ss [FDB.Bytes "TS"]) <$> newIORef mempty
 
 numTasks :: TaskRegistry -> IO Int
 numTasks tr = M.size <$> readIORef (getTaskRegistry tr)

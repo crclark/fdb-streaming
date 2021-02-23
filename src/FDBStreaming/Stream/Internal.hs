@@ -57,6 +57,7 @@ import FoundationDB as FDB
 import qualified FoundationDB.Layer.Subspace as FDB
 import qualified FoundationDB.Layer.Tuple as FDB
 import Safe.Foldable (maximumMay)
+import Data.Bifunctor (first)
 
 -- TODO: add a MonadStream implementation that checks that all stream names are
 -- unique.
@@ -307,7 +308,7 @@ streamFromTopic :: Topic -> StreamName -> Stream 'FDB ByteString
 streamFromTopic tc streamName' = InternalStream tc $
   Stream'
     { streamReadAndCheckpoint' = \_cfg rn pid _chkptSS n _state ->
-        fmap (fmap (\(c, xs) -> (Just c, xs))) $ Topic.readNAndCheckpoint tc pid rn n,
+        fmap (first Just) <$> Topic.readNAndCheckpoint tc pid rn n,
       streamMinReaderPartitions' = fromIntegral $ Topic.numPartitions tc,
       streamWatermarkSS' = Nothing,
       streamName' = streamName',

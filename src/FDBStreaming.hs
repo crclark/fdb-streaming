@@ -964,7 +964,7 @@ instance HasJobConfig LeaseBasedStreamWorker where
   getJobConfig = Reader.asks fst
 
 taskRegistry :: LeaseBasedStreamWorker TaskRegistry
-taskRegistry = snd <$> Reader.ask
+taskRegistry = Reader.asks snd
 
 {-
 -- | Repeatedly run a transaction so long as another transaction returns True.
@@ -1127,23 +1127,21 @@ instance MonadStream LeaseBasedStreamWorker where
                   bracket
                     (runStreamTxn jobConfigDB $ setUpState cfg sn_i pid checkpointSS)
                     destroyState
-                    \state ->
-                      doForSeconds (leaseDuration cfg)
-                        $ void
-                        $ throttleByErrors metrics sn_i
-                        $ runStreamTxn jobConfigDB
-                        $ runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy
-                        $ runIndexers streamProcessorIndexers outTopic
-                        $ writeToRandomPartition outTopic
-                        $ transformBatch (processBatch workspaceSS pid)
-                        $ recordInputBatchMetrics metrics
-                        $ streamReadAndCheckpoint
-                          cfg
-                          sn_i
-                          pid
-                          checkpointSS
-                          (getMsgsPerBatch cfg streamProcessorStreamStepConfig)
-                          state
+                    (doForSeconds (leaseDuration cfg)
+                      . void
+                      . throttleByErrors metrics sn_i
+                      . runStreamTxn jobConfigDB
+                      . runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy
+                      . runIndexers streamProcessorIndexers outTopic
+                      . writeToRandomPartition outTopic
+                      . transformBatch (processBatch workspaceSS pid)
+                      . recordInputBatchMetrics metrics
+                      . streamReadAndCheckpoint
+                        cfg
+                        sn_i
+                        pid
+                        checkpointSS
+                        (getMsgsPerBatch cfg streamProcessorStreamStepConfig))
                   where
                     checkpointSS =
                       streamConsumerCheckpointSS
@@ -1356,7 +1354,7 @@ throttleByErrors metrics sn x =
 -- Returns the sequence of input messages unchanged.
 recordInputBatchMetrics ::
   MonadIO m =>
-  (Maybe StreamEdgeMetrics) ->
+  Maybe StreamEdgeMetrics ->
   m (Seq (Maybe Topic.Coordinate, a)) ->
   m (Seq (Maybe Topic.Coordinate, a))
 recordInputBatchMetrics metrics getMsgs = do
@@ -1433,7 +1431,7 @@ oneToOneJoinStep joinSS streamJoinIx pl combiner ckptmsgs = do
   joinData <- for joinFutures \(k, msg, joinF) -> do
     d <- await joinF
     return (k, msg, d)
-  fmap catMaybes $ for joinData \(k, lmsg, d) -> do
+  catMaybes <$> for joinData \(k, lmsg, d) -> do
     case d of
       Just (rmsg :: a2) -> do
         delete1to1JoinData joinSS k
