@@ -35,6 +35,7 @@ library
       FDBStreaming.Index,
       FDBStreaming.JobConfig
       FDBStreaming.Joins,
+      FDBStreaming.Joins.OneToMany,
       FDBStreaming.Util,
       FDBStreaming.Util.BatchWriter,
       FDBStreaming.Watermark,
@@ -118,6 +119,7 @@ test-suite fdb-streaming-test
       Spec.FDBStreaming.Util.BatchWriter
       Spec.FDBStreaming.Topic
       Spec.FDBStreaming.Index
+      Spec.FDBStreaming.Joins.OneToMany
   hs-source-dirs:
       test
   ghc-options: -threaded -rtsopts -with-rtsopts=-N -Wall -g

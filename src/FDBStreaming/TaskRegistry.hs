@@ -12,8 +12,9 @@ module FDBStreaming.TaskRegistry
 where
 
 import Control.Concurrent (myThreadId)
-import Control.Logger.Simple (logDebug, showText)
-import Control.Monad.IO.Class (liftIO)
+import Control.Logger.Simple (logError, logDebug, showText)
+import Control.Monad (when)
+import Control.Monad.IO.Class (liftIO, MonadIO)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Map (Map)
 import qualified Data.Map as M
@@ -56,12 +57,24 @@ empty ::
   Subspace ->
   IO TaskRegistry
 empty ss =
-  TaskRegistry
-    <$> pure (taskSpace $ FDB.extend ss [FDB.Bytes "TS"])
-    <*> newIORef mempty
+  TaskRegistry (taskSpace $ FDB.extend ss [FDB.Bytes "TS"]) <$> newIORef mempty
 
 numTasks :: TaskRegistry -> IO Int
 numTasks tr = M.size <$> readIORef (getTaskRegistry tr)
+
+-- | Returns True iff the given TaskName has already been registered within this
+-- process. If this is true, it is strong evidence that there is an internal bug
+-- in the user's pipeline or in FDBStreaming itself, and that it has generated
+-- the same TaskName for two distinct tasks. If that happens, parts of the job
+-- DAG will never run.
+-- Note that this is distinct from the same TaskName being registered inside
+-- FoundationDB multiple times, which is expected to happen when many processes
+-- start up -- each one registers all tasks in the DAG, which is harmless
+-- because the operation is idempotent.
+alreadyRegisteredLocally :: MonadIO m => TaskRegistry -> TaskName -> m Bool
+alreadyRegisteredLocally (TaskRegistry _ tr) taskName = do
+  taskMap <- liftIO $ readIORef tr
+  return (M.member taskName taskMap)
 
 addTask ::
   TaskRegistry ->
@@ -76,8 +89,14 @@ addTask ::
   -- atomically finish a longer-running computation.
   (Transaction Bool -> Transaction ReleaseResult -> IO ()) ->
   Transaction ()
-addTask (TaskRegistry ts tr) taskName dur f = do
+addTask reg@(TaskRegistry ts tr) taskName dur f = do
+  logDebug $ "Registering task " <> showText taskName
   taskID <- extractID <$> ensureTask ts taskName
+  alreadyRegistered <- alreadyRegisteredLocally reg taskName
+  when alreadyRegistered $ do
+    logError $ "Task is already registered: "
+                <> showText taskName
+    error "Internal error: tried to register task twice"
   liftIO $ atomicModifyIORef' tr ((,()) . M.insert taskName (taskID, dur, f))
   where
     extractID (AlreadyExists t) = t
@@ -112,4 +131,5 @@ runRandomTask db (TaskRegistry ts tr) = do
                 <*> isLocked ts taskName
             )
             (release ts taskName lease)
+        logDebug $ "Finished running task " <> showText taskName
         return True

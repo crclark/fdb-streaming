@@ -78,8 +78,6 @@ data BatchWrite a = BatchWrite
     -- the 'maxBatchBytes' limit on the batch.
   , writeSizeHint :: Maybe Word
   , batchWriteItem :: a
-  -- | TMVar that will be filled by the writer loop with the result of the write
-  -- operation.
   } deriving (Eq, Show)
 
 -- | Represents a single write request to the BatchWriter.

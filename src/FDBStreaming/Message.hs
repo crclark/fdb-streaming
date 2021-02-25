@@ -60,6 +60,7 @@ import GHC.Natural (Natural)
 -- Laws:
 --
 -- prop> fromMessage (toMessage x) == x
+-- prop>  toMessage x == toMessage y iff x == y
 class Message a where
 
   -- | Serialize a message.
@@ -69,6 +70,10 @@ class Message a where
   -- Exceptions are caught and handled by the loop associated with each worker
   -- thread.
   fromMessage :: ByteString -> a
+
+instance Message ByteString where
+  toMessage = id
+  fromMessage = id
 
 instance Message Void where
 

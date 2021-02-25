@@ -36,6 +36,7 @@ import qualified Streamly as S
 import qualified Streamly.Prelude as S
 import System.Random (Random, randomRIO)
 import qualified FoundationDB as FDB
+import Control.Monad (when)
 
 currMillisSinceEpoch :: MonadIO m => m Int64
 currMillisSinceEpoch = liftIO (millisSinceEpoch <$> getCurrentTime)
@@ -87,7 +88,7 @@ logAndRethrowErrors ident =
 withOneIn :: (Random a, Integral a, MonadIO m) => a -> m () -> m ()
 withOneIn n action = do
   x <- liftIO $ randomRIO (1,n)
-  if x == 1 then action else return ()
+  when (x == 1) action
 
 -- | @chunksOfSize n sz@ splits a list into chunks, such that for each chunk
 -- @c@, @sum $ map sz c@ is less than or equal to @n@, except for elements

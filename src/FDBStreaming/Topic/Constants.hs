@@ -1,4 +1,4 @@
--- | Reusable constants for short tuple keys
+-- | Reusable constants for short keys
 module FDBStreaming.Topic.Constants
   ( topics,
     messages,
@@ -10,6 +10,10 @@ module FDBStreaming.Topic.Constants
     customMeta,
     indices,
     streamStepWorkspace,
+    oneToManyJoin,
+    oneToManyJoinLStore,
+    oneToManyJoinBacklog,
+    oneToManyJoinBackloggedKeys
   )
 where
 
@@ -44,3 +48,16 @@ indices = Int 8
 
 streamStepWorkspace :: Elem
 streamStepWorkspace = Int 9
+
+oneToManyJoin :: Elem
+oneToManyJoin = Int 10
+
+oneToManyJoinLStore :: Elem
+oneToManyJoinLStore = Int 11
+
+oneToManyJoinBacklog :: Elem
+oneToManyJoinBacklog = Int 12
+
+-- | Contains a set of keys for which a backlog of r-messages exists.
+oneToManyJoinBackloggedKeys :: Elem
+oneToManyJoinBackloggedKeys = Int 13

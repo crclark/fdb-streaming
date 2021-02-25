@@ -1,4 +1,3 @@
-{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE LambdaCase #-}
@@ -6,7 +5,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TupleSections #-}
-{-# LANGUAGE TypeApplications #-}
 
 module FDBStreaming.Topic
   ( TopicName,
@@ -362,7 +360,7 @@ writeTopicIO db topic@Topic {..} bss = do
 parseTopicV :: ByteString -> [ByteString]
 parseTopicV vals = case FDB.decodeTupleElems vals of
   Right bs | allBytes bs -> unBytes bs
-  _ -> error $ "parseTopicV: unexpected topic chunk format"
+  _ -> error "parseTopicV: unexpected topic chunk format"
   where
     allBytes [] = True
     allBytes (FDB.Bytes _ : xs) = allBytes xs

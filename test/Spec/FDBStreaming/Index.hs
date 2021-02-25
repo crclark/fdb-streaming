@@ -5,6 +5,8 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 
+{-# OPTIONS_GHC -fno-warn-incomplete-uni-patterns #-}
+
 module Spec.FDBStreaming.Index
   ( indexTests,
   )

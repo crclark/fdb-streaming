@@ -16,7 +16,8 @@ import Test.Tasty (TestTree, testGroup)
 import qualified Test.Tasty.QuickCheck as QC
 
 -- | Randomly extends a subspace. This allows us to run tests in parallel
--- without collisions.
+-- without collisions. TODO: there seem to still be collisions in some cases.
+-- Did we forget some tests?
 extendRand :: FDB.Subspace -> IO FDB.Subspace
 extendRand ss = do
   u <- UUID.nextRandom

@@ -114,7 +114,7 @@ type WatermarkSS = FDB.Subspace
 
 -- | Sets the watermark for the current FDB version to the given time, using
 -- a versionstamped key. The time will be rounded to milliseconds before being
--- stored.
+-- stored. Ignores the input watermark if the current watermark is larger.
 setWatermark :: WatermarkSS -> Watermark -> Transaction ()
 setWatermark ss watermark = do
   current <- getCurrentWatermark ss >>= FDB.await

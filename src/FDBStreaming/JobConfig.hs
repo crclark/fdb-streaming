@@ -2,6 +2,7 @@
 module FDBStreaming.JobConfig
   ( JobConfig (..),
     JobSubspace,
+    PartitionCount
   )
 where
 
@@ -13,6 +14,8 @@ import qualified System.Metrics as Metrics
 
 -- | The top-level subspace that contains all state for a given streaming job.
 type JobSubspace = FDB.Subspace
+
+type PartitionCount = Word8
 
 -- | Specifies configuration for a single streaming job. This is passed to
 -- 'FDBStreaming.runJob'.
@@ -54,8 +57,8 @@ data JobConfig
         -- partitions means more throughput at the expense of more worker threads.
         -- In tables, the number of concurrent writers is bounded by the number of
         -- partitions, but having fewer writers won't significantly affect
-        -- pipeline timeliness.
-        defaultNumPartitions :: Word8,
+        -- pipeline timeliness (TODO: explain why not).
+        defaultNumPartitions :: PartitionCount,
         -- | Default target number of bytes to store per k/v in topics. Small
         -- messages will be combined into one k/v to reach this target. This
         -- generally improves throughput and reduces disk usage in FDB.
