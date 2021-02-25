@@ -91,7 +91,11 @@ data BatchProcessor b
                        -> Transaction (Seq b),
         -- | Number of distinct partitions (threads) that this processor should
         -- run on concurrently.
-        ioBatchNumPartitions :: Word8
+        ioBatchNumPartitions :: Word8,
+        -- | Name of this processor. Must be unique within a StreamStep. This
+        -- name will be appended to the task name in the TaskRegistry, easing
+        -- debugging of the task assignment system.
+        ioBatchProcessorName :: ByteString
       }
     -- | A batch processing function that reads input but has no output.
     | forall a r. IBatchProcessor
@@ -101,7 +105,8 @@ data BatchProcessor b
                         -> PartitionId
                         -> Seq (Maybe Coordinate, a)
                         -> Transaction (),
-          iBatchNumPartitions :: Word8
+          iBatchNumPartitions :: Word8,
+          iBatchProcessorName :: ByteString
         }
     -- | A batch processing function that does not read from an input stream but
     -- produces output. This sounds weird, but it can be useful in more complex
@@ -115,7 +120,8 @@ data BatchProcessor b
           oProcessBatch :: Subspace
                         -> PartitionId
                         -> Transaction (Seq b),
-          oBatchNumPartitions :: Word8
+          oBatchNumPartitions :: Word8,
+          oBatchProcessorName :: ByteString
         }
     -- | A batch processor that is run purely for side effects. No input stream,
     -- no output stream.
@@ -124,7 +130,8 @@ data BatchProcessor b
           processBatch :: Subspace
                        -> PartitionId
                        -> Transaction (),
-          batchNumPartitions :: Word8
+          batchNumPartitions :: Word8,
+          batchProcessorName :: ByteString
         }
 
 -- | Datatype describing the outputs of batchProcessorInputWatermarkSS.
@@ -175,6 +182,12 @@ numBatchPartitions IOBatchProcessor{ioBatchNumPartitions} = ioBatchNumPartitions
 numBatchPartitions IBatchProcessor{iBatchNumPartitions} = iBatchNumPartitions
 numBatchPartitions OBatchProcessor{oBatchNumPartitions} = oBatchNumPartitions
 numBatchPartitions BatchProcessor{batchNumPartitions} = batchNumPartitions
+
+getBatchProcessorName :: BatchProcessor b -> ByteString
+getBatchProcessorName IOBatchProcessor{ioBatchProcessorName} = ioBatchProcessorName
+getBatchProcessorName IBatchProcessor{iBatchProcessorName} = iBatchProcessorName
+getBatchProcessorName OBatchProcessor{oBatchProcessorName} = oBatchProcessorName
+getBatchProcessorName BatchProcessor{batchProcessorName} = batchProcessorName
 
 data Indexer outMsg
   = forall k.

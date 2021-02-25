@@ -287,17 +287,21 @@ import FDBStreaming.StreamStep.Internal
   ( BatchProcessor (IOBatchProcessor,
                     ioBatchInStream,
                     ioProcessBatch,
+                    ioBatchProcessorName,
                     ioBatchNumPartitions,
                     IBatchProcessor,
                     iBatchInStream,
                     iProcessBatch,
                     iBatchNumPartitions,
+                    iBatchProcessorName,
                     OBatchProcessor,
                     oProcessBatch,
                     oBatchNumPartitions,
+                    oBatchProcessorName,
                     BatchProcessor,
                     processBatch),
     numBatchPartitions,
+    getBatchProcessorName,
     --tableProcessorGroupedBy,
     --tableProcessorAggregation,
     --tableProcessorWatermarkBy,
@@ -692,6 +696,7 @@ atLeastOnce sn input f = void $ do
               input
               (\_ss _pid xs -> mapM (liftIO . f . snd) xs)
               (fromIntegral $ streamMinReaderPartitions input)
+              "alo"
           ],
         streamProcessorIndexers = [],
         streamProcessorStreamStepConfig = defaultStreamStepConfig
@@ -734,6 +739,7 @@ pipe' input f =
             input
             (\_ss _pid xs -> catMaybes <$> mapM (liftIO . f . snd) xs)
             (fromIntegral $ streamMinReaderPartitions input)
+            "p"
         ],
       streamProcessorIndexers = [],
       streamProcessorStreamStepConfig = defaultStreamStepConfig
@@ -765,7 +771,11 @@ eventualIndexBy sn f stream = do
       StreamProcessor
         { streamProcessorWatermarkBy = NoWatermark,
           streamProcessorBatchProcessors =
-            [IOBatchProcessor stream ixer (fromIntegral $ streamMinReaderPartitions stream)],
+            [IOBatchProcessor
+              stream
+              ixer
+              (fromIntegral $ streamMinReaderPartitions stream)
+              "eix"],
           streamProcessorIndexers = [],
           streamProcessorStreamStepConfig = defaultStreamStepConfig
         }
@@ -812,8 +822,16 @@ oneToOneJoin' inl inr pl pr j =
             then DefaultWatermark
             else NoWatermark
         )
-        [ IOBatchProcessor inl lstep (fromIntegral $ streamMinReaderPartitions inl),
-          IOBatchProcessor inr rstep (fromIntegral $ streamMinReaderPartitions inr)
+        [ IOBatchProcessor
+           inl
+           lstep
+           (fromIntegral $ streamMinReaderPartitions inl)
+           "1l",
+          IOBatchProcessor
+            inr
+            rstep
+            (fromIntegral $ streamMinReaderPartitions inr)
+            "1r"
         ]
         []
         defaultStreamStepConfig
@@ -854,12 +872,15 @@ oneToManyJoin' inl inr pl pr j =
       lstep =
         IBatchProcessor
           { iBatchInStream = inl,
-            iProcessBatch = \workSS pid lmsgs ->
+            iProcessBatch = \workSS pid lmsgs -> do
+                             logInfo "about to start lMessageJob"
                              OTM.lMessageJob (OTM.oneToManyJoinSS workSS)
                                              pid
                                              pl
-                                             (fmap snd lmsgs),
-            iBatchNumPartitions = fromIntegral $ streamMinReaderPartitions inl
+                                             (fmap snd lmsgs)
+                             logInfo "finished lMessageJob",
+            iBatchNumPartitions = fromIntegral $ streamMinReaderPartitions inl,
+            iBatchProcessorName = "otml"
           }
       rstep =
         IOBatchProcessor
@@ -869,7 +890,8 @@ oneToManyJoin' inl inr pl pr j =
                                              pr
                                              (fmap snd rmsgs)
                                              joinFn,
-            ioBatchNumPartitions = fromIntegral $ streamMinReaderPartitions inr
+            ioBatchNumPartitions = fromIntegral $ streamMinReaderPartitions inr,
+            ioBatchProcessorName = "otmr"
           }
       flushBacklog =
         OBatchProcessor
@@ -880,7 +902,8 @@ oneToManyJoin' inl inr pl pr j =
                                                  pid
                                                  joinFn
                                                  256,
-            oBatchNumPartitions = fromIntegral $ streamMinReaderPartitions inl
+            oBatchNumPartitions = fromIntegral $ streamMinReaderPartitions inl,
+            oBatchProcessorName = "otmf"
           }
    in StreamProcessor
         { streamProcessorWatermarkBy = watermarker,
@@ -1110,9 +1133,12 @@ instance MonadStream LeaseBasedStreamWorker where
               (topicCustomMetadataSS outTopic)
               [C.streamStepWorkspace]
       let processorsWStepNames =
-            zip
+            zipWith
+              (\bp i ->
+                (bp
+                , sn <> BS8.pack (show i) <> "_" <> getBatchProcessorName bp))
               streamProcessorBatchProcessors
-              [sn <> BS8.pack (show i) | i <- [(0 :: Int) ..]]
+              [(0 :: Int) ..]
       for_ processorsWStepNames \(batchProcessor, sn_i) -> do
         let job pid _stillValid _release =
               case batchProcessor of
@@ -1159,7 +1185,10 @@ instance MonadStream LeaseBasedStreamWorker where
                           . void
                           . throttleByErrors metrics sn_i
                           . runStreamTxn jobConfigDB
-                          . fmap (iProcessBatch workspaceSS pid)
+                          -- TODO: this is so ugly; fix all these awful cases
+                          -- and use do notation instead. This led directly to
+                          -- a bug.
+                          . (flip (>>=)) (iProcessBatch workspaceSS pid)
                           . recordInputBatchMetrics metrics
                           . streamReadAndCheckpoint
                             cfg
@@ -1243,7 +1272,7 @@ instance MonadStream LeaseBasedStreamWorker where
                           pid
         forEachPartition inStream $ \pid -> do
           taskReg <- taskRegistry
-          let taskName = TaskName $ BS8.pack (show sn ++ "_" ++ show pid)
+          let taskName = TaskName $ BS8.pack (show sn ++ "_tbl_" ++ show pid)
           liftIO
             $ runStreamTxn jobConfigDB
             $ addTask taskReg taskName (leaseDuration cfg) (job pid)

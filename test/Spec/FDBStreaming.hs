@@ -20,7 +20,7 @@ import Data.Persist (Persist)
 import qualified Data.Persist as Persist
 import qualified Data.Set as Set
 import Data.Traversable (for)
-import FDBStreaming (Index, Message (fromMessage, toMessage), MonadStream, Stream, StreamPersisted (FDB), indexBy, pipe', run, streamTopic, oneToOneJoin)
+import FDBStreaming (Index, Message (fromMessage, toMessage), MonadStream, Stream, StreamPersisted (FDB), indexBy, pipe', run, streamTopic, oneToOneJoin, oneToManyJoin)
 import qualified FDBStreaming.Index as Index
 import qualified FDBStreaming.JobConfig as JC
 import FDBStreaming.TableKey (TableKey)
@@ -30,7 +30,7 @@ import qualified FDBStreaming.Topic as Topic
 import qualified FoundationDB as FDB
 import FoundationDB (Database, await, runTransaction)
 import FoundationDB.Layer.Subspace (Subspace)
-import GHC.Generics
+import GHC.Generics ( Generic )
 import Spec.FDBStreaming.Util (extendRand)
 import qualified Streamly.Prelude as S
 import Test.Tasty (TestTree, testGroup)
@@ -144,7 +144,29 @@ oneToOneJoinTest testSS db = testCase "oneToOneJoin" $ do
   results <- Set.fromList <$> dumpStream db outStream
   results @?= Set.fromList (zip in1 in2)
 
+oneToManyJoinJob ::
+  forall m. MonadStream m =>
+  Stream 'FDB TestMsg ->
+  Stream 'FDB TestMsg ->
+  m (Stream 'FDB (TestMsg, TestMsg))
+oneToManyJoinJob l r = do
+  oneToManyJoin "out" l r payload payload (,)
+
+oneToManyJoinTest :: Subspace -> Database -> TestTree
+oneToManyJoinTest testSS db = testCase "oneToManyJoinJob" $ do
+  ss <- extendRand testSS
+  let in1 = [ TestMsg "k1" "1" "2"
+            , TestMsg "k2" "2" "3"
+            , TestMsg "k3" "4" "5"]
+  let in2 = [ TestMsg "k1" "1" "3"
+            , TestMsg "k1" "5" "7"
+            , TestMsg "k2" "7" "9"]
+  outStream <- testOnInput2 ((testJobConfig db ss) {JC.msgsPerBatch = 1}) in1 in2 oneToManyJoinJob
+  results <- Set.fromList <$> dumpStream db outStream
+  results @?= Set.fromList [(x,y) | x <- in1, y <- in2, payload x == payload y]
+
 jobTests :: Subspace -> Database -> TestTree
 jobTests testSS db = testGroup "Jobs" [indexTest testSS db,
                                        oneToOneSelfJoinTest testSS db,
-                                       oneToOneJoinTest testSS db]
+                                       oneToOneJoinTest testSS db,
+                                       oneToManyJoinTest testSS db]

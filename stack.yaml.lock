@@ -47,9 +47,6 @@ packages:
   original:
     hackage: witherable-class-0@sha256:91f05518f9f4af5b02424f13ee7dcdab5d6618e01346aa2f388a72ff93e2e501,775
 - completed:
-    cabal-file:
-      size: 2399
-      sha256: 501ed999e587c14877d4cb8b69fdef65fb9e4eec8d11b33459d9c8978275efe5
     name: monoid-statistics
     version: 1.1.0
     git: git@github.com:Shimuuar/monoid-statistics.git
@@ -61,9 +58,6 @@ packages:
     git: git@github.com:Shimuuar/monoid-statistics.git
     commit: d82f384cc127e8bbabb774407d225ef07f341076
 - completed:
-    cabal-file:
-      size: 7318
-      sha256: 7dbff82bc126b657692174ca304ec397c0c6d11960f181ced7ce9fb320d668a0
     name: foundationdb-haskell
     version: 0.1.0.0
     git: https://github.com/crclark/foundationdb-haskell.git

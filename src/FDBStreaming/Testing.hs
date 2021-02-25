@@ -48,7 +48,7 @@ waitCountUnchanged ::
   -- | Max iterations
   Int ->
   IO ()
-waitCountUnchanged _ _ _ 0 = return ()
+waitCountUnchanged _ _ _ 0 = putStrLn "WARN: test job timed out"
 waitCountUnchanged db cfg topology maxIter = do
   tc1 <- topicCounts db cfg topology
   threadDelay 5000000
@@ -113,7 +113,7 @@ testJobConfig db ss = JC.JobConfig
     JC.numPeriodicJobThreads = 1,
     JC.defaultNumPartitions = 2,
     JC.defaultChunkSizeBytes = 0,
-    JC.logLevel = Log.LogError
+    JC.logLevel = Log.LogTrace
   }
 
 -- | Get the entire contents of a stream. For testing purposes only.
