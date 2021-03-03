@@ -46,22 +46,16 @@ import Control.Concurrent.Async
     race,
     waitAny,
   )
-import Data.Binary.Get
-  ( getWord64le,
-    runGet,
-  )
 import Data.Binary.Put
   ( putWord64le,
     runPut,
   )
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import Data.ByteString.Lazy (fromStrict, toStrict)
 import Data.Foldable (forM_)
 import Data.Function ((&))
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.Maybe (fromMaybe)
 import qualified Data.Sequence as Seq
 import Data.Sequence (Seq ((:|>)))
 import Data.Traversable (for)
@@ -71,7 +65,7 @@ import Data.Word
     Word8,
   )
 import qualified FDBStreaming.Topic.Constants as C
-import FDBStreaming.Util (chunksOfSize, streamlyRangeResult)
+import FDBStreaming.Util (chunksOfSize, streamlyRangeResult, parseWord64le)
 import qualified FoundationDB as FDB
 import FoundationDB as FDB (Database, FutureIO, KeySelector (FirstGreaterOrEq, FirstGreaterThan), Range (Range), Transaction, atomicOp, await, awaitIO, getKey, runTransaction, watch)
 import qualified FoundationDB.Layer.Subspace as FDB
@@ -87,10 +81,7 @@ import FoundationDB.Versionstamp
 import GHC.Generics (Generic)
 import qualified Streamly.Prelude as S
 import System.Random (randomRIO)
-
--- | Integer zero, little endian
-zeroLE :: ByteString
-zeroLE = "\x00\x00\x00\x00\x00\x00\x00\x00"
+import Data.ByteString.Lazy.Char8 (toStrict)
 
 -- | The unique name of a topic.
 type TopicName = ByteString
@@ -263,7 +254,7 @@ listExistingTopics db ss = runTransaction db $ go (FDB.pack ss [C.topics])
 getPartitionCountF :: Topic -> PartitionId -> Transaction (FDB.Future Word64)
 getPartitionCountF topic i = do
   let k = partitionCountKey topic i
-  fmap (maybe 0 (runGet getWord64le . fromStrict)) <$> FDB.get k
+  fmap (maybe 0 parseWord64le) <$> FDB.get k
 
 getTopicCount :: Topic -> Transaction Word64
 getTopicCount topic = do
@@ -281,8 +272,8 @@ incrPartitionCountBy topic pid n = do
 getPartitionCount :: Topic -> PartitionId -> Transaction Word64
 getPartitionCount topic i = do
   let k = partitionCountKey topic i
-  bs <- fromMaybe zeroLE <$> (FDB.get k >>= await)
-  return $ (runGet getWord64le . fromStrict) bs
+  bs <- FDB.get k >>= await
+  return $ maybe 0 parseWord64le bs
 
 -- | A private subspace for a consumer of a topic. The consumer may record
 -- anything it wants in this subspace.

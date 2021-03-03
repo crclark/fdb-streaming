@@ -12,7 +12,9 @@ module FDBStreaming.Util (
   logAndRethrowErrors,
   withOneIn,
   chunksOfSize,
-  streamlyRangeResult
+  streamlyRangeResult,
+  parseWord64le,
+  addOneAtomic
 ) where
 
 import Control.Logger.Simple (logError, showText)
@@ -24,7 +26,7 @@ import Control.Exception
     throw
   )
 import Control.Monad.IO.Class (MonadIO, liftIO)
-import Data.Binary.Get (Get, runGetOrFail)
+import Data.Binary.Get (Get, getWord64le, runGet, runGetOrFail)
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (fromStrict)
 import Data.Fixed (Fixed (MkFixed), E12)
@@ -36,6 +38,7 @@ import qualified Streamly as S
 import qualified Streamly.Prelude as S
 import System.Random (Random, randomRIO)
 import qualified FoundationDB as FDB
+import qualified FoundationDB.Options.MutationType as Mut
 import Control.Monad (when)
 
 currMillisSinceEpoch :: MonadIO m => m Int64
@@ -115,3 +118,13 @@ streamlyRangeResult rr =
     (Just (FDB.RangeMore xs f)) -> do
       next <- FDB.await f
       return (Just (xs, Just next))
+
+-- This just throws an error because if we fail to parse a number from FDB, we
+-- are in a totally broken state, anyway.
+parseWord64le :: Num a => ByteString -> a
+parseWord64le bs = fromIntegral $ runGet getWord64le $ fromStrict bs
+
+-- Adds little-endian encoded 1 to the value stored at the given key.
+addOneAtomic :: ByteString -> FDB.Transaction ()
+addOneAtomic k = FDB.atomicOp k (Mut.add oneLE)
+  where oneLE = "\x01\x00\x00\x00\x00\x00\x00\x00"

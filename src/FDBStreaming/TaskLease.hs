@@ -42,11 +42,7 @@ module FDBStreaming.TaskLease (
 ) where
 
 import           Control.Monad.IO.Class         ( liftIO )
-import           Data.Binary.Get                ( runGet
-                                                , getWord64le
-                                                )
 import           Data.ByteString                ( ByteString )
-import           Data.ByteString.Lazy           ( fromStrict )
 import           Data.Maybe                     ( fromMaybe )
 import           Data.Sequence                  ( Seq )
 import qualified Data.Sequence                  as Seq
@@ -61,7 +57,7 @@ import qualified FoundationDB as FDB
 import           FoundationDB.Layer.Subspace (Subspace)
 import qualified FoundationDB.Layer.Subspace as FDB
 import qualified FoundationDB.Layer.Tuple as FDB
-import qualified FoundationDB.Options.MutationType as Mut
+import FDBStreaming.Util (parseWord64le, addOneAtomic)
 
 -- | Uniquely identifies an acquired lease on a 'TaskName'.
 newtype AcquiredLease = AcquiredLease Int
@@ -86,18 +82,13 @@ newtype TaskSpace = TaskSpace Subspace
 taskSpace :: Subspace -> TaskSpace
 taskSpace = TaskSpace
 
--- subspace structure constants
-
--- | integer one, little endian encoded
-oneLE :: ByteString
-oneLE = "\x01\x00\x00\x00\x00\x00\x00\x00"
-
 -- | Returns the number of seconds since the epoch.
 secondsSinceEpoch :: IO Int
 secondsSinceEpoch = do
   t <- getTime Realtime
   return $ fromIntegral (toNanoSecs t `div` 1_000_000_000)
 
+-- subspace structure constants
 available, locked, allTasks, count, lockVersions, expiresAts :: ByteString
 -- | 'available' records available (unleased) tasks.
 --   key is (taskId, taskName). Value is empty.
@@ -177,33 +168,29 @@ parseExpiresAtKey (TaskSpace ss) k =
 
   where expiresAtSS = FDB.extend ss [ FDB.Bytes expiresAts ]
 
--- TODO: incrementing and counting code is getting repeated everywhere. DRY out!
 getCount :: TaskSpace -> Transaction Word64
 getCount l = do
   let k = countKey l
   FDB.get k >>= FDB.await >>= \case
     Nothing -> return 0
-    Just bs -> return $ (runGet getWord64le . fromStrict) bs
+    Just bs -> return $ parseWord64le bs
 
 incrCount :: TaskSpace -> Transaction ()
 incrCount l = do
   let k = countKey l
-  FDB.atomicOp k (Mut.add oneLE)
+  addOneAtomic k
 
 getAcquiredLease :: TaskSpace -> TaskID -> Transaction AcquiredLease
 getAcquiredLease l taskID = do
   let k = lockVersionKey l taskID
   FDB.get k >>= FDB.await >>= \case
     Nothing -> return (AcquiredLease 0)
-    Just bs -> return
-               $ AcquiredLease
-               $ fromIntegral
-               $ (runGet getWord64le . fromStrict) bs
+    Just bs -> return $ AcquiredLease $ parseWord64le bs
 
 incrAcquiredLease :: TaskSpace -> TaskID -> Transaction ()
 incrAcquiredLease l taskID = do
   let k = lockVersionKey l taskID
-  FDB.atomicOp k (Mut.add oneLE)
+  addOneAtomic k
 
 -- | Returns True iff the given lease is still the most recent lease for the
 -- given task. Does not check whether the lease has expired.
