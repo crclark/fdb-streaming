@@ -98,7 +98,7 @@ secondsSinceEpoch = do
   t <- getTime Realtime
   return $ fromIntegral (toNanoSecs t `div` 1_000_000_000)
 
-available, locked, allTasks, count, lockVersions, timeouts :: ByteString
+available, locked, allTasks, count, lockVersions, expiresAts :: ByteString
 -- | 'available' records available (unleased) tasks.
 --   key is (taskId, taskName). Value is empty.
 --   Primarily used to be able to choose a random available task,
@@ -118,12 +118,10 @@ count        = "ct"
 -- key is taskId, value is a little endian counter.
 lockVersions = "lv"
 --- | Stores the current timeout time of each lease.
---    Key is (timesOutAt, name). Value is empty.
---    Note that timesOutAt is first, so we can get the list of locks that have
+--    Key is (expiresAt, name). Value is empty.
+--    Note that expiresAt is first, so we can get the list of locks that have
 --    timed out, using a range read.
---    TODO: rename to expiresAts or something! Timeout is misleading -- it's not
---    a duration; it's an instant.
-timeouts     = "to"
+expiresAts     = "to"
 
 availableKey :: TaskSpace -> TaskID -> TaskName -> ByteString
 availableKey (TaskSpace ss) (TaskID tid) (TaskName nm) =
@@ -147,7 +145,7 @@ lockedKey (TaskSpace ss) (TaskID tid) _ =
 
 parseLockedValue :: ByteString -> Int
 parseLockedValue v = case FDB.decodeTupleElems v of
-  Right [FDB.Int timesOutAt] -> fromIntegral timesOutAt
+  Right [FDB.Int expiresAt] -> fromIntegral expiresAt
   x -> error $ "failed to parse timeout " ++ show x
 
 allTasksKey :: TaskSpace -> TaskID -> TaskName -> ByteString
@@ -164,20 +162,20 @@ lockVersionKey :: TaskSpace -> TaskID -> ByteString
 lockVersionKey (TaskSpace ss) (TaskID tid) =
   FDB.pack ss [FDB.Bytes lockVersions, FDB.Int (fromIntegral tid)]
 
-timeoutsKey :: TaskSpace -> Int -> TaskName -> ByteString
-timeoutsKey (TaskSpace ss) seconds (TaskName nm) =
-  FDB.pack ss [ FDB.Bytes timeouts
+expiresAtKey :: TaskSpace -> Int -> TaskName -> ByteString
+expiresAtKey (TaskSpace ss) seconds (TaskName nm) =
+  FDB.pack ss [ FDB.Bytes expiresAts
               , FDB.Int (fromIntegral seconds)
               , FDB.Bytes nm
               ]
 
-parseTimeoutsKey :: TaskSpace -> ByteString -> (Int, TaskName)
-parseTimeoutsKey (TaskSpace ss) k =
-  case FDB.unpack timeoutSS k of
-    Right [FDB.Int timeout, FDB.Bytes name] -> (fromIntegral timeout, TaskName name)
-    x -> error $ "Failed to parse timeouts key: " ++ show x
+parseExpiresAtKey :: TaskSpace -> ByteString -> (Int, TaskName)
+parseExpiresAtKey (TaskSpace ss) k =
+  case FDB.unpack expiresAtSS k of
+    Right [FDB.Int expiresAt, FDB.Bytes name] -> (fromIntegral expiresAt, TaskName name)
+    x -> error $ "Failed to parse expiresAts key: " ++ show x
 
-  where timeoutSS = FDB.extend ss [ FDB.Bytes timeouts ]
+  where expiresAtSS = FDB.extend ss [ FDB.Bytes expiresAts ]
 
 -- TODO: incrementing and counting code is getting repeated everywhere. DRY out!
 getCount :: TaskSpace -> Transaction Word64
@@ -255,14 +253,14 @@ ensureTask l taskName =
       FDB.set alk ""
 
 -- | Clear the old timeout key for a previously locked task, if it exists.
-clearOldTimeoutKey :: TaskSpace -> TaskID -> TaskName -> Transaction ()
-clearOldTimeoutKey l taskID taskName = do
+clearOldExpiresAtKey :: TaskSpace -> TaskID -> TaskName -> Transaction ()
+clearOldExpiresAtKey l taskID taskName = do
   let lkk = lockedKey l taskID taskName
   oldTimesOutAtBytes <- FDB.get lkk >>= FDB.await
   case fmap parseLockedValue oldTimesOutAtBytes of
     Nothing -> return ()
     Just oldTimesOutAt -> do
-      let toClear = timeoutsKey l oldTimesOutAt taskName
+      let toClear = expiresAtKey l oldTimesOutAt taskName
       FDB.clear toClear
 
 -- | Forces the acquisition of a lock, even if it was already locked. The caller
@@ -274,13 +272,13 @@ acquire l taskName seconds =
     Nothing -> error "impossible happened: tried to acquire nonexistent lock"
     Just taskID -> do
       currTime <- liftIO secondsSinceEpoch
-      let timesOutAt = currTime + seconds
-      clearOldTimeoutKey l taskID taskName
+      let expiresAt = currTime + seconds
+      clearOldExpiresAtKey l taskID taskName
       let lkk = lockedKey l taskID taskName
-      FDB.set lkk (FDB.encodeTupleElems [FDB.Int (fromIntegral timesOutAt)])
+      FDB.set lkk (FDB.encodeTupleElems [FDB.Int (fromIntegral expiresAt)])
       let avk = availableKey l taskID taskName
       FDB.clear avk
-      let tok = timeoutsKey l timesOutAt taskName
+      let tok = expiresAtKey l expiresAt taskName
       FDB.set tok ""
       incrAcquiredLease l taskID
       getAcquiredLease l taskID
@@ -295,7 +293,7 @@ getTimesOutAt l taskName =
     Just taskID ->
       FDB.get (lockedKey l taskID taskName) >>= FDB.await >>= \case
         Nothing -> return Nothing
-        Just timesOutAtBytes -> return $ Just $ parseLockedValue timesOutAtBytes
+        Just expiresAtBytes -> return $ Just $ parseLockedValue expiresAtBytes
 
 -- | Returns true if the lease has been acquired and the current acquired lease
 -- has not expired.
@@ -303,9 +301,9 @@ isLocked :: TaskSpace -> TaskName -> Transaction Bool
 isLocked l taskName =
   getTimesOutAt l taskName >>= \case
     Nothing -> return False
-    Just timesOutAt -> do
+    Just expiresAt -> do
       currTime <- liftIO secondsSinceEpoch
-      return (currTime <= timesOutAt)
+      return (currTime <= expiresAt)
 
 -- | Attempt to acquire the given task. If it is already locked by another
 -- worker, returns 'Nothing'. Otherwise, returns the acquired lease.
@@ -343,12 +341,12 @@ release l taskName@(TaskName nm) lockVersion =
       currVersion | currVersion < lockVersion -> return InvalidLease
       _ -> do
           let lkk = lockedKey l taskID taskName
-          timesOutAtBytes <- FDB.get lkk >>= FDB.await
-          case fmap parseLockedValue timesOutAtBytes of
+          expiresAtBytes <- FDB.get lkk >>= FDB.await
+          case fmap parseLockedValue expiresAtBytes of
             Nothing -> return InvalidLease
-            Just timesOutAt -> do
+            Just expiresAt -> do
               FDB.clear lkk
-              FDB.clear (timeoutsKey l timesOutAt taskName)
+              FDB.clear (expiresAtKey l expiresAt taskName)
               let avk = availableKey l taskID taskName
               FDB.set avk nm
               return ReleaseSuccess
@@ -356,14 +354,13 @@ release l taskName@(TaskName nm) lockVersion =
 -- | Returns all tasks that were locked, but whose leases have expired.
 expiredLocks :: TaskSpace -> Transaction (Seq TaskName)
 expiredLocks ls@(TaskSpace ss) = do
-  let timeoutSS = FDB.extend ss [FDB.Bytes timeouts ]
-  --TODO: pass in time boundaries?
+  let timeoutSS = FDB.extend ss [FDB.Bytes expiresAts ]
   currTime <- liftIO secondsSinceEpoch
   let end = FDB.pack timeoutSS [FDB.Int $ fromIntegral currTime ]
   let range = (FDB.subspaceRange timeoutSS)
                 {FDB.rangeEnd = FDB.FirstGreaterOrEq end}
   res <- FDB.getEntireRange range
-  return (fmap (\(k,_) -> snd (parseTimeoutsKey ls k)) res)
+  return (fmap (\(k,_) -> snd (parseExpiresAtKey ls k)) res)
 
 -- | Returns all tasks in the available state. Tasks are in the available state
 -- if they are newly created or they have been successfully released. If a worker
