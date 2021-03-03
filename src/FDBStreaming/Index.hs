@@ -20,17 +20,12 @@ module FDBStreaming.Index
   )
 where
 
-import Data.Binary.Get
-  ( getWord64le,
-    runGet,
-  )
 import Data.ByteString (ByteString)
-import Data.ByteString.Lazy (fromStrict)
 import Data.Word (Word64)
 import FDBStreaming.TableKey (OrdTableKey, TableKey (fromKeyBytes, toKeyBytes))
 import qualified FDBStreaming.Topic as Topic
 import qualified FDBStreaming.Topic.Constants as Constants
-import FDBStreaming.Util (streamlyRangeResult)
+import FDBStreaming.Util (streamlyRangeResult, parseWord64le, addOneAtomic)
 import qualified FoundationDB as FDB
 import FoundationDB as FDB (KeySelector (FirstGreaterOrEq), Range (Range), Transaction, atomicOp, await)
 import qualified FoundationDB.Layer.Subspace as FDB
@@ -42,10 +37,6 @@ import qualified Streamly as S
 indexKeys, counts :: FDB.Elem
 indexKeys = FDB.Int 0
 counts = FDB.Int 1
-
--- | integer one, little endian encoded
-oneLE :: ByteString
-oneLE = "\x01\x00\x00\x00\x00\x00\x00\x00"
 
 -- | A secondary index on a 'Topic'. This can be used to look up individual
 -- messages within a topic.
@@ -90,7 +81,7 @@ parseCountKV ::
   (ByteString, ByteString) ->
   (k, Word64)
 parseCountKV Index {indexSS} (k, v) =
-  case (FDB.unpack indexSS k, runGet getWord64le $ fromStrict v) of
+  case (FDB.unpack indexSS k, parseWord64le v) of
     (Right [FDB.Int 1, FDB.Bytes k'], c) -> (fromKeyBytes k', c)
     _ -> error "Failed to parse count key/value pair."
 
@@ -116,7 +107,7 @@ index ix@Index {indexSS} k (Topic.CoordinateUncommitted pid vs i) = do
             FDB.Int $ fromIntegral i
           ]
   FDB.atomicOp ik (Mut.setVersionstampedKey "")
-  FDB.atomicOp (countKey ix k) (Mut.add oneLE)
+  addOneAtomic (countKey ix k)
 
 -- | Index a single message in a topic by the given key. This must be called in
 -- a subsequent transaction to the one that originally wrote the message to
@@ -139,7 +130,7 @@ indexCommitted ix@Index {indexSS} k (Topic.Coordinate pid vs i) = do
             FDB.Int $ fromIntegral i
           ]
   FDB.set ik ""
-  FDB.atomicOp (countKey ix k) (Mut.add oneLE)
+  addOneAtomic (countKey ix k)
 
 -- | Returns a range corresponding to all coordinates for the given key in the
 -- given index. Coordinates will be returned in the order in which they were
@@ -193,7 +184,7 @@ coordinateRangeStream ix r = do
 -- | Returns the number of messages indexed by the given key.
 countForKey :: TableKey k => Index k -> k -> Transaction (FDB.Future Word64)
 countForKey ix k =
-  fmap (maybe 0 (runGet getWord64le . fromStrict))
+  fmap (maybe 0 parseWord64le)
     <$> FDB.get (countKey ix k)
 
 -- | Returns a range containing the count of keys for each key between @k1@ and

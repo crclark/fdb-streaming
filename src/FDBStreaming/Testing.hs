@@ -73,7 +73,6 @@ testOnInput cfg xs topology = do
   void $ writeTopicIO (JC.jobConfigDB cfg) inTopic (fmap toMessage xs)
   let strm = fromMessage <$> streamFromTopic inTopic "test_input_stream"
   job <- async $ runJob cfg (topology strm)
-  -- TODO: this is probably incredibly brittle.
   waitCountUnchanged (JC.jobConfigDB cfg) cfg (topology strm) 10
   cancel job
   return $ runPure cfg (topology strm)
@@ -95,7 +94,6 @@ testOnInput2 cfg xs ys topology = do
   let strmXs = fromMessage <$> streamFromTopic inTopicXs "test_input_stream"
   let strmYs = fromMessage <$> streamFromTopic inTopicYs "test_input_stream2"
   job <- async $ runJob cfg (topology strmXs strmYs)
-  -- TODO: this is probably incredibly brittle.
   waitCountUnchanged (JC.jobConfigDB cfg) cfg (topology strmXs strmYs) 10
   cancel job
   return $ runPure cfg (topology strmXs strmYs)
@@ -113,7 +111,7 @@ testJobConfig db ss = JC.JobConfig
     JC.numPeriodicJobThreads = 1,
     JC.defaultNumPartitions = 2,
     JC.defaultChunkSizeBytes = 0,
-    JC.logLevel = Log.LogTrace
+    JC.logLevel = Log.LogInfo
   }
 
 -- | Get the entire contents of a stream. For testing purposes only.

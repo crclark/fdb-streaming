@@ -872,13 +872,11 @@ oneToManyJoin' inl inr pl pr j =
       lstep =
         IBatchProcessor
           { iBatchInStream = inl,
-            iProcessBatch = \workSS pid lmsgs -> do
-                             logInfo "about to start lMessageJob"
+            iProcessBatch = \workSS pid lmsgs ->
                              OTM.lMessageJob (OTM.oneToManyJoinSS workSS)
                                              pid
                                              pl
-                                             (fmap snd lmsgs)
-                             logInfo "finished lMessageJob",
+                                             (fmap snd lmsgs),
             iBatchNumPartitions = fromIntegral $ streamMinReaderPartitions inl,
             iBatchProcessorName = "otml"
           }

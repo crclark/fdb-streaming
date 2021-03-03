@@ -39,7 +39,7 @@ import FDBStreaming.TaskLease
     TaskName,
     TaskSpace (TaskSpace),
     TaskSpace,
-    acquireRandomUnbiased,
+    acquireRandom,
     ensureTask,
     release,
     tryAcquire,
@@ -114,7 +114,7 @@ semantics db testTaskSpace (EnsureTask taskName) = do
   result <- runTransaction db $ ensureTask testTaskSpace taskName
   return $ TaskEnsured result
 semantics db testTaskSpace (AcquireRandom n) = do
-  result <- runTransaction db $ acquireRandomUnbiased testTaskSpace (const n)
+  result <- runTransaction db $ acquireRandom testTaskSpace (const n)
   case result of
     Nothing -> return AlreadyLocked
     Just (taskName, lease, _) -> return (AcquiredRandom taskName lease)
@@ -343,19 +343,19 @@ mutualExclusion (TaskSpace testSS) db =
 
 mutualExclusionRandom :: TaskSpace -> Database -> TestTree
 mutualExclusionRandom (TaskSpace testSS) db =
-  testCase "With only one task, acquireRandomUnbiased should be equivalent to acquire" $ do
+  testCase "With only one task, acquireRandom should be equivalent to acquire" $ do
     ss <- TaskSpace <$> extendRand testSS
     let taskName = "testTask2"
     res <- runTransaction db $ ensureTask ss taskName
     assertBool "created" $ isNewlyCreated res
-    acq1 <- runTransaction db $ acquireRandomUnbiased ss (const 5)
+    acq1 <- runTransaction db $ acquireRandom ss (const 5)
     acq1 @?= Just (taskName, AcquiredLease 1, Available)
-    acq2 <- runTransaction db $ acquireRandomUnbiased ss (const 5)
+    acq2 <- runTransaction db $ acquireRandom ss (const 5)
     acq2 @?= Nothing
     threadDelay 7000000
-    acq3 <- runTransaction db $ acquireRandomUnbiased ss (const 5)
+    acq3 <- runTransaction db $ acquireRandom ss (const 5)
     acq3 @?= Just (taskName, AcquiredLease 2, RandomExpired)
-    acq4 <- runTransaction db $ acquireRandomUnbiased ss (const 5)
+    acq4 <- runTransaction db $ acquireRandom ss (const 5)
     acq4 @?= Nothing
 
 uniformRandomness :: TaskSpace -> Database -> TestTree
