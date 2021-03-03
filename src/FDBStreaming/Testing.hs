@@ -113,7 +113,7 @@ testJobConfig db ss = JC.JobConfig
     JC.numPeriodicJobThreads = 1,
     JC.defaultNumPartitions = 2,
     JC.defaultChunkSizeBytes = 0,
-    JC.logLevel = Log.LogTrace
+    JC.logLevel = Log.LogInfo
   }
 
 -- | Get the entire contents of a stream. For testing purposes only.

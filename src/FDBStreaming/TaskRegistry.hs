@@ -12,13 +12,13 @@ module FDBStreaming.TaskRegistry
 where
 
 import Control.Concurrent (myThreadId)
-import Control.Logger.Simple (logError, logDebug, showText)
+import Control.Logger.Simple (logWarn, logDebug, showText)
 import Control.Monad (when)
 import Control.Monad.IO.Class (liftIO, MonadIO)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Map (Map)
 import qualified Data.Map as M
-import FDBStreaming.TaskLease (EnsureTaskResult (AlreadyExists, NewlyCreated), ReleaseResult, TaskID, TaskName, TaskSpace, acquireRandomUnbiased, ensureTask, isLeaseValid, isLocked, release, taskSpace)
+import FDBStreaming.TaskLease (EnsureTaskResult (AlreadyExists, NewlyCreated), ReleaseResult, TaskID, TaskName, TaskSpace, acquireRandom, ensureTask, isLeaseValid, isLocked, release, taskSpace)
 import FDBStreaming.Util (logAndRethrowErrors)
 import FoundationDB (Transaction)
 import qualified FoundationDB as FDB
@@ -94,9 +94,8 @@ addTask reg@(TaskRegistry ts tr) taskName dur f = do
   taskID <- extractID <$> ensureTask ts taskName
   alreadyRegistered <- alreadyRegisteredLocally reg taskName
   when alreadyRegistered $ do
-    logError $ "Task is already registered: "
-                <> showText taskName
-    error "Internal error: tried to register task twice"
+    logWarn $ "Task is already registered: "
+               <> showText taskName
   liftIO $ atomicModifyIORef' tr ((,()) . M.insert taskName (taskID, dur, f))
   where
     extractID (AlreadyExists t) = t
@@ -110,7 +109,7 @@ runRandomTask db (TaskRegistry ts tr) = do
   let toDur taskName = case M.lookup taskName tr' of
         Nothing -> 5 -- code below will warn
         Just (_, dur, _) -> dur
-  FDB.runTransaction db (acquireRandomUnbiased ts toDur) >>= \case
+  FDB.runTransaction db (acquireRandom ts toDur) >>= \case
     Nothing -> return False
     Just (taskName, lease, howAcquired) -> case M.lookup taskName tr' of
       Nothing ->

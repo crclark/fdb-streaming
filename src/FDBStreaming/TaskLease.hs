@@ -34,7 +34,6 @@ module FDBStreaming.TaskLease (
   EnsureTaskResult(..),
   tryAcquire,
   acquireRandom,
-  acquireRandomUnbiased,
   HowAcquired(..),
   release,
   ReleaseResult(..),
@@ -378,71 +377,17 @@ availableLocks ts@(TaskSpace ss) = do
   res <- FDB.getEntireRange range
   return $ fmap (\(k,_) -> snd (parseAvailableKey ts k)) res
 
-acquireRandomExpired :: TaskSpace
-                     -> Int
-                     -> Transaction (Maybe (TaskName, AcquiredLease, HowAcquired))
-acquireRandomExpired l seconds = do
-  expired <- FDB.withSnapshot (expiredLocks l)
-  let n = length expired
-  if n > 0
-    then do
-            i <- liftIO $ randomRIO (0, n - 1)
-            let nm = Seq.index expired i
-            tv <- acquire l nm seconds
-            return $ Just (nm, tv, RandomExpired)
-    else return Nothing
-
 data HowAcquired = RandomExpired | Available
   deriving (Show, Eq, Ord)
 
--- | Attempt to acquire a random task. Returns the task name and lock version.
--- This is faster than 'acquireRandomExpired' but can cause starvation of
--- expired tasks when there are fewer workers than tasks, if some workers
--- use deliver and others do not.
-{-# DEPRECATED acquireRandom "Expired tasks can starve when number of workers is less than number of tasks. Use acquireRandomUnbiased instead." #-}
+-- | Acquire a random available or expired lease.
 acquireRandom :: TaskSpace
-              -> Int
-              -> Transaction (Maybe (TaskName, AcquiredLease, HowAcquired))
-acquireRandom l@(TaskSpace ss) seconds = do
-  --TODO: fdb task bucket uses UUIDs so it doesn't need to spend latency on this
-  -- get.
-  n <- getCount l
-  rand <- liftIO $ randomRIO (0,n)
-  let mkQueryK m = FDB.pack availableSS [ FDB.Int (fromIntegral m) ]
-  let queryK = mkQueryK rand
-  resultK <- FDB.getKey (FDB.LastLessOrEq queryK) >>= FDB.await
-  if not (FDB.contains availableSS resultK)
-    --TODO: recurse w/ limit instead? Return watch?
-    then do
-      let queryK' = mkQueryK n
-      resultK' <- FDB.getKey (FDB.LastLessOrEq queryK') >>= FDB.await
-      if not (FDB.contains availableSS resultK')
-        then acquireRandomExpired l seconds
-        else acquireAvailable resultK'
-    else acquireAvailable resultK
-
-  where
-    acquireAvailable k = case FDB.unpack availableSS k of
-      Right [FDB.Int _tid, FDB.Bytes nm] -> do
-         tv <- acquire l (TaskName nm) seconds
-         return $ Just (TaskName nm, tv, Available)
-      _ -> error $ "unexpected key format when acquiring lock: " ++ show k
-
-    availableSS = FDB.extend ss [FDB.Bytes available]
-
--- | Acquire a random available or expired lease. Unlike the deprecated
--- 'acquireRandom', this is not biased towards available leases and is thus
--- completely fair -- all tasks will progress. However, this has higher overhead
--- -- it does two range reads to get all available and expired leases, while
--- in most cases, acquireRandom does O(1) work. For the number of tasks we are
--- typically using, however, this shouldn't be an issue.
-acquireRandomUnbiased :: TaskSpace
                       -> (TaskName -> Int)
                       -- ^ How long to lock the task, depending on its name.
                       -> Transaction (Maybe (TaskName, AcquiredLease, HowAcquired))
-acquireRandomUnbiased ts taskSeconds = do
-  -- TODO: many more tests to ensure that these snapshot reads are safe and
-  -- that no two workers can acquire the same lease.
+acquireRandom ts taskSeconds = do
+  -- Note: these snapshot reads are safe because 'acquire' below will conflict
+  -- if two workers concurrently try to acquire the same lease.
   expireds <- FDB.withSnapshot $ expiredLocks ts
   availables <- FDB.withSnapshot $ availableLocks ts
   let tasks = expireds <> availables
