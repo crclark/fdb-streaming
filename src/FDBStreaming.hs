@@ -439,7 +439,8 @@ runStreamTxn =
       -- No point in retrying since we are running in a loop
       -- anyway.
       maxRetries = 0,
-      timeout = 5000
+      timeout = 5000,
+      FDB.getConflictingKeys = False
     }
 
 {-
@@ -1271,9 +1272,9 @@ throttleByErrors metrics sn x =
               logWarn (showText sn <> " timed out. If this keeps happening, try reducing the batch size.")
               incrTimeouts metrics
               threadDelay 15000
-            Error (MaxRetriesExceeded (CError NotCommitted)) -> do
+            Error (MaxRetriesExceeded (CError (NotCommitted range))) -> do
               incrConflicts metrics
-              logWarn (showText sn <> " conflicted with another transaction. If this happens frequently, it may be a bug in fdb-streaming. If this step is a join, occasional conflicts are expected and shouldn't impact performance.")
+              logWarn (showText sn <> " conflicted with another transaction. If this happens frequently, it may be a bug in fdb-streaming. If this step is a join, occasional conflicts are expected and shouldn't impact performance. Conflict range: " <> showText range)
               threadDelay 15000
             e -> throw e
         ),

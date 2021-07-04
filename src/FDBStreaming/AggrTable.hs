@@ -224,7 +224,7 @@ getTableRangeVia ::
 getTableRangeVia table pid start end parse = do
   let startK = SS.pack (aggrTableSS table) [FDB.Int (fromIntegral pid), FDB.Bytes (toKeyBytes start)]
   let endK = SS.pack (aggrTableSS table) [FDB.Int (fromIntegral pid), FDB.Bytes (toKeyBytes end)]
-  let range = FDB.keyRangeInclusive startK endK
+  let range = FDB.keyRangeQueryInclusive startK endK
   let unwrapOuterBytes bs = case SS.unpack (aggrTableSS table) bs of
         Left err -> error $ "Error decoding table key in getTableRangeVia: " ++ show err
         Right [FDB.Int _, FDB.Bytes bs'] -> bs'

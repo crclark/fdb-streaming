@@ -10,7 +10,7 @@ where
 import FDBStreaming.Message (Message (fromMessage, toMessage))
 import qualified FDBStreaming.Topic.Constants as C
 import FoundationDB (Future, Transaction, clearRange, get, rangeKeys, set)
-import FoundationDB.Layer.Subspace (Subspace, extend, pack, subspaceRange)
+import FoundationDB.Layer.Subspace (Subspace, extend, pack, subspaceRangeQuery)
 import FoundationDB.Layer.Tuple (Elem (Bytes, Int))
 
 -- | For one-to-one joins, we have an outer subspace, and then for each join key
@@ -125,7 +125,7 @@ delete1to1JoinData ::
   Message k => OneToOneJoinSS -> k -> Transaction ()
 delete1to1JoinData joinSS k = do
   let ss = oneToOneKeySS joinSS k
-  let (x, y) = rangeKeys $ subspaceRange ss
+  let (x, y) = rangeKeys $ subspaceRangeQuery ss
   clearRange x y
 
 write1to1JoinData ::
