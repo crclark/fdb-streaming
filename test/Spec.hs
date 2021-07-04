@@ -21,7 +21,7 @@ testSS = subspace [Bytes "fdbstreaming-test"]
 
 cleanup :: Database -> IO ()
 cleanup db = do
-  let (begin, end) = rangeKeys $ subspaceRange testSS
+  let (begin, end) = rangeKeys $ subspaceRangeQuery testSS
   runTransactionWithConfig defaultConfig {timeout = 5000} db $ clearRange begin end
 
 allTests :: Database -> TestTree

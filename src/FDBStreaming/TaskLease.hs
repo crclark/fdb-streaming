@@ -344,7 +344,7 @@ expiredLocks ls@(TaskSpace ss) = do
   let timeoutSS = FDB.extend ss [FDB.Bytes expiresAts ]
   currTime <- liftIO secondsSinceEpoch
   let end = FDB.pack timeoutSS [FDB.Int $ fromIntegral currTime ]
-  let range = (FDB.subspaceRange timeoutSS)
+  let range = (FDB.subspaceRangeQuery timeoutSS)
                 {FDB.rangeEnd = FDB.FirstGreaterOrEq end}
   res <- FDB.getEntireRange range
   return (fmap (\(k,_) -> snd (parseExpiresAtKey ls k)) res)
@@ -357,7 +357,7 @@ expiredLocks ls@(TaskSpace ss) = do
 availableLocks :: TaskSpace -> Transaction (Seq TaskName)
 availableLocks ts@(TaskSpace ss) = do
   let availableSS = FDB.extend ss [FDB.Bytes available]
-  let range = FDB.subspaceRange availableSS
+  let range = FDB.subspaceRangeQuery availableSS
   res <- FDB.getEntireRange range
   return $ fmap (\(k,_) -> snd (parseAvailableKey ts k)) res
 

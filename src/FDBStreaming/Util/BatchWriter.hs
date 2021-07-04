@@ -174,9 +174,9 @@ nextIdemSS cfg ss = do
 
 cleanupOldIdemKeys :: BatchWriterConfig -> FDB.Subspace -> FDB.Transaction ()
 cleanupOldIdemKeys cfg ss = do
-  let totalRange = FDB.subspaceRange ss
+  let totalRange = FDB.subspaceRangeQuery ss
   lastSS <- liftIO $ lastIdemSS cfg ss
-  let lastSlotRange = FDB.subspaceRange lastSS
+  let lastSlotRange = FDB.subspaceRangeQuery lastSS
   kBeginF <- FDB.getKey (FDB.rangeBegin totalRange)
   kEnd <- FDB.getKey (FDB.rangeEnd lastSlotRange) >>= FDB.await
   kBegin <- FDB.await kBeginF
@@ -293,7 +293,8 @@ batchWriterLoop db cfg@BatchWriterConfig{..} inQ ss f = forever $ logErrors ("ba
             -- potentially losing messages.
             , maxRetries = 0
             -- Max timeout, since the user can set 'desiredMaxLatencyMillis'.
-            , timeout = 5000}
+            , timeout = 5000
+            , getConflictingKeys = False}
 
 -- | Create a 'BatchWriter'.
 batchWriter :: BatchWriterConfig

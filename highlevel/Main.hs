@@ -50,7 +50,6 @@ import           Data.Coerce                    ( coerce )
 import           Data.Time.Clock                ( diffUTCTime, getCurrentTime )
 import           Data.Word                      ( Word16, Word8 )
 import           FoundationDB                  as FDB
-import           FoundationDB.Error
 import           FoundationDB.Layer.Subspace   as FDB
 import           FoundationDB.Layer.Tuple      as FDB
 import qualified FoundationDB.Options.NetworkOption as NetOp
@@ -233,7 +232,7 @@ placeAndAwaitOrders db bw table stats latencyDist awaitGauge batchSize shouldWat
     $ forM_ orders $ awaitOrder db table stats latencyDist awaitGauge
   )
   [ Handler (\case
-               Error (MaxRetriesExceeded (CError NotCommitted)) ->
+               Error (MaxRetriesExceeded (CError (NotCommitted _))) ->
                  putStrLn "Caught NotCommitted when writing to topic!"
                e -> putStrLn $ "caught fdb error " ++ show e ++ " while writing to topic")
   , Handler (\(e :: SomeException) ->
@@ -401,7 +400,7 @@ mainLoop db ss Args{ generatorNumThreads
 cleanup :: Database -> Subspace -> IO ()
 cleanup db ss = catches (do
   putStrLn "Cleaning up FDB state"
-  let (delBegin, delEnd) = rangeKeys $ subspaceRange ss
+  let (delBegin, delEnd) = rangeKeys $ subspaceRangeQuery ss
   runTransactionWithConfig defaultConfig {timeout = 5000} db $ clearRange delBegin delEnd
   putStrLn "Cleanup successful")
   [Handler $ \case

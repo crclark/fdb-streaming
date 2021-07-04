@@ -27,11 +27,11 @@ import qualified FDBStreaming.Topic as Topic
 import qualified FDBStreaming.Topic.Constants as Constants
 import FDBStreaming.Util (streamlyRangeResult, parseWord64le, addOneAtomic)
 import qualified FoundationDB as FDB
-import FoundationDB as FDB (KeySelector (FirstGreaterOrEq), Range (Range), Transaction, atomicOp, await)
+import FoundationDB as FDB (KeySelector (FirstGreaterOrEq), RangeQuery (RangeQuery), Transaction, atomicOp, await)
 import qualified FoundationDB.Layer.Subspace as FDB
 import qualified FoundationDB.Layer.Tuple as FDB
 import qualified FoundationDB.Options.MutationType as Mut
-import qualified FoundationDB.Transaction as FDB
+import Safe (fromJustNote)
 import qualified Streamly as S
 
 indexKeys, counts :: FDB.Elem
@@ -137,17 +137,17 @@ indexCommitted ix@Index {indexSS} k (Topic.Coordinate pid vs i) = do
 -- committed. Reverse the range to return the most recently-committed
 -- coordinates first. This can be consumed with 'FDB.getRange' or
 -- 'coordinateRangeStream'.
-coordinateRangeForKey :: TableKey k => Index k -> k -> Range
+coordinateRangeForKey :: TableKey k => Index k -> k -> RangeQuery
 coordinateRangeForKey Index {indexSS} k =
-  FDB.subspaceRange $ FDB.extend indexSS [indexKeys, FDB.Bytes (toKeyBytes k)]
+  FDB.subspaceRangeQuery $ FDB.extend indexSS [indexKeys, FDB.Bytes (toKeyBytes k)]
 
 -- | @coordinateRangeForKeyRange i k1 k2@
 -- returns a range corresponding to all coordinates for the given indexed
 -- range of keys between @k1@ and @k2@ (inclusive). Coordinates will be returned
 -- in ascending order from k1 to k2, and in the order they were committed.
-coordinateRangeForKeyRange :: OrdTableKey k => Index k -> k -> k -> Range
+coordinateRangeForKeyRange :: OrdTableKey k => Index k -> k -> k -> RangeQuery
 coordinateRangeForKeyRange Index {indexSS} k1 k2 =
-  Range
+  RangeQuery
     { FDB.rangeBegin =
         FDB.FirstGreaterOrEq $
           FDB.pack
@@ -157,6 +157,7 @@ coordinateRangeForKeyRange Index {indexSS} k1 k2 =
             ],
       FDB.rangeEnd =
         FDB.FirstGreaterThan
+          $ fromJustNote "impossible index subspace in coordinateRangeForKey"
           $ FDB.prefixRangeEnd
           $ FDB.pack indexSS [indexKeys, FDB.Bytes (toKeyBytes k2)],
       FDB.rangeLimit = Nothing,
@@ -175,7 +176,7 @@ coordinateRangeStream ::
     Functor (t Transaction)
   ) =>
   Index k ->
-  Range ->
+  RangeQuery ->
   FDB.Transaction (t FDB.Transaction (k, Topic.Coordinate))
 coordinateRangeStream ix r = do
   rr <- FDB.getRange r >>= await
@@ -190,9 +191,9 @@ countForKey ix k =
 -- | Returns a range containing the count of keys for each key between @k1@ and
 -- @k2@ (inclusive). Keys will be returned in ascending order from @k1@ to @k2@.
 -- If a key has a count of zero, it will not be included in the returned range.
-countForKeysRange :: OrdTableKey k => Index k -> k -> k -> Range
+countForKeysRange :: OrdTableKey k => Index k -> k -> k -> RangeQuery
 countForKeysRange ix k1 k2 =
-  Range
+  RangeQuery
     { FDB.rangeBegin =
         FDB.FirstGreaterOrEq (countKey ix k1),
       FDB.rangeEnd =
@@ -219,7 +220,7 @@ countForKeysStream ::
     Functor (t Transaction)
   ) =>
   Index k ->
-  Range ->
+  RangeQuery ->
   FDB.Transaction (t FDB.Transaction (k, Word64))
 countForKeysStream ix r = do
   rr <- FDB.getRange r >>= await

@@ -17,7 +17,6 @@ import FDBStreaming.Topic (getTopicCount, makeTopic, writeTopic)
 import qualified FDBStreaming.Util.BatchWriter as BW
 import FoundationDB (runTransaction)
 import qualified FoundationDB as FDB
-import qualified FoundationDB.Error as FDB
 import qualified FoundationDB.Layer.Subspace as FDB
 import Spec.FDBStreaming.Util (extendRand)
 import Test.Tasty (TestTree, testGroup)
