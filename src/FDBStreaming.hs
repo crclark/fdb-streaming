@@ -319,7 +319,6 @@ import FDBStreaming.StreamStep.Internal
     StreamStepConfig (StreamStepConfig),
     batchProcessorHasInput,
     batchProcessorInputTopic,
-    consIndexer,
     defaultStreamStepConfig,
     getStepConfig,
     groupedByInStream,
@@ -333,7 +332,6 @@ import FDBStreaming.StreamStep.Internal
     stepOutputPartitions,
     stepProducesWatermark,
     streamProcessorBatchProcessors,
-    streamProcessorIndexers,
     streamProcessorStreamStepConfig,
     streamProcessorWatermarkBy,
     watermarkBy,
@@ -556,8 +554,8 @@ defaultWatermarkUpstreamTopics sn StreamProcessor {streamProcessorBatchProcessor
         else Nothing
 
 instance MonadStream DefaultWatermarker where
-  run sn step@IndexedStreamProcessor {} =
-    runIndexedStreamProcessor sn step
+  run sn step@IndexedStreamProcessor{} =
+    runIndexedStreamProcessorPure sn step
   run sn step@StreamProcessor {} = do
     JobConfig {jobConfigSS} <- getJobConfig
     output <- makeStream sn sn step
@@ -698,7 +696,6 @@ atLeastOnce sn input f = void $ do
               (fromIntegral $ streamMinReaderPartitions input)
               "alo"
           ],
-        streamProcessorIndexers = [],
         streamProcessorStreamStepConfig = defaultStreamStepConfig
       }
 
@@ -741,7 +738,6 @@ pipe' input f =
             (fromIntegral $ streamMinReaderPartitions input)
             "p"
         ],
-      streamProcessorIndexers = [],
       streamProcessorStreamStepConfig = defaultStreamStepConfig
     }
 
@@ -776,7 +772,6 @@ eventualIndexBy sn f stream = do
               ixer
               (fromIntegral $ streamMinReaderPartitions stream)
               "eix"],
-          streamProcessorIndexers = [],
           streamProcessorStreamStepConfig = defaultStreamStepConfig
         }
   return ix
@@ -833,7 +828,6 @@ oneToOneJoin' inl inr pl pr j =
             (fromIntegral $ streamMinReaderPartitions inr)
             "1r"
         ]
-        []
         defaultStreamStepConfig
 
 -- Streaming one-to-many join. Each message in the left stream may be joined
@@ -910,7 +904,6 @@ oneToManyJoin' inl inr pl pr j =
               rstep,
               flushBacklog
             ],
-          streamProcessorIndexers = [],
           streamProcessorStreamStepConfig = defaultStreamStepConfig
         }
 
@@ -1114,115 +1107,9 @@ outputTopic _ TableProcessor {} = return Nothing
 
 instance MonadStream LeaseBasedStreamWorker where
   run sn step@IndexedStreamProcessor {} =
-    runIndexedStreamProcessor sn step
-  run
-    sn
-    s@StreamProcessor
-      { streamProcessorWatermarkBy,
-        streamProcessorBatchProcessors,
-        streamProcessorIndexers,
-        streamProcessorStreamStepConfig
-      } = do
-      (outStream, outTopic) <- outputStreamAndTopic sn s
-      (cfg@JobConfig {jobConfigDB}, _) <- Reader.ask
-      metrics <- registerStepMetrics sn
-      let workspaceSS =
-            FDB.extend
-              (topicCustomMetadataSS outTopic)
-              [C.streamStepWorkspace]
-      let processorsWStepNames =
-            zipWith
-              (\bp i ->
-                (bp
-                , sn <> BS8.pack (show i) <> "_" <> getBatchProcessorName bp))
-              streamProcessorBatchProcessors
-              [(0 :: Int) ..]
-      for_ processorsWStepNames \(batchProcessor, sn_i) -> do
-        let job pid _stillValid _release =
-              case batchProcessor of
-                IOBatchProcessor{ioBatchInStream, ioProcessBatch} ->
-                  -- NOTE: we must use a case here to do the pattern match to
-                  -- work around a GHC limitation. In 8.6, let gives a very
-                  -- confusing error message about variables escaping their
-                  -- scopes. In 8.8, it gives a more helpful "my brain just
-                  -- exploded" message that says to use a case statement.
-                  case getStream' ioBatchInStream of
-                    (Stream' streamReadAndCheckpoint _ _ _ setUpState destroyState) -> do
-                      bracket
-                        (runStreamTxn jobConfigDB $ setUpState cfg sn_i pid checkpointSS)
-                        destroyState
-                        (doForSeconds (leaseDuration cfg)
-                          . void
-                          . throttleByErrors metrics sn_i
-                          . runStreamTxn jobConfigDB
-                          . runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy
-                          . runIndexers streamProcessorIndexers outTopic
-                          . writeToRandomPartition outTopic
-                          . transformBatch (ioProcessBatch workspaceSS pid)
-                          . recordInputBatchMetrics metrics
-                          . streamReadAndCheckpoint
-                            cfg
-                            sn_i
-                            pid
-                            checkpointSS
-                            (getMsgsPerBatch cfg streamProcessorStreamStepConfig))
-                      where
-                        -- TODO: DRY out
-                        checkpointSS =
-                          streamConsumerCheckpointSS
-                            (jobConfigSS cfg)
-                            ioBatchInStream
-                            sn_i
-                IBatchProcessor{iBatchInStream, iProcessBatch} ->
-                  case getStream' iBatchInStream of
-                    (Stream' streamReadAndCheckpoint _ _ _ setUpState destroyState) -> do
-                      bracket
-                        (runStreamTxn jobConfigDB $ setUpState cfg sn_i pid checkpointSS)
-                        destroyState
-                        (doForSeconds (leaseDuration cfg)
-                          . void
-                          . throttleByErrors metrics sn_i
-                          . runStreamTxn jobConfigDB
-                          -- TODO: this is so ugly; fix all these awful cases
-                          -- and use do notation instead. This led directly to
-                          -- a bug.
-                          . (flip (>>=)) (iProcessBatch workspaceSS pid)
-                          . recordInputBatchMetrics metrics
-                          . streamReadAndCheckpoint
-                            cfg
-                            sn_i
-                            pid
-                            checkpointSS
-                            (getMsgsPerBatch cfg streamProcessorStreamStepConfig))
-                      where
-                        checkpointSS =
-                          streamConsumerCheckpointSS
-                            (jobConfigSS cfg)
-                            iBatchInStream
-                            sn_i
-                OBatchProcessor{oProcessBatch} ->
-                  doForSeconds (leaseDuration cfg)
-                          $ void
-                          $ throttleByErrors metrics sn_i
-                          $ runStreamTxn jobConfigDB
-                          $ runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy
-                          $ runIndexers streamProcessorIndexers outTopic
-                          $ writeToRandomPartition outTopic
-                          $ oProcessBatch workspaceSS pid
-                BatchProcessor{processBatch} ->
-                  doForSeconds (leaseDuration cfg)
-                          $ void
-                          $ throttleByErrors metrics sn_i
-                          $ runStreamTxn jobConfigDB
-                          $ processBatch workspaceSS pid
-
-        forEachPartition' (numBatchPartitions batchProcessor) $ \pid -> do
-          let taskName = mkTaskName sn_i pid
-          taskReg <- taskRegistry
-          liftIO
-            $ runStreamTxn jobConfigDB
-            $ addTask taskReg taskName (leaseDuration cfg) (job pid)
-      return outStream
+    runIndexedStreamProcessorLeaseBased sn step
+  run sn step@StreamProcessor {} =
+    runStreamProcessorLeaseBased sn step []
   run
     sn
     step@( TableProcessor
@@ -1586,7 +1473,7 @@ instance HasJobConfig PureStream where
 
 instance MonadStream PureStream where
   run sn step@IndexedStreamProcessor {} =
-    runIndexedStreamProcessor sn step
+    runIndexedStreamProcessorPure sn step
   run sn s@StreamProcessor {} = makeStream sn sn s
   run sn s@TableProcessor {} = do
     cfg <- getJobConfig
@@ -1625,7 +1512,7 @@ instance MonadStream ListTopics where
   run sn step@IndexedStreamProcessor {} = do
     t <- outputTopic sn step
     State.modify (fromJust t :)
-    runIndexedStreamProcessor sn step
+    runIndexedStreamProcessorPure sn step
   run sn step@StreamProcessor {} = do
     t <- outputTopic sn step
     State.modify (fromJust t :)
@@ -1644,22 +1531,208 @@ listTopics :: JobConfig -> (forall m. MonadStream m => m a) -> [Topic]
 listTopics cfg f =
   State.execState (Reader.runReaderT (unListTopics f) cfg) []
 
-runIndexedStreamProcessor :: (HasJobConfig m, MonadStream m) => StepName -> StreamStep outMsg runResult -> m runResult
-runIndexedStreamProcessor
+-- | Run function for 'IndexedStreamProcessor'. If the input is not
+-- an 'IndexedStreamProcessor', fails.
+--
+-- Internally, this function collects all the indexers the user has set for
+-- this stream step into a list, then runs the step by calling
+-- 'runStreamProcessorLeaseBased' on the step and its indexers. The purpose of
+-- the function is to "forget" the type information that is remembered
+-- by the 'IndexedStreamProcessor' constructor.
+runIndexedStreamProcessorLeaseBased :: StepName
+                                    -> StreamStep outMsg runResult
+                                    -> LeaseBasedStreamWorker runResult
+runIndexedStreamProcessorLeaseBased
   sn
-  step@IndexedStreamProcessor
-    { indexedStreamProcessorInner,
-      indexedStreamProcessorIndexName,
-      indexedStreamProcessorIndexBy
-    } = do
-    let step' =
-          consIndexer
-            indexedStreamProcessorInner
-            indexedStreamProcessorIndexName
-            indexedStreamProcessorIndexBy
-    res <- run sn step'
-    mtopic <- outputTopic sn step
-    case mtopic of
-      Nothing -> error "impossible happened"
-      Just topic -> return (Ix.namedIndex topic indexedStreamProcessorIndexName, res)
-runIndexedStreamProcessor _ _ = error "runIndexedStreamProcessor called on wrong constructor"
+  step@IndexedStreamProcessor {} = go step []
+
+    where
+      go :: StreamStep outMsg runResult -> [Indexer outMsg] -> LeaseBasedStreamWorker runResult
+      go
+        step'@IndexedStreamProcessor { indexedStreamProcessorInner
+                                     , indexedStreamProcessorIndexName
+                                     , indexedStreamProcessorIndexBy
+                                     }
+        indexers = do
+          result <- go indexedStreamProcessorInner
+                       (Indexer
+                          indexedStreamProcessorIndexName
+                          indexedStreamProcessorIndexBy
+                        : indexers)
+          mtopic <- outputTopic sn step'
+          case mtopic of
+            -- impossible because if there is no output, then there is no
+            -- output to be indexed. Also impossible by construction. :)
+            Nothing -> error "impossible case in runIndexedStreamProcessorLeaseBased"
+            Just topic -> return (Ix.namedIndex topic indexedStreamProcessorIndexName, result)
+      go step'@StreamProcessor {} indexers =
+        runStreamProcessorLeaseBased sn step' indexers
+      go TableProcessor{} _ = error "impossible case 2"
+runIndexedStreamProcessorLeaseBased _ _ = error "runIndexedStreamProcessorLeaseBased called on wrong constructor"
+
+-- | run the indexed stream processor in monads where we don't need indexing
+-- to actually be run, such as when we are just trying to analyze the DAG.
+-- This means every MonadStream except for 'LeasebasedStreamWorker'.
+runIndexedStreamProcessorPure :: (HasJobConfig m, MonadStream m)
+                              => StepName
+                              -> StreamStep outMsg runResult
+                              -> m runResult
+runIndexedStreamProcessorPure
+  sn
+  step@IndexedStreamProcessor {} = go step
+
+    where
+      go :: (HasJobConfig m, MonadStream m) => StreamStep outMsg runResult -> m runResult
+      go
+        step'@IndexedStreamProcessor { indexedStreamProcessorInner
+                                     , indexedStreamProcessorIndexName
+                                     } = do
+          result <- go indexedStreamProcessorInner
+          mtopic <- outputTopic sn step'
+          case mtopic of
+            -- impossible because if there is no output, then there is no
+            -- output to be indexed. Also impossible by construction. :)
+            Nothing -> error "impossible case in runIndexedStreamProcessorPure"
+            Just topic -> return (Ix.namedIndex topic indexedStreamProcessorIndexName, result)
+      go step'@StreamProcessor {} =
+        run sn step'
+      go TableProcessor{} = error "impossible case 2"
+runIndexedStreamProcessorPure _ _ = error "runIndexedStreamProcessorPure called on wrong constructor"
+
+
+{-
+runIndexedStreamProcessorPure
+  sn
+  step@IndexedStreamProcessor {} = go step
+    where
+      go (step'@StreamProcessor{}) = run sn step'
+      go (step'@IndexedStreamProcessor{indexedStreamProcessorIndexName}) = do
+        x <- go (indexedStreamProcessorInner step')
+        mtopic <- outputTopic sn step'
+        case mtopic of
+          -- impossible because if there is no output, then there is no
+          -- output to be indexed. Also impossible by construction. :)
+          Nothing -> error "impossible case in runIndexedStreamProcessorLeaseBased"
+          Just topic -> return (Ix.namedIndex topic indexedStreamProcessorIndexName, _)
+
+runIndexedStreamProcessorPure sn _ = error "runIndexedStreamProcessorPure called on non-indexed stream processor"
+-}
+
+
+runStreamProcessorLeaseBased :: StepName
+                             -> StreamStep outMsg runResult
+                             -> [Indexer outMsg]
+                             -> LeaseBasedStreamWorker runResult
+runStreamProcessorLeaseBased
+  sn
+  s@StreamProcessor
+    { streamProcessorWatermarkBy,
+      streamProcessorBatchProcessors,
+      streamProcessorStreamStepConfig
+    }
+  indexers = do
+    (outStream, outTopic) <- outputStreamAndTopic sn s
+    (cfg@JobConfig {jobConfigDB}, _) <- Reader.ask
+    metrics <- registerStepMetrics sn
+    let workspaceSS =
+          FDB.extend
+            (topicCustomMetadataSS outTopic)
+            [C.streamStepWorkspace]
+    let processorsWStepNames =
+          zipWith
+            (\bp i ->
+              (bp
+              , sn <> BS8.pack (show i) <> "_" <> getBatchProcessorName bp))
+            streamProcessorBatchProcessors
+            [(0 :: Int) ..]
+    for_ processorsWStepNames \(batchProcessor, sn_i) -> do
+      let job pid _stillValid _release =
+            case batchProcessor of
+              IOBatchProcessor{ioBatchInStream, ioProcessBatch} ->
+                -- NOTE: we must use a case here to do the pattern match to
+                -- work around a GHC limitation. In 8.6, let gives a very
+                -- confusing error message about variables escaping their
+                -- scopes. In 8.8, it gives a more helpful "my brain just
+                -- exploded" message that says to use a case statement.
+                case getStream' ioBatchInStream of
+                  (Stream' streamReadAndCheckpoint _ _ _ setUpState destroyState) -> do
+                    bracket
+                      (runStreamTxn jobConfigDB $ setUpState cfg sn_i pid checkpointSS)
+                      destroyState
+                      (doForSeconds (leaseDuration cfg)
+                        . void
+                        . throttleByErrors metrics sn_i
+                        . runStreamTxn jobConfigDB
+                        . runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy
+                        . runIndexers indexers outTopic
+                        . writeToRandomPartition outTopic
+                        . transformBatch (ioProcessBatch workspaceSS pid)
+                        . recordInputBatchMetrics metrics
+                        . streamReadAndCheckpoint
+                          cfg
+                          sn_i
+                          pid
+                          checkpointSS
+                          (getMsgsPerBatch cfg streamProcessorStreamStepConfig))
+                    where
+                      -- TODO: DRY out
+                      checkpointSS =
+                        streamConsumerCheckpointSS
+                          (jobConfigSS cfg)
+                          ioBatchInStream
+                          sn_i
+              IBatchProcessor{iBatchInStream, iProcessBatch} ->
+                case getStream' iBatchInStream of
+                  (Stream' streamReadAndCheckpoint _ _ _ setUpState destroyState) -> do
+                    bracket
+                      (runStreamTxn jobConfigDB $ setUpState cfg sn_i pid checkpointSS)
+                      destroyState
+                      (doForSeconds (leaseDuration cfg)
+                        . void
+                        . throttleByErrors metrics sn_i
+                        . runStreamTxn jobConfigDB
+                        -- TODO: this is so ugly; fix all these awful cases
+                        -- and use do notation instead. This led directly to
+                        -- a bug.
+                        . (flip (>>=)) (iProcessBatch workspaceSS pid)
+                        . recordInputBatchMetrics metrics
+                        . streamReadAndCheckpoint
+                          cfg
+                          sn_i
+                          pid
+                          checkpointSS
+                          (getMsgsPerBatch cfg streamProcessorStreamStepConfig))
+                    where
+                      checkpointSS =
+                        streamConsumerCheckpointSS
+                          (jobConfigSS cfg)
+                          iBatchInStream
+                          sn_i
+              OBatchProcessor{oProcessBatch} ->
+                doForSeconds (leaseDuration cfg)
+                        $ void
+                        $ throttleByErrors metrics sn_i
+                        $ runStreamTxn jobConfigDB
+                        $ runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy
+                        $ runIndexers indexers outTopic
+                        $ writeToRandomPartition outTopic
+                        $ oProcessBatch workspaceSS pid
+              BatchProcessor{processBatch} ->
+                doForSeconds (leaseDuration cfg)
+                        $ void
+                        $ throttleByErrors metrics sn_i
+                        $ runStreamTxn jobConfigDB
+                        $ processBatch workspaceSS pid
+
+      forEachPartition' (numBatchPartitions batchProcessor) $ \pid -> do
+        let taskName = mkTaskName sn_i pid
+        taskReg <- taskRegistry
+        liftIO
+          $ runStreamTxn jobConfigDB
+          $ addTask taskReg taskName (leaseDuration cfg) (job pid)
+    return outStream
+
+  -- TODO: is it worth trying to make this impossible? Maybe add another phantom
+  -- type to the GADT?
+runStreamProcessorLeaseBased
+  _ _ _ = error "runStreamProcessorLeaseBased called on non-StreamProcessor"
