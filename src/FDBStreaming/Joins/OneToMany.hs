@@ -36,9 +36,9 @@ import FDBStreaming.Message (Message (fromMessage, toMessage))
 import FDBStreaming.Topic (PartitionId)
 import qualified FDBStreaming.Topic.Constants as C
 import qualified FoundationDB as FDB
-import FoundationDB (Future, Range (Range, rangeBegin), Transaction, atomicOp, clear, clearRange, get, getKey, set)
+import FoundationDB (Future, RangeQuery (RangeQuery, rangeBegin), Transaction, atomicOp, clear, clearRange, get, getKey, set)
 import qualified FoundationDB.Layer.Subspace as FDB
-import FoundationDB.Layer.Subspace (Subspace, extend, pack, rawPrefix, subspaceRange, subspaceRange)
+import FoundationDB.Layer.Subspace (Subspace, extend, pack, rawPrefix, subspaceRangeQuery)
 import FoundationDB.Layer.Tuple (Elem (Bytes, CompleteVS, IncompleteVS, Int))
 import qualified FoundationDB.Options.MutationType as Mut
 import FoundationDB.Versionstamp (
@@ -173,7 +173,7 @@ getAndDeleteRBacklogMessages ::
   Transaction (Seq r)
 getAndDeleteRBacklogMessages ss k n = do
   let rSS = rBacklogSS ss k
-  let r = (subspaceRange rSS) {FDB.rangeLimit = Just n}
+  let r = (subspaceRangeQuery rSS) {FDB.rangeLimit = Just n}
   rs <- FDB.getEntireRange r
   -- delete what we read. The case matching is used to do a more efficient
   -- clearRange command for most of the range when possible. However, clearRange
@@ -257,7 +257,7 @@ getArbitraryFlushableBackloggedKey ::
   Transaction (Future (Maybe ByteString))
 getArbitraryFlushableBackloggedKey ss pid = do
   let backloggedSS = flushableBackloggedKeysSS ss pid
-  let Range {rangeBegin} = subspaceRange backloggedSS
+  let RangeQuery {rangeBegin} = subspaceRangeQuery backloggedSS
   -- TODO: if this is too much load on one key, we could randomly select either
   -- the begin or end of the range to get a key.
   f <- getKey rangeBegin

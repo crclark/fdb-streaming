@@ -46,7 +46,7 @@ import FDBStreaming.TaskLease
   )
 import qualified FDBStreaming.TaskRegistry as TR
 import FoundationDB (Database, clearRange, rangeKeys, runTransaction)
-import FoundationDB.Layer.Subspace (Subspace, subspaceRange)
+import FoundationDB.Layer.Subspace (Subspace, subspaceRangeQuery)
 import GHC.Generics
 import Safe (headMay)
 import Spec.FDBStreaming.Util (extendRand)
@@ -63,7 +63,7 @@ update ref i m = (ref, i) : filter ((/= ref) . fst) m
 
 cleanup :: Database -> Subspace -> IO ()
 cleanup db testSS = do
-  let (begin, end) = rangeKeys $ subspaceRange testSS
+  let (begin, end) = rangeKeys $ subspaceRangeQuery testSS
   runTransaction db $ clearRange begin end
 
 -- NOTE: since the TaskName type is so easy to create (just a string), we don't

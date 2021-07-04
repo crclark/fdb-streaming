@@ -67,7 +67,7 @@ import Data.Word
 import qualified FDBStreaming.Topic.Constants as C
 import FDBStreaming.Util (chunksOfSize, streamlyRangeResult, parseWord64le)
 import qualified FoundationDB as FDB
-import FoundationDB as FDB (Database, FutureIO, KeySelector (FirstGreaterOrEq, FirstGreaterThan), Range (Range), Transaction, atomicOp, await, awaitIO, getKey, runTransaction, watch)
+import FoundationDB as FDB (Database, FutureIO, KeySelector (FirstGreaterOrEq, FirstGreaterThan), RangeQuery (RangeQuery), Transaction, atomicOp, await, awaitIO, getKey, runTransaction, watch)
 import qualified FoundationDB.Layer.Subspace as FDB
 import qualified FoundationDB.Layer.Tuple as FDB
 import qualified FoundationDB.Options.MutationType as Mut
@@ -79,6 +79,7 @@ import FoundationDB.Versionstamp
     VersionstampCompleteness (Complete, Incomplete),
   )
 import GHC.Generics (Generic)
+import Safe (fromJustNote)
 import qualified Streamly.Prelude as S
 import System.Random (randomRIO)
 import Data.ByteString.Lazy.Char8 (toStrict)
@@ -507,8 +508,11 @@ peekNPastCheckpoint ::
 peekNPastCheckpoint topic pid rn n = do
   ckpt@(Checkpoint cpvs _) <- getCheckpoint topic pid rn
   let begin = FDB.pack (partitionMsgsSS topic pid) [FDB.CompleteVS cpvs]
-  let end = prefixRangeEnd $ FDB.subspaceKey (partitionMsgsSS topic pid)
-  let r = Range
+  let end = fromJustNote "peekNPastCheckpoint: impossible subspace range"
+            $ prefixRangeEnd
+            $ FDB.subspaceKey (partitionMsgsSS topic pid)
+
+  let r = RangeQuery
         { rangeBegin = FirstGreaterOrEq begin,
           rangeEnd = FirstGreaterOrEq end,
           -- +1 because the checkpoint can point at a fully-read kv, in which
@@ -581,8 +585,11 @@ getEntireTopic ::
 getEntireTopic topic@Topic {..} = do
   partitions <- for [0 .. numPartitions - 1] $ \pid -> do
     let begin = FDB.pack (partitionMsgsSS pid) [FDB.CompleteVS minBound]
-    let end = prefixRangeEnd $ FDB.subspaceKey (partitionMsgsSS pid)
-    let r = Range
+    let end = fromJustNote "getEntireTopic: impossible subspace range"
+              $ prefixRangeEnd
+              $ FDB.subspaceKey (partitionMsgsSS pid)
+
+    let r = RangeQuery
           { rangeBegin = FirstGreaterThan begin,
             rangeEnd = FirstGreaterOrEq end,
             rangeLimit = Nothing,
