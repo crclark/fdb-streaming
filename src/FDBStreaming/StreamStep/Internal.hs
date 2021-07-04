@@ -36,10 +36,7 @@ import FoundationDB.Layer.Subspace (Subspace)
 type StepName = ByteString
 
 data GroupedBy k v
-  = -- TODO: we could improve type safety by parametrizing by t, but not sure if
-    -- it would cause problems. Seems like GroupedBy shouldn't care about where
-    -- the stream is.
-    -- NOTE: do not export this constructor to users; it's too easy to hit
+  = -- NOTE: do not export this constructor to users; it's too easy to hit
     -- GHC bug: https://gitlab.haskell.org/ghc/ghc/issues/15991
     forall t.
     GroupedBy
@@ -60,9 +57,6 @@ data StreamStepConfig
 
 defaultStreamStepConfig :: StreamStepConfig
 defaultStreamStepConfig = StreamStepConfig Nothing Nothing
-
--- TODO: instead of the Maybe in batchInStream, we should really have two
--- constructors for BatchProcessor.
 
 -- | Contains all the information we need to pull data out of a stream and
 -- transform it. Uses an existential so that we can more easily implement
@@ -197,6 +191,17 @@ data Indexer outMsg
         indexerIndexBy :: outMsg -> [k]
       }
 
+streamProcessorIndexers :: StreamStep outMsg runResult -> [Indexer outMsg]
+streamProcessorIndexers IndexedStreamProcessor{ indexedStreamProcessorInner
+                                              , indexedStreamProcessorIndexName
+                                              , indexedStreamProcessorIndexBy
+                                              } =
+  indexer : streamProcessorIndexers indexedStreamProcessorInner
+
+  where indexer = Indexer indexedStreamProcessorIndexName indexedStreamProcessorIndexBy
+
+streamProcessorIndexers _ = []
+
 -- TODO: What is a stream step, really? Just seems to be miscellaneous inputs to
 -- 'run', gathered together so we can use a builder style on them.
 -- Streams and AggrTables are well-defined, but stream steps are not.
@@ -221,13 +226,6 @@ data StreamStep outMsg runResult where
       -- reason I can see that pipeStep and this callback both need to exist.
       -- Same with the other constructors.
       streamProcessorBatchProcessors :: [BatchProcessor b],
-      -- | This is a hack to allow IndexedStreamProcessor to push its index
-      -- function down into the run function for StreamProcessor. It should
-      -- only be used by 'run' for IndexedStreamProcessor. Its job is to forget
-      -- the index key type, while IndexedStreamProcessor's job is to remember
-      -- it. TODO: is there a less redundant way to do this? We have a new
-      -- GADT constructor, this existentially-quantified list, and a type class!
-      streamProcessorIndexers :: [Indexer b],
       streamProcessorStreamStepConfig :: StreamStepConfig
     } ->
     StreamStep b
@@ -282,8 +280,8 @@ isStepDefaultWatermarked = isDefaultWatermark . stepWatermarkBy
 watermarkBy :: (b -> Transaction Watermark) -> StreamStep b r -> StreamStep b r
 watermarkBy f (IndexedStreamProcessor inner nm ixby) =
   IndexedStreamProcessor (watermarkBy f inner) nm ixby
-watermarkBy f (StreamProcessor _ ps ixers stepCfg) =
-  StreamProcessor (CustomWatermark f) ps ixers stepCfg
+watermarkBy f (StreamProcessor _ ps stepCfg) =
+  StreamProcessor (CustomWatermark f) ps stepCfg
 watermarkBy f (TableProcessor g a _ trigger stepCfg) =
   TableProcessor g a (CustomWatermark f) trigger stepCfg
 
@@ -298,7 +296,7 @@ getStepConfig TableProcessor {tableProcessorStreamStepConfig} =
 mapStepConfig :: (StreamStepConfig -> StreamStepConfig) -> StreamStep b r -> StreamStep b r
 mapStepConfig f (IndexedStreamProcessor inner nm ixby) =
   IndexedStreamProcessor (mapStepConfig f inner) nm ixby
-mapStepConfig f (StreamProcessor w p ixers c) = StreamProcessor w p ixers (f c)
+mapStepConfig f (StreamProcessor w p c) = StreamProcessor w p (f c)
 mapStepConfig f (TableProcessor g a w t c) = TableProcessor g a w t (f c)
 
 -- | Sets the number of messages to process per batch for the given step.
@@ -317,20 +315,6 @@ withBatchSize n = mapStepConfig (\c -> c {stepBatchSize = Just n})
 -- performance.
 withOutputPartitions :: Word8 -> StreamStep b r -> StreamStep b r
 withOutputPartitions np = mapStepConfig (\c -> c {stepOutputPartitions = Just np})
-
-consIndexer ::
-  AT.TableKey k =>
-  StreamStep outMsg runResult ->
-  IndexName ->
-  (outMsg -> [k]) ->
-  StreamStep outMsg runResult
-consIndexer (IndexedStreamProcessor inner ixnm' f') ixnm f =
-  IndexedStreamProcessor (consIndexer inner ixnm f) ixnm' f'
-consIndexer (StreamProcessor wm bps ixers conf) ixnm f =
-  StreamProcessor wm bps (Indexer ixnm f : ixers) conf
--- TODO: make type more precise to indicate that this won't work on
--- table processors. Had difficulty doing so.
-consIndexer s@TableProcessor {} _ _ = s
 
 {- TODO
 triggerBy :: ((Versionstamp 'Complete, v, [k]) -> Transaction [(k,aggr)])
