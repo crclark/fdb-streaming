@@ -486,7 +486,7 @@ benignIO g stream = case getStream' stream of
 -- the DAG in multiple ways, including checking for errors, forward
 -- compatibility checks, running with different strategies, etc. The record
 -- interface allows us to use a builder style to modify our stream processors
--- at a distance, with functions like 'watermarkBy'.
+-- "at a distance", with functions like 'watermarkBy'.
 
 -- | A stream monad, whose actions represents a stream processing DAG.
 class Monad m => MonadStream m where
@@ -506,7 +506,7 @@ class Monad m => MonadStream m where
 -- info for its parent streams. The downside is that the transaction may be
 -- somewhat large for very large DAGs.
 -- NOTE: originally I was planning on watermarking the entire DAG in one
--- transaction (and making this StateT of Transaction, not IO), but I hit
+-- transaction (and making this StateT of Transaction, not of IO), but I hit
 -- an unexpected FDB behavior: https://github.com/apple/foundationdb/issues/2504
 newtype DefaultWatermarker a
   = DefaultWatermarker
@@ -525,12 +525,14 @@ registerDefaultWatermarker cfg@JobConfig {jobConfigDB = db} taskReg x = do
 instance HasJobConfig DefaultWatermarker where
   getJobConfig = State.gets fst
 
+-- | Append another watermark operation to the sequence of watermarking actions
+-- that we intend to run when default watermarking.
 watermarkNext :: Transaction () -> DefaultWatermarker ()
 watermarkNext t = do
   JobConfig {jobConfigDB} <- getJobConfig
   State.modify \(c, t') -> (c, t' >> runStreamTxn jobConfigDB t)
 
--- | If it's possible to default watermark a streamstep's output, return the
+-- | If it's possible to default watermark a StreamStep's output, return the
 -- topics and the names of the batch processors reading from them, so that we
 -- can watermark.
 defaultWatermarkUpstreamTopics ::
@@ -655,7 +657,9 @@ defaultWatermark topicsAndReaders wmSS = do
     transactionV :: Versionstamp 'Complete -> Word64
     transactionV (CompleteVersionstamp (TransactionVersionstamp v _) _) = v
 
--- | Read messages from an existing Stream.
+-- | Read messages from an existing Stream. You can use this to read from a
+-- separate stream job that was defined at a distance -- in another codebase,
+-- scope, etc.
 --
 -- If you want events downstream of this to have watermarks, set
 -- 'isWatermarked' to @True@ on the result if you know that the existing Stream
@@ -680,8 +684,9 @@ existingWatermarked tc =
 -- checkpoints and THEN performs side effects. The problem is if the thread
 -- dies after the checkpoint but before the side effect, or if the side effect
 -- fails. We could maintain a set of in-flight side effects, and remove them
--- from the set once finished. In that case, we could try to recover by
--- traversing the items in the set that are older than t.
+-- from the set once finished (like a kind of write-ahead log). In that case, we
+-- could try to recover by traversing the items in the set that are older than
+-- t.
 
 -- | Produce a side effect at least once for each message in the stream.
 -- TODO: is this going to leave traces of an empty topic in FDB?
@@ -704,7 +709,7 @@ atLeastOnce sn input f = void $ do
 -- stored in FoundationDB. Return 'Nothing' to filter the stream.
 --
 -- While this function is versatile, it should be used sparingly. Each
--- intermediate 'Stream' in FoundationDB has a significant cost in storage and
+-- intermediate 'Stream' stored in FoundationDB has a significant cost in storage and
 -- performance. Prefer to use 'fmap' and 'benignIO' on 'Stream's when possible,
 -- as these functions register transformations that are applied lazily when the
 -- stream is processed by downstream 'StreamStep's, which avoids persisting
@@ -1039,28 +1044,28 @@ doForSeconds n f = do
 mkTaskName :: StepName -> PartitionId -> TaskName
 mkTaskName sn pid = TaskName $ BS8.pack (show sn ++ "_" ++ show pid)
 
-runCustomWatermark :: WatermarkSS -> WatermarkBy a -> Transaction (Seq a) -> Transaction (Seq a)
-runCustomWatermark wmSS (CustomWatermark f) t = do
-  xs <- t
-  case xs of
-    (_ Seq.:|> x) -> f x >>= setWatermark wmSS
-    _ -> return ()
-  return xs
-runCustomWatermark _ _ t = t
+-- | Given the output messages of a O or IO batch processor, runs the user's
+-- custom watermark function on the last message in the batch, then sets the
+-- watermark to the output of the function.
+--
+-- If the batch is empty or the user has not specified a custom watermark
+-- function, does nothing.
+runCustomWatermark :: WatermarkSS -> WatermarkBy a -> Seq a -> Transaction ()
+runCustomWatermark wmSS (CustomWatermark f) _outputMsgs@(_ Seq.:|> x) =
+  f x >>= setWatermark wmSS
+runCustomWatermark _ _ _ = return ()
 
 runIndexers ::
   [Indexer outMsg] ->
   Topic ->
-  Transaction (Seq (Topic.CoordinateUncommitted, outMsg)) ->
-  Transaction (Seq outMsg)
-runIndexers ixers outTopic f = do
-  cmsgs <- f
+  Seq (outMsg, Topic.CoordinateUncommitted) ->
+  Transaction ()
+runIndexers ixers outTopic outMsgsWithCoords = do
   for_ ixers \(Indexer ixNm ixer) -> do
     let ix = Ix.namedIndex outTopic ixNm
-    for_ cmsgs \(coord, msg) -> do
+    for_ outMsgsWithCoords \(msg, coord) -> do
       let ks = ixer msg
       for_ ks \k -> Ix.index ix k coord
-  return (fmap snd cmsgs)
 
 outputStreamAndTopic ::
   (HasJobConfig m, Message c, Monad m) =>
@@ -1086,7 +1091,7 @@ outputStreamAndTopic stepName step = do
 -- TODO: find a way to improve the type on this so that we don't need to
 -- return Maybe.
 
--- | Returns Nothing if the step doesn't produce a topic (i.e., it's a
+-- | Returns Nothing if the step doesn't produce a topic (e.g., it's a
 -- TableProcessor).
 outputTopic ::
   (HasJobConfig m, Monad m) =>
@@ -1141,21 +1146,20 @@ instance MonadStream LeaseBasedStreamWorker where
                     destroyState
                     \state ->
                       doForSeconds (leaseDuration cfg)
-                        $ void
                         $ throttleByErrors metrics sn
-                        $ runStreamTxn jobConfigDB
-                        $ runCustomWatermark (AT.aggrTableWatermarkSS table) tableProcessorWatermarkBy
-                        $ aggregateStep
-                          cfg
-                          tableProcessorStreamStepConfig
-                          sn
-                          tableProcessorGroupedBy
-                          streamReadAndCheckpoint
-                          state
-                          tableProcessorAggregation
-                          table
-                          metrics
-                          pid
+                        $ runStreamTxn jobConfigDB do
+                          aggs <- aggregateStep
+                                  cfg
+                                  tableProcessorStreamStepConfig
+                                  sn
+                                  tableProcessorGroupedBy
+                                  streamReadAndCheckpoint
+                                  state
+                                  tableProcessorAggregation
+                                  table
+                                  metrics
+                                  pid
+                          runCustomWatermark (AT.aggrTableWatermarkSS table) tableProcessorWatermarkBy aggs
         forEachPartition inStream $ \pid -> do
           taskReg <- taskRegistry
           let taskName = TaskName $ BS8.pack (show sn ++ "_tbl_" ++ show pid)
@@ -1202,26 +1206,6 @@ registerContinuousLeases cfg wkr = do
 
 -- Note: we don't need a separate type for nested groupby -- we can simply group
 -- by a tuple. No need to support GroupedBy a (GroupedBy b c).
-
--- TODO: think about joins.
--- I believe we can build joins out of FDB by listening to both upstream topics,
--- writing a k/v when we receive one half of the join tuple, check if the tuple
--- has been completed (i.e., the half we just received is the last of the two
--- halves), and then emit a downstream message of the tuple.
--- tentative type:
--- joinOn :: (a -> e) -> (b -> e) -> Stream a -> Stream b -> Stream (a,b)
--- possible user errors/gotchas:
--- 1. non-unique join values
--- 2. must be the case for all x,y :: JoinValue that
---    (toMessage x == toMessage y) iff x == y. That is, they will be joined by
---    the equality of the serializations of the values, not the Haskell values
---    themselves.
--- stuff to deal with on our side:
--- 1. How do we garbage collect halves that never get paired up?
---    The intermediate data must necessarily be keyed by the projected value,
---    which is itself not ordered by anything useful.
-
--- TODO: what about truncating old data by timestamp?
 
 -- | Creates a reference to an existing aggregation table from outside of a
 -- 'MonadStream' action. This is used in order to read from the aggregation
@@ -1296,49 +1280,31 @@ throttleByErrors metrics sn x =
       -- with BatchProcessors that intentionally don't take input!
       -- when (numConsumed == 0) (threadDelay 1000000)
 
--- TODO: the next few functions were split apart from one large messy function.
--- Their types are partially lies -- they don't really need to take Transactions
--- as input, and they pass along an Int that many of them don't use. This needs
--- to be further refactored and simplified.
--- =======================================
-
 -- | Utility function to record metrics for an input batch of messages.
 -- Returns the sequence of input messages unchanged.
 recordInputBatchMetrics ::
   MonadIO m =>
   Maybe StreamEdgeMetrics ->
-  m (Seq (Maybe Topic.Coordinate, a)) ->
-  m (Seq (Maybe Topic.Coordinate, a))
-recordInputBatchMetrics metrics getMsgs = do
-  inMsgs <- getMsgs
+  Seq (Maybe Topic.Coordinate, a) ->
+  m ()
+recordInputBatchMetrics metrics inMsgs = do
   liftIO $ when (Seq.null inMsgs) (incrEmptyBatchCount metrics)
   liftIO $ recordMsgsPerBatch metrics (Seq.length inMsgs)
-  return inMsgs
 
 -- | Utility function to write output messages to a random partition of
--- the given topic. Returns the written messages unchanged.
+-- the given topic. Returns the uncommitted coordinates the messages will be
+-- written to once the transaction commits. These coordinates can be used to
+-- atomically write secondary indices.
 writeToRandomPartition ::
   Message b =>
   Topic ->
-  Transaction (Seq b) ->
-  Transaction (Seq (Topic.CoordinateUncommitted, b))
-writeToRandomPartition outTopic t = do
-  outputMsgs <- t
+  Seq b ->
+  Transaction (Seq Topic.CoordinateUncommitted)
+writeToRandomPartition outTopic outputMsgs = do
   let outMsgs = fmap toMessage outputMsgs
   p' <- liftIO $ randPartition outTopic
   coords <- writeTopic outTopic p' (toList outMsgs)
-  return (Seq.zip (Seq.fromList coords) outputMsgs)
-
-transformBatch ::
-  (Seq (Maybe Topic.Coordinate, a) -> Transaction (Seq b)) ->
-  Transaction (Seq (Maybe Topic.Coordinate, a)) ->
-  Transaction (Seq b)
-transformBatch f getBatch = do
-  xs <- getBatch
-  f xs
-
--- END stupid functions that need to be refactored.
--- ===============================================
+  return (Seq.fromList coords)
 
 oneToOneJoinStep ::
   forall a1 a2 b c.
@@ -1600,26 +1566,6 @@ runIndexedStreamProcessorPure
       go TableProcessor{} = error "impossible case 2"
 runIndexedStreamProcessorPure _ _ = error "runIndexedStreamProcessorPure called on wrong constructor"
 
-
-{-
-runIndexedStreamProcessorPure
-  sn
-  step@IndexedStreamProcessor {} = go step
-    where
-      go (step'@StreamProcessor{}) = run sn step'
-      go (step'@IndexedStreamProcessor{indexedStreamProcessorIndexName}) = do
-        x <- go (indexedStreamProcessorInner step')
-        mtopic <- outputTopic sn step'
-        case mtopic of
-          -- impossible because if there is no output, then there is no
-          -- output to be indexed. Also impossible by construction. :)
-          Nothing -> error "impossible case in runIndexedStreamProcessorLeaseBased"
-          Just topic -> return (Ix.namedIndex topic indexedStreamProcessorIndexName, _)
-
-runIndexedStreamProcessorPure sn _ = error "runIndexedStreamProcessorPure called on non-indexed stream processor"
--}
-
-
 runStreamProcessorLeaseBased :: StepName
                              -> StreamStep outMsg runResult
                              -> [Indexer outMsg]
@@ -1633,8 +1579,9 @@ runStreamProcessorLeaseBased
     }
   indexers = do
     (outStream, outTopic) <- outputStreamAndTopic sn s
-    (cfg@JobConfig {jobConfigDB}, _) <- Reader.ask
+    (cfg@JobConfig {jobConfigDB, jobConfigSS, leaseDuration}, _) <- Reader.ask
     metrics <- registerStepMetrics sn
+    let msgsPerBatch = getMsgsPerBatch cfg streamProcessorStreamStepConfig
     let workspaceSS =
           FDB.extend
             (topicCustomMetadataSS outTopic)
@@ -1657,29 +1604,34 @@ runStreamProcessorLeaseBased
                 -- exploded" message that says to use a case statement.
                 case getStream' ioBatchInStream of
                   (Stream' streamReadAndCheckpoint _ _ _ setUpState destroyState) -> do
+                    -- NOTE: there is repetition of the bracket, doForSeconds,
+                    -- and throttleByErrors, but the existentials make
+                    -- DRYing it out difficult.
                     bracket
                       (runStreamTxn jobConfigDB $ setUpState cfg sn_i pid checkpointSS)
                       destroyState
-                      (doForSeconds (leaseDuration cfg)
-                        . void
-                        . throttleByErrors metrics sn_i
-                        . runStreamTxn jobConfigDB
-                        . runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy
-                        . runIndexers indexers outTopic
-                        . writeToRandomPartition outTopic
-                        . transformBatch (ioProcessBatch workspaceSS pid)
-                        . recordInputBatchMetrics metrics
-                        . streamReadAndCheckpoint
-                          cfg
-                          sn_i
-                          pid
-                          checkpointSS
-                          (getMsgsPerBatch cfg streamProcessorStreamStepConfig))
+                      $ \state -> doForSeconds leaseDuration
+                      $ throttleByErrors metrics sn_i
+                      $ runStreamTxn jobConfigDB
+                      $ do
+                        inMsgs <- streamReadAndCheckpoint
+                                  cfg
+                                  sn_i
+                                  pid
+                                  checkpointSS
+                                  msgsPerBatch
+                                  state
+                        recordInputBatchMetrics metrics inMsgs
+                        outputMsgs <- ioProcessBatch workspaceSS pid inMsgs
+                        coordsUncommitted <- writeToRandomPartition outTopic outputMsgs
+                        let outMsgsWithCoords = Seq.zip outputMsgs coordsUncommitted
+                        runIndexers indexers outTopic outMsgsWithCoords
+                        runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy outputMsgs
                     where
                       -- TODO: DRY out
                       checkpointSS =
                         streamConsumerCheckpointSS
-                          (jobConfigSS cfg)
+                          jobConfigSS
                           ioBatchInStream
                           sn_i
               IBatchProcessor{iBatchInStream, iProcessBatch} ->
@@ -1688,38 +1640,35 @@ runStreamProcessorLeaseBased
                     bracket
                       (runStreamTxn jobConfigDB $ setUpState cfg sn_i pid checkpointSS)
                       destroyState
-                      (doForSeconds (leaseDuration cfg)
-                        . void
-                        . throttleByErrors metrics sn_i
-                        . runStreamTxn jobConfigDB
-                        -- TODO: this is so ugly; fix all these awful cases
-                        -- and use do notation instead. This led directly to
-                        -- a bug.
-                        . (flip (>>=)) (iProcessBatch workspaceSS pid)
-                        . recordInputBatchMetrics metrics
-                        . streamReadAndCheckpoint
-                          cfg
-                          sn_i
-                          pid
-                          checkpointSS
-                          (getMsgsPerBatch cfg streamProcessorStreamStepConfig))
+                      $ \state -> doForSeconds leaseDuration
+                      $ throttleByErrors metrics sn_i
+                      $ runStreamTxn jobConfigDB
+                      $ do
+                        inMsgs <- streamReadAndCheckpoint
+                                  cfg
+                                  sn_i
+                                  pid
+                                  checkpointSS
+                                  msgsPerBatch
+                                  state
+                        recordInputBatchMetrics metrics inMsgs
+                        iProcessBatch workspaceSS pid inMsgs
                     where
                       checkpointSS =
                         streamConsumerCheckpointSS
-                          (jobConfigSS cfg)
+                          jobConfigSS
                           iBatchInStream
                           sn_i
               OBatchProcessor{oProcessBatch} ->
-                doForSeconds (leaseDuration cfg)
-                        $ void
+                doForSeconds leaseDuration
                         $ throttleByErrors metrics sn_i
-                        $ runStreamTxn jobConfigDB
-                        $ runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy
-                        $ runIndexers indexers outTopic
-                        $ writeToRandomPartition outTopic
-                        $ oProcessBatch workspaceSS pid
+                        $ runStreamTxn jobConfigDB do
+                          outputMsgs <- oProcessBatch workspaceSS pid
+                          coordsUncommitted <- writeToRandomPartition outTopic outputMsgs
+                          runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy outputMsgs
+                          runIndexers indexers outTopic (Seq.zip outputMsgs coordsUncommitted)
               BatchProcessor{processBatch} ->
-                doForSeconds (leaseDuration cfg)
+                doForSeconds leaseDuration
                         $ void
                         $ throttleByErrors metrics sn_i
                         $ runStreamTxn jobConfigDB
@@ -1730,10 +1679,10 @@ runStreamProcessorLeaseBased
         taskReg <- taskRegistry
         liftIO
           $ runStreamTxn jobConfigDB
-          $ addTask taskReg taskName (leaseDuration cfg) (job pid)
+          $ addTask taskReg taskName leaseDuration (job pid)
     return outStream
 
-  -- TODO: is it worth trying to make this impossible? Maybe add another phantom
-  -- type to the GADT?
+-- It's not worth making this case impossible because this function is internal
+-- to this namespace and used merely to DRY out a few cases.
 runStreamProcessorLeaseBased
   _ _ _ = error "runStreamProcessorLeaseBased called on non-StreamProcessor"
