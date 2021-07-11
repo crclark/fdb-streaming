@@ -336,7 +336,7 @@ import FDBStreaming.StreamStep.Internal
     streamProcessorWatermarkBy,
     watermarkBy,
     withBatchSize,
-    withOutputPartitions,
+    withOutputPartitions, ProcessBatchStats (ProcessBatchStats, processBatchStatsNumProcessed)
   )
 import FDBStreaming.TaskLease (TaskName (TaskName), secondsSinceEpoch)
 import FDBStreaming.TaskRegistry as TaskRegistry
@@ -689,16 +689,20 @@ existingWatermarked tc =
 -- t.
 
 -- | Produce a side effect at least once for each message in the stream.
--- TODO: is this going to leave traces of an empty topic in FDB?
 atLeastOnce :: (MonadStream m) => StepName -> Stream t a -> (a -> IO ()) -> m ()
 atLeastOnce sn input f = void $ do
   run sn $
+    -- TODO: this produces a 'Stream FDB' ()' that the 'void' above hides from
+    -- the user, but it will still be persisted to FDB. We need a real sink type
+    -- in StreamStep to avoid this.
     StreamProcessor
       { streamProcessorWatermarkBy = NoWatermark,
         streamProcessorBatchProcessors =
           [ IOBatchProcessor
               input
-              (\_ss _pid xs -> mapM (liftIO . f . snd) xs)
+              (\_ss _pid xs -> do
+                units <- mapM (liftIO . f . snd) xs
+                return (ProcessBatchStats (Just $ length xs), units))
               (fromIntegral $ streamMinReaderPartitions input)
               "alo"
           ],
@@ -740,7 +744,9 @@ pipe' input f =
       streamProcessorBatchProcessors =
         [ IOBatchProcessor
             input
-            (\_ss _pid xs -> catMaybes <$> mapM (liftIO . f . snd) xs)
+            (\_ss _pid xs -> do
+              results <- catMaybes <$> mapM (liftIO . f . snd) xs
+              return (ProcessBatchStats (Just $ length xs), results))
             (fromIntegral $ streamMinReaderPartitions input)
             "p"
         ],
@@ -767,7 +773,7 @@ eventualIndexBy sn f stream = do
           (Just coord, x) -> for_ (f x) \k -> do
             Ix.indexCommitted ix k coord
           (Nothing, _) -> return ()
-        return mempty
+        return (ProcessBatchStats (Just (length batch)), mempty)
   (_s :: Stream 'FDB ()) <-
     run sn $
       StreamProcessor
@@ -872,22 +878,26 @@ oneToManyJoin' inl inr pl pr j =
       lstep =
         IBatchProcessor
           { iBatchInStream = inl,
-            iProcessBatch = \workSS pid lmsgs ->
+            iProcessBatch = \workSS pid lmsgs -> do
                              OTM.lMessageJob (OTM.oneToManyJoinSS workSS)
                                              pid
                                              pl
-                                             (fmap snd lmsgs),
+                                             (fmap snd lmsgs)
+                             return (ProcessBatchStats (Just (length lmsgs))),
             iBatchNumPartitions = fromIntegral $ streamMinReaderPartitions inl,
             iBatchProcessorName = "otml"
           }
       rstep =
         IOBatchProcessor
           { ioBatchInStream = inr,
-            ioProcessBatch = \workSS _pid rmsgs ->
-                             OTM.rMessageJob (OTM.oneToManyJoinSS workSS)
-                                             pr
-                                             (fmap snd rmsgs)
-                                             joinFn,
+            ioProcessBatch = \workSS _pid rmsgs -> do
+                             results <- OTM.rMessageJob
+                                          (OTM.oneToManyJoinSS workSS)
+                                          pr
+                                          (fmap snd rmsgs)
+                                          joinFn
+                             return ( ProcessBatchStats (Just (length rmsgs))
+                                    , results),
             ioBatchNumPartitions = fromIntegral $ streamMinReaderPartitions inr,
             ioBatchProcessorName = "otmr"
           }
@@ -895,11 +905,18 @@ oneToManyJoin' inl inr pl pr j =
         OBatchProcessor
           { -- TODO: pass job config into processBatch, too? Need batch size
             -- info to replace the 256 magic number below.
-            oProcessBatch = \workSS pid ->
-                             OTM.flushBacklogJob (OTM.oneToManyJoinSS workSS)
-                                                 pid
-                                                 joinFn
-                                                 256,
+            oProcessBatch = \workSS pid -> do
+                             results <- OTM.flushBacklogJob
+                                          (OTM.oneToManyJoinSS workSS)
+                                          pid
+                                          joinFn
+                                          256
+                             -- Usually we want to return stats about the length
+                             -- of the input to the batch processor, but in this
+                             -- case, output is all we have (see flushBacklogJob)
+                             -- for details.
+                             return ( ProcessBatchStats (Just (length results))
+                                    , results),
             oBatchNumPartitions = fromIntegral $ streamMinReaderPartitions inl,
             oBatchProcessorName = "otmf"
           }
@@ -1148,18 +1165,21 @@ instance MonadStream LeaseBasedStreamWorker where
                       doForSeconds (leaseDuration cfg)
                         $ throttleByErrors metrics sn
                         $ runStreamTxn jobConfigDB do
-                          aggs <- aggregateStep
-                                  cfg
-                                  tableProcessorStreamStepConfig
-                                  sn
-                                  tableProcessorGroupedBy
-                                  streamReadAndCheckpoint
-                                  state
-                                  tableProcessorAggregation
-                                  table
-                                  metrics
-                                  pid
-                          runCustomWatermark (AT.aggrTableWatermarkSS table) tableProcessorWatermarkBy aggs
+                          (stats, aggs) <- aggregateStep
+                                            cfg
+                                            tableProcessorStreamStepConfig
+                                            sn
+                                            tableProcessorGroupedBy
+                                            streamReadAndCheckpoint
+                                            state
+                                            tableProcessorAggregation
+                                            table
+                                            metrics
+                                            pid
+                          runCustomWatermark (AT.aggrTableWatermarkSS table)
+                                             tableProcessorWatermarkBy
+                                             aggs
+                          return stats
         forEachPartition inStream $ \pid -> do
           taskReg <- taskRegistry
           let taskName = TaskName $ BS8.pack (show sn ++ "_tbl_" ++ show pid)
@@ -1241,7 +1261,7 @@ periodicTaskRegSS cfg = FDB.extend (jobConfigSS cfg) [FDB.Bytes "leasep"]
 throttleByErrors ::
   Maybe StreamEdgeMetrics ->
   StepName ->
-  IO a ->
+  IO ProcessBatchStats ->
   IO ()
 throttleByErrors metrics sn x =
   flip
@@ -1271,14 +1291,13 @@ throttleByErrors metrics sn x =
     $ do
       threadDelay 150
       t1 <- getTime Monotonic
-      _ <- x
+      ProcessBatchStats{processBatchStatsNumProcessed} <- x
       t2 <- getTime Monotonic
       let timeMillis = (`div` 1000000) $ toNanoSecs $ diffTimeSpec t2 t1
       recordBatchLatency metrics timeMillis
-      -- TODO: reinstate this logic in a way that doesn't require passing
-      -- an int through ninety functions. And make sure it works correctly
-      -- with BatchProcessors that intentionally don't take input!
-      -- when (numConsumed == 0) (threadDelay 1000000)
+      case processBatchStatsNumProcessed of
+        Just 0 -> threadDelay 1000000
+        _      -> return ()
 
 -- | Utility function to record metrics for an input batch of messages.
 -- Returns the sequence of input messages unchanged.
@@ -1317,7 +1336,7 @@ oneToOneJoinStep ::
   (a1 -> c) ->
   (a1 -> a2 -> b) ->
   Seq (Maybe Topic.Coordinate, a1) ->
-  Transaction (Seq b)
+  Transaction (ProcessBatchStats, Seq b)
 oneToOneJoinStep joinSS streamJoinIx pl combiner ckptmsgs = do
   -- Read from one of the two join streams, and for each
   -- message read, compute the join key. Using the join key, look in the
@@ -1349,7 +1368,7 @@ oneToOneJoinStep joinSS streamJoinIx pl combiner ckptmsgs = do
   joinData <- for joinFutures \(k, msg, joinF) -> do
     d <- await joinF
     return (k, msg, d)
-  catMaybes <$> for joinData \(k, lmsg, d) -> do
+  results <- catMaybes <$> for joinData \(k, lmsg, d) -> do
     case d of
       Just (rmsg :: a2) -> do
         delete1to1JoinData joinSS k
@@ -1357,7 +1376,10 @@ oneToOneJoinStep joinSS streamJoinIx pl combiner ckptmsgs = do
       Nothing -> do
         write1to1JoinData joinSS k streamJoinIx (lmsg :: a1)
         return Nothing
+  return (ProcessBatchStats (Just (length ckptmsgs)), results)
 
+-- TODO: replace this helper function with a BatchProcessor in the table stream
+-- step constructor
 aggregateStep ::
   forall v k aggr state.
   (Ord k, AT.TableKey k, AT.TableSemigroup aggr) =>
@@ -1371,7 +1393,7 @@ aggregateStep ::
   AT.AggrTable k aggr ->
   Maybe StreamEdgeMetrics ->
   PartitionId ->
-  FDB.Transaction (Seq (k, aggr))
+  FDB.Transaction (ProcessBatchStats, Seq (k, aggr))
 aggregateStep
   jobCfg
   stepCfg
@@ -1393,11 +1415,13 @@ aggregateStep
           checkpointSS
           (getMsgsPerBatch jobCfg stepCfg)
           state
+    -- TODO: consolidate these metrics (probably in throttleByErrors, which
+    -- should be renamed)
     liftIO $ when (Seq.null msgs) (incrEmptyBatchCount metrics)
     liftIO $ recordMsgsPerBatch metrics (Seq.length msgs)
     let kvs = Seq.fromList [(k, toAggr v) | v <- toList msgs, k <- toKeys v]
     AT.mappendBatch table pid kvs
-    return kvs
+    return (ProcessBatchStats (Just (length msgs)), kvs)
 
 -- | Runs a stream processing job forever. Blocks indefinitely.
 runJob :: JobConfig -> (forall m. MonadStream m => m a) -> IO ()
@@ -1622,11 +1646,12 @@ runStreamProcessorLeaseBased
                                   msgsPerBatch
                                   state
                         recordInputBatchMetrics metrics inMsgs
-                        outputMsgs <- ioProcessBatch workspaceSS pid inMsgs
+                        (stats, outputMsgs) <- ioProcessBatch workspaceSS pid inMsgs
                         coordsUncommitted <- writeToRandomPartition outTopic outputMsgs
                         let outMsgsWithCoords = Seq.zip outputMsgs coordsUncommitted
                         runIndexers indexers outTopic outMsgsWithCoords
                         runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy outputMsgs
+                        return stats
                     where
                       -- TODO: DRY out
                       checkpointSS =
@@ -1663,10 +1688,11 @@ runStreamProcessorLeaseBased
                 doForSeconds leaseDuration
                         $ throttleByErrors metrics sn_i
                         $ runStreamTxn jobConfigDB do
-                          outputMsgs <- oProcessBatch workspaceSS pid
+                          (stats, outputMsgs) <- oProcessBatch workspaceSS pid
                           coordsUncommitted <- writeToRandomPartition outTopic outputMsgs
                           runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy outputMsgs
                           runIndexers indexers outTopic (Seq.zip outputMsgs coordsUncommitted)
+                          return stats
               BatchProcessor{processBatch} ->
                 doForSeconds leaseDuration
                         $ void

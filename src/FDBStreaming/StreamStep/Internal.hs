@@ -58,6 +58,22 @@ data StreamStepConfig
 defaultStreamStepConfig :: StreamStepConfig
 defaultStreamStepConfig = StreamStepConfig Nothing Nothing
 
+-- | Returns various metadata about the run of a BatchProcessor one one batch.
+-- | This metadata is used to emit metrics, throttle the processor, etc.
+data ProcessBatchStats = ProcessBatchStats {
+  -- | The number of elements processed by the BatchProcessor. This number will
+  -- be used to throttle the processor to maximize throughput. If there is no
+  -- useful concept of "elements processed" for this BatchProcessor, return
+  -- 'Nothing'. In that case, the BatchProcessor will not be throttled based on
+  -- this value.
+  --
+  -- NOTE: even if a batch processor is filtering and discarding its input, the
+  -- number returned should be the number of elements consumed, not the number
+  -- that passed the filter. This number is intended to represent the amount of
+  -- work the processor was able to do in this run.
+  processBatchStatsNumProcessed :: Maybe Int
+} deriving (Show, Eq)
+
 -- | Contains all the information we need to pull data out of a stream and
 -- transform it. Uses an existential so that we can more easily implement
 -- joins and other operations that pull from multiple streams. This type is an
@@ -82,7 +98,7 @@ data BatchProcessor b
         ioProcessBatch :: Subspace
                        -> PartitionId
                        -> Seq (Maybe Coordinate, a)
-                       -> Transaction (Seq b),
+                       -> Transaction (ProcessBatchStats, Seq b),
         -- | Number of distinct partitions (threads) that this processor should
         -- run on concurrently.
         ioBatchNumPartitions :: Word8,
@@ -98,7 +114,7 @@ data BatchProcessor b
           iProcessBatch :: Subspace
                         -> PartitionId
                         -> Seq (Maybe Coordinate, a)
-                        -> Transaction (),
+                        -> Transaction ProcessBatchStats,
           iBatchNumPartitions :: Word8,
           iBatchProcessorName :: ByteString
         }
@@ -113,7 +129,7 @@ data BatchProcessor b
         {
           oProcessBatch :: Subspace
                         -> PartitionId
-                        -> Transaction (Seq b),
+                        -> Transaction (ProcessBatchStats, Seq b),
           oBatchNumPartitions :: Word8,
           oBatchProcessorName :: ByteString
         }
@@ -123,7 +139,7 @@ data BatchProcessor b
         {
           processBatch :: Subspace
                        -> PartitionId
-                       -> Transaction (),
+                       -> Transaction ProcessBatchStats,
           batchNumPartitions :: Word8,
           batchProcessorName :: ByteString
         }
@@ -205,8 +221,17 @@ streamProcessorIndexers _ = []
 -- TODO: What is a stream step, really? Just seems to be miscellaneous inputs to
 -- 'run', gathered together so we can use a builder style on them.
 -- Streams and AggrTables are well-defined, but stream steps are not.
+-- Document the nouns of the system in an overview doc somewhere. Why do we need
+-- batch processors, stream steps, the complex functions that run stream steps,
+-- the helper functions that create stream steps that are comprehensible to
+-- end users, etc.
+-- As our BatchProcessor framework becomes more ubiquitous, StreamSteps might
+-- become just a thin layer over them. The major difference: BatchProcessors
+-- are just loops intended to run forever. StreamSteps orchestrate them into
+-- useful entities in a stream processing framework.
 -- TODO: need a splitter that can efficiently route messages to different
 -- output streams.
+-- TODO: need a sink type.
 data StreamStep outMsg runResult where
   IndexedStreamProcessor ::
     (Indexable c, Message b, AT.TableKey k) =>
