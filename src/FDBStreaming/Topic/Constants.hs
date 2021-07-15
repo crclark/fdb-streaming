@@ -13,7 +13,8 @@ module FDBStreaming.Topic.Constants
     oneToManyJoin,
     oneToManyJoinLStore,
     oneToManyJoinBacklog,
-    oneToManyJoinBackloggedKeys
+    oneToManyJoinBackloggedKeys,
+    sink
   )
 where
 
@@ -61,3 +62,6 @@ oneToManyJoinBacklog = Int 12
 -- | Contains a set of keys for which a backlog of r-messages exists.
 oneToManyJoinBackloggedKeys :: Elem
 oneToManyJoinBackloggedKeys = Int 13
+
+sink :: Elem
+sink = Int 14
