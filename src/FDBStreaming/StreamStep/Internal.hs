@@ -231,8 +231,14 @@ streamProcessorIndexers _ = []
 -- useful entities in a stream processing framework.
 -- TODO: need a splitter that can efficiently route messages to different
 -- output streams.
--- TODO: need a sink type.
+-- NOTE: adding more StreamStep constructors leads to a lot of repetition in
+-- the lease-based 'run' function. Avoid creating new StreamStep constructors,
+-- or come up with some solution. We may be able to decouple running the
+-- batchprocessors from setting up the runResult, which might be enough to fix
+-- the problem.
 data StreamStep outMsg runResult where
+  -- | A StreamStep that writes an immediately consistent secondary index on
+  -- the output of a 'StreamProcessor'.
   IndexedStreamProcessor ::
     (Indexable c, Message b, AT.TableKey k) =>
     { indexedStreamProcessorInner :: StreamStep b c,
@@ -272,6 +278,11 @@ data StreamStep outMsg runResult where
     } ->
     StreamStep (k, aggr)
       (AT.AggrTable k aggr)
+  SinkProcessor ::
+    { sinkProcessorWatermarkBy :: WatermarkBy (),
+      sinkProcessorBatchProcessors :: [BatchProcessor ()],
+      sinkProcessorStreamStepConfig :: StreamStepConfig
+    } -> StreamStep () ()
 
 class Indexable runResult where
   -- | When writing messages downstream, also index them by the given key
@@ -293,6 +304,7 @@ stepWatermarkBy :: StreamStep outMsg runResult -> WatermarkBy outMsg
 stepWatermarkBy IndexedStreamProcessor {..} = stepWatermarkBy indexedStreamProcessorInner
 stepWatermarkBy StreamProcessor {..} = streamProcessorWatermarkBy
 stepWatermarkBy TableProcessor {..} = tableProcessorWatermarkBy
+stepWatermarkBy SinkProcessor {..} = sinkProcessorWatermarkBy
 
 stepProducesWatermark :: StreamStep outMsg runResult -> Bool
 stepProducesWatermark = producesWatermark . stepWatermarkBy
@@ -309,6 +321,8 @@ watermarkBy f (StreamProcessor _ ps stepCfg) =
   StreamProcessor (CustomWatermark f) ps stepCfg
 watermarkBy f (TableProcessor g a _ trigger stepCfg) =
   TableProcessor g a (CustomWatermark f) trigger stepCfg
+watermarkBy f (SinkProcessor _ ps stepCfg) =
+  SinkProcessor (CustomWatermark f) ps stepCfg
 
 getStepConfig :: StreamStep b r -> StreamStepConfig
 getStepConfig IndexedStreamProcessor {indexedStreamProcessorInner} =
@@ -317,12 +331,24 @@ getStepConfig StreamProcessor {streamProcessorStreamStepConfig} =
   streamProcessorStreamStepConfig
 getStepConfig TableProcessor {tableProcessorStreamStepConfig} =
   tableProcessorStreamStepConfig
+getStepConfig SinkProcessor {sinkProcessorStreamStepConfig} =
+  sinkProcessorStreamStepConfig
 
 mapStepConfig :: (StreamStepConfig -> StreamStepConfig) -> StreamStep b r -> StreamStep b r
 mapStepConfig f (IndexedStreamProcessor inner nm ixby) =
   IndexedStreamProcessor (mapStepConfig f inner) nm ixby
 mapStepConfig f (StreamProcessor w p c) = StreamProcessor w p (f c)
 mapStepConfig f (TableProcessor g a w t c) = TableProcessor g a w t (f c)
+mapStepConfig f (SinkProcessor w p c) = SinkProcessor w p (f c)
+
+stepBatchProcessors :: StreamStep b r -> [BatchProcessor b]
+stepBatchProcessors IndexedStreamProcessor{indexedStreamProcessorInner} =
+  stepBatchProcessors indexedStreamProcessorInner
+stepBatchProcessors StreamProcessor {streamProcessorBatchProcessors} =
+  streamProcessorBatchProcessors
+stepBatchProcessors TableProcessor {} = []
+stepBatchProcessors SinkProcessor {sinkProcessorBatchProcessors} =
+  sinkProcessorBatchProcessors
 
 -- | Sets the number of messages to process per batch for the given step.
 -- Overrides the default set in 'JobConfig.msgsPerBatch'.

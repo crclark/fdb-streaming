@@ -207,7 +207,7 @@ module FDBStreaming
     groupBy,
     GroupedBy (..),
     aggregate,
-    getAggrTable,
+    getAggrTable, --TODO: footgun, don't export?
     benignIO,
 
     -- * More complex usage
@@ -314,7 +314,7 @@ import FDBStreaming.StreamStep.Internal
     StreamStep
       ( IndexedStreamProcessor,
         StreamProcessor,
-        TableProcessor
+        TableProcessor, SinkProcessor, sinkProcessorWatermarkBy, sinkProcessorBatchProcessors, sinkProcessorStreamStepConfig
       ),
     StreamStepConfig (StreamStepConfig),
     batchProcessorHasInput,
@@ -336,7 +336,7 @@ import FDBStreaming.StreamStep.Internal
     streamProcessorWatermarkBy,
     watermarkBy,
     withBatchSize,
-    withOutputPartitions, ProcessBatchStats (ProcessBatchStats, processBatchStatsNumProcessed)
+    withOutputPartitions, ProcessBatchStats (ProcessBatchStats, processBatchStatsNumProcessed), stepBatchProcessors
   )
 import FDBStreaming.TaskLease (TaskName (TaskName), secondsSinceEpoch)
 import FDBStreaming.TaskRegistry as TaskRegistry
@@ -537,16 +537,16 @@ watermarkNext t = do
 -- can watermark.
 defaultWatermarkUpstreamTopics ::
   StepName ->
-  StreamStep outMsg (Stream t outMsg) ->
+  StreamStep outMsg runResult ->
   Maybe [(Topic, StepName)]
-defaultWatermarkUpstreamTopics sn StreamProcessor {streamProcessorBatchProcessors} =
+defaultWatermarkUpstreamTopics sn streamStep =
   -- This checks two of the conditions that must be satisfied to apply a default
   -- watermark to a stream. Specifically, conditions 3 and 4:
   -- 3. Does the input have a watermark subspace?
   -- 4. Is the input a stream inside FoundationDB? If not, we can't get the
   --    checkpoint for this reader that corresponds to a point in the
   --    watermark function.
-  let withInput = filter batchProcessorHasInput streamProcessorBatchProcessors
+  let withInput = filter batchProcessorHasInput (stepBatchProcessors streamStep)
       topics = map batchProcessorInputTopic withInput
    in if all isBatchProcessorInputWatermarked withInput && all isJust topics
         then
@@ -603,6 +603,14 @@ instance MonadStream DefaultWatermarker where
             wmSS
       _ -> return ()
     return table
+  run sn step@SinkProcessor {} = do
+    cfg <- getJobConfig
+    case (isStepDefaultWatermarked step,
+          sinkWatermarkSubspace cfg sn,
+           defaultWatermarkUpstreamTopics sn step) of
+      (True, wmSS, Just xs) ->
+        watermarkNext (defaultWatermark xs wmSS)
+      _ -> return ()
 
 -- | Runs the standard watermark logic for a stream. For each input stream,
 -- finds the minimum checkpoint across all its partitions. For each of these
@@ -690,14 +698,13 @@ existingWatermarked tc =
 
 -- | Produce a side effect at least once for each message in the stream.
 atLeastOnce :: (MonadStream m) => StepName -> Stream t a -> (a -> IO ()) -> m ()
-atLeastOnce sn input f = void $ do
+atLeastOnce sn input f =
   run sn $
-    -- TODO: this produces a 'Stream FDB' ()' that the 'void' above hides from
-    -- the user, but it will still be persisted to FDB. We need a real sink type
-    -- in StreamStep to avoid this.
-    StreamProcessor
-      { streamProcessorWatermarkBy = NoWatermark,
-        streamProcessorBatchProcessors =
+    SinkProcessor
+      -- TODO: it would be good to watermark this so users can see how far
+      -- behind real time this step is lagging.
+      { sinkProcessorWatermarkBy = NoWatermark,
+        sinkProcessorBatchProcessors =
           [ IOBatchProcessor
               input
               (\_ss _pid xs -> do
@@ -706,7 +713,7 @@ atLeastOnce sn input f = void $ do
               (fromIntegral $ streamMinReaderPartitions input)
               "alo"
           ],
-        streamProcessorStreamStepConfig = defaultStreamStepConfig
+        sinkProcessorStreamStepConfig = defaultStreamStepConfig
       }
 
 -- | Transforms the contents of a stream, outputting the results to a new Stream
@@ -766,26 +773,26 @@ eventualIndexBy ::
 eventualIndexBy sn f stream = do
   let topic = streamTopic stream
   let ix = Ix.namedIndex topic sn
-  -- TODO: we seem to need a StreamSink type for side effects that don't
-  -- write downstream.
   let ixer _ss _pid batch = do
         for_ batch $ \case
           (Just coord, x) -> for_ (f x) \k -> do
             Ix.indexCommitted ix k coord
           (Nothing, _) -> return ()
         return (ProcessBatchStats (Just (length batch)), mempty)
-  (_s :: Stream 'FDB ()) <-
-    run sn $
-      StreamProcessor
-        { streamProcessorWatermarkBy = NoWatermark,
-          streamProcessorBatchProcessors =
-            [IOBatchProcessor
-              stream
-              ixer
-              (fromIntegral $ streamMinReaderPartitions stream)
-              "eix"],
-          streamProcessorStreamStepConfig = defaultStreamStepConfig
-        }
+  run sn $
+    SinkProcessor
+      -- TODO: we definitely want to watermark this so that users can see how
+      -- far behind real time their secondary index is. How do we best expose
+      -- it to the user so they can check on it?
+      { sinkProcessorWatermarkBy = NoWatermark,
+        sinkProcessorBatchProcessors =
+          [IOBatchProcessor
+            stream
+            ixer
+            (fromIntegral $ streamMinReaderPartitions stream)
+            "eix"],
+        sinkProcessorStreamStepConfig = defaultStreamStepConfig
+      }
   return ix
 
 -- | Streaming one-to-one join. If the relationship is not actually one-to-one
@@ -1127,6 +1134,7 @@ outputTopic stepName step@StreamProcessor {} = do
       (getStepNumPartitions jc (getStepConfig step))
       (defaultChunkSizeBytes jc)
 outputTopic _ TableProcessor {} = return Nothing
+outputTopic _ SinkProcessor {} = return Nothing
 
 instance MonadStream LeaseBasedStreamWorker where
   run sn step@IndexedStreamProcessor {} =
@@ -1187,6 +1195,8 @@ instance MonadStream LeaseBasedStreamWorker where
             $ runStreamTxn jobConfigDB
             $ addTask taskReg taskName (leaseDuration cfg) (job pid)
         return table
+  run sn step@SinkProcessor {} =
+    runSinkProcessorLeaseBased sn step
 
 -- TODO: what if we have recently removed steps from our topology? Old leases
 -- will be registered forever. Need to remove old ones.
@@ -1249,6 +1259,21 @@ getAggrTable sc sn n = AT.AggrTable {..}
     aggrTableSS =
       FDB.extend (jobConfigSS sc) [C.topics, FDB.Bytes sn, C.aggrTable]
     aggrTableNumPartitions = n
+
+-- | Subspace storing any state needed to maintain a SinkProcessor StreamStep.
+sinkSubspace ::
+  JobConfig ->
+  StepName ->
+  FDB.Subspace
+sinkSubspace cfg sn = FDB.extend (jobConfigSS cfg) [C.topics, FDB.Bytes sn, C.sink]
+
+-- | Subspace storing watermark information for a sink (a stream step that
+-- produces no output).
+sinkWatermarkSubspace ::
+  JobConfig ->
+  StepName ->
+  FDB.Subspace
+sinkWatermarkSubspace cfg sn = FDB.extend (sinkSubspace cfg sn) [FDB.Bytes "wm"]
 
 continuousTaskRegSS :: JobConfig -> FDB.Subspace
 continuousTaskRegSS cfg = FDB.extend (jobConfigSS cfg) [FDB.Bytes "leasec"]
@@ -1351,7 +1376,7 @@ oneToOneJoinStep joinSS streamJoinIx pl combiner ckptmsgs = do
       -- processed at exactly the same time. We originally used a snapshot read
       -- here, but that was incorrect -- if both messages for a key are
       -- processed simultaneously, they miss each other and get stuck forever.
-      -- It's possible that this isn't a big problem -- perhaps it will reach an
+      -- It's possible that conflicts aren't a big problem -- perhaps it will reach an
       -- equilibrium where one side of the join is a little behind the other.
       -- The other alternative is to add a partitionByKey operation before the
       -- join step. It would hash the key of each message, modulate that hash
@@ -1378,8 +1403,8 @@ oneToOneJoinStep joinSS streamJoinIx pl combiner ckptmsgs = do
         return Nothing
   return (ProcessBatchStats (Just (length ckptmsgs)), results)
 
--- TODO: replace this helper function with a BatchProcessor in the table stream
--- step constructor
+-- TODO: replace this helper function with a BatchProcessor in the
+-- TableProcessor constructor
 aggregateStep ::
   forall v k aggr state.
   (Ord k, AT.TableKey k, AT.TableSemigroup aggr) =>
@@ -1474,6 +1499,8 @@ instance MonadStream PureStream where
             sn
             (getStepNumPartitions cfg (getStepConfig s))
     return table
+  run _ SinkProcessor {} =
+    return ()
 
 -- | Extracts the output of a MonadStream topology without side effects.
 -- This can be used to return handles to any streams and tables you want
@@ -1516,6 +1543,8 @@ instance MonadStream ListTopics where
             sn
             (getStepNumPartitions cfg (getStepConfig step))
     return table
+  run _ SinkProcessor {} =
+    return ()
 
 -- | List all topics written to by the given stream topology.
 listTopics :: JobConfig -> (forall m. MonadStream m => m a) -> [Topic]
@@ -1559,6 +1588,7 @@ runIndexedStreamProcessorLeaseBased
       go step'@StreamProcessor {} indexers =
         runStreamProcessorLeaseBased sn step' indexers
       go TableProcessor{} _ = error "impossible case 2"
+      go SinkProcessor{} _ = error "impossible case 3"
 runIndexedStreamProcessorLeaseBased _ _ = error "runIndexedStreamProcessorLeaseBased called on wrong constructor"
 
 -- | run the indexed stream processor in monads where we don't need indexing
@@ -1588,6 +1618,7 @@ runIndexedStreamProcessorPure
       go step'@StreamProcessor {} =
         run sn step'
       go TableProcessor{} = error "impossible case 2"
+      go SinkProcessor{} = error "impossible case 3"
 runIndexedStreamProcessorPure _ _ = error "runIndexedStreamProcessorPure called on wrong constructor"
 
 runStreamProcessorLeaseBased :: StepName
@@ -1712,3 +1743,88 @@ runStreamProcessorLeaseBased
 -- to this namespace and used merely to DRY out a few cases.
 runStreamProcessorLeaseBased
   _ _ _ = error "runStreamProcessorLeaseBased called on non-StreamProcessor"
+
+runSinkProcessorLeaseBased :: StepName
+                           -> StreamStep () ()
+                           -> LeaseBasedStreamWorker ()
+runSinkProcessorLeaseBased
+  sn
+  SinkProcessor { sinkProcessorWatermarkBy
+                , sinkProcessorBatchProcessors
+                , sinkProcessorStreamStepConfig
+                } = do
+    (cfg@JobConfig {jobConfigDB, jobConfigSS, leaseDuration}, _) <- Reader.ask
+    metrics <- registerStepMetrics sn
+    let msgsPerBatch = getMsgsPerBatch cfg sinkProcessorStreamStepConfig
+    let workspaceSS =
+          FDB.extend
+            (sinkSubspace cfg sn)
+            [C.streamStepWorkspace]
+    let wmSS = sinkWatermarkSubspace cfg sn
+    let processorsWStepNames =
+          zipWith
+            (\bp i ->
+              (bp
+              , sn <> BS8.pack (show i) <> "_" <> getBatchProcessorName bp))
+            sinkProcessorBatchProcessors
+            [(0 :: Int) ..]
+    --TODO: most of this is copy/pasted from runStreamProcessorLeaseBased, but
+    -- I don't yet see a way to avoid the repetition, because there are enough
+    -- differences that it's somewhat tricky to DRY out.
+    for_ processorsWStepNames \(batchProcessor, sn_i) -> do
+      let job pid _stillValid _release =
+            case batchProcessor of
+              IOBatchProcessor{ioBatchInStream, ioProcessBatch} ->
+                -- NOTE: we must use a case here to do the pattern match to
+                -- work around a GHC limitation. In 8.6, let gives a very
+                -- confusing error message about variables escaping their
+                -- scopes. In 8.8, it gives a more helpful "my brain just
+                -- exploded" message that says to use a case statement.
+                case getStream' ioBatchInStream of
+                  (Stream' streamReadAndCheckpoint _ _ _ setUpState destroyState) -> do
+                    -- NOTE: there is repetition of the bracket, doForSeconds,
+                    -- and throttleByErrors, but the existentials make
+                    -- DRYing it out difficult.
+                    bracket
+                      (runStreamTxn jobConfigDB $ setUpState cfg sn_i pid checkpointSS)
+                      destroyState
+                      $ \state -> doForSeconds leaseDuration
+                      $ throttleByErrors metrics sn_i
+                      $ runStreamTxn jobConfigDB
+                      $ do
+                        inMsgs <- streamReadAndCheckpoint
+                                  cfg
+                                  sn_i
+                                  pid
+                                  checkpointSS
+                                  msgsPerBatch
+                                  state
+                        recordInputBatchMetrics metrics inMsgs
+                        (stats, outputMsgs) <- ioProcessBatch workspaceSS pid inMsgs
+                        -- custom watermark support might not actually be needed
+                        -- for sink steps -- the custom watermark is always going
+                        -- to be given () as input, so it's not really useful.
+                        runCustomWatermark wmSS sinkProcessorWatermarkBy outputMsgs
+                        return stats
+                    where
+                      -- TODO: DRY out
+                      checkpointSS =
+                        streamConsumerCheckpointSS
+                          jobConfigSS
+                          ioBatchInStream
+                          sn_i
+              -- Crude way to reduce needless repetition. Users can't create
+              -- sink steps themselves, so these error should be impossible
+              -- cases.
+              IBatchProcessor{} ->
+                error "impossible: sink steps don't support IBatchProcessor"
+              OBatchProcessor{} ->
+                error "impossible: sink steps don't support OBatchProcessor"
+              BatchProcessor{} ->
+                error "impossible: sink steps don't support BatchProcessor"
+      forEachPartition' (numBatchPartitions batchProcessor) $ \pid -> do
+        let taskName = mkTaskName sn_i pid
+        taskReg <- taskRegistry
+        liftIO
+          $ runStreamTxn jobConfigDB
+          $ addTask taskReg taskName leaseDuration (job pid)
