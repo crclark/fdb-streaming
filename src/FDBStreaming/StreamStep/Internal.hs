@@ -17,7 +17,7 @@ import Data.Sequence (Seq)
 import Data.Word (Word16, Word8)
 import qualified FDBStreaming.AggrTable as AT
 import FDBStreaming.Index (Index, IndexName)
-import FDBStreaming.JobConfig (JobSubspace)
+import FDBStreaming.JobConfig (JobSubspace, JobConfig)
 import FDBStreaming.Message (Message)
 import FDBStreaming.Stream.Internal (Stream, StreamPersisted (FDB), maybeStreamTopic, streamWatermarkSS)
 import FDBStreaming.Topic (Coordinate, Topic, PartitionId)
@@ -95,7 +95,8 @@ data BatchProcessor b
         -- within a step to communicate. For example, this is used to store
         -- temporary data for joins -- one BatchProcessor is responsible for the
         -- left side of the join, the other is responsible for the right side.
-        ioProcessBatch :: Subspace
+        ioProcessBatch :: JobConfig
+                       -> Subspace
                        -> PartitionId
                        -> Seq (Maybe Coordinate, a)
                        -> Transaction (ProcessBatchStats, Seq b),
@@ -111,7 +112,8 @@ data BatchProcessor b
     | forall a r. IBatchProcessor
         {
           iBatchInStream :: Stream r a,
-          iProcessBatch :: Subspace
+          iProcessBatch :: JobConfig
+                        -> Subspace
                         -> PartitionId
                         -> Seq (Maybe Coordinate, a)
                         -> Transaction ProcessBatchStats,
@@ -127,7 +129,8 @@ data BatchProcessor b
     -- downstream. See the OneToMany join namespace for more details.
     | OBatchProcessor
         {
-          oProcessBatch :: Subspace
+          oProcessBatch :: JobConfig
+                        -> Subspace
                         -> PartitionId
                         -> Transaction (ProcessBatchStats, Seq b),
           oBatchNumPartitions :: Word8,
@@ -137,7 +140,8 @@ data BatchProcessor b
     -- no output stream.
     | BatchProcessor
         {
-          processBatch :: Subspace
+          processBatch :: JobConfig
+                       -> Subspace
                        -> PartitionId
                        -> Transaction ProcessBatchStats,
           batchNumPartitions :: Word8,
@@ -218,6 +222,8 @@ streamProcessorIndexers IndexedStreamProcessor{ indexedStreamProcessorInner
 
 streamProcessorIndexers _ = []
 
+data Sink = Sink {sinkWatermarkSS :: Subspace} deriving Show
+
 -- TODO: What is a stream step, really? Just seems to be miscellaneous inputs to
 -- 'run', gathered together so we can use a builder style on them.
 -- Streams and AggrTables are well-defined, but stream steps are not.
@@ -282,7 +288,7 @@ data StreamStep outMsg runResult where
     { sinkProcessorWatermarkBy :: WatermarkBy (),
       sinkProcessorBatchProcessors :: [BatchProcessor ()],
       sinkProcessorStreamStepConfig :: StreamStepConfig
-    } -> StreamStep () ()
+    } -> StreamStep () Sink
 
 class Indexable runResult where
   -- | When writing messages downstream, also index them by the given key
