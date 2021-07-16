@@ -14,7 +14,9 @@ module FDBStreaming.Util (
   chunksOfSize,
   streamlyRangeResult,
   parseWord64le,
-  addOneAtomic
+  addOneAtomic,
+  subtractOneAtomic,
+  addAtomic
 ) where
 
 import Control.Logger.Simple (logError, showText)
@@ -27,8 +29,9 @@ import Control.Exception
   )
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Binary.Get (Get, getWord64le, runGet, runGetOrFail)
+import Data.Binary.Put (runPut, putInt64le)
 import Data.ByteString (ByteString)
-import Data.ByteString.Lazy (fromStrict)
+import Data.ByteString.Lazy (fromStrict, toStrict)
 import Data.Fixed (Fixed (MkFixed), E12)
 import Data.Time.Clock (NominalDiffTime, UTCTime, getCurrentTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
@@ -124,7 +127,17 @@ streamlyRangeResult rr =
 parseWord64le :: Num a => ByteString -> a
 parseWord64le bs = fromIntegral $ runGet getWord64le $ fromStrict bs
 
--- Adds little-endian encoded 1 to the value stored at the given key.
+-- | Adds little-endian encoded 1 to the value stored at the given key.
 addOneAtomic :: ByteString -> FDB.Transaction ()
 addOneAtomic k = FDB.atomicOp k (Mut.add oneLE)
   where oneLE = "\x01\x00\x00\x00\x00\x00\x00\x00"
+
+-- | Subtracts little-endian encoded 1 to the value stored at the given key.
+subtractOneAtomic :: ByteString -> FDB.Transaction ()
+subtractOneAtomic k = FDB.atomicOp k (Mut.add oneLE)
+  where oneLE = "\xff\xff\xff\xff\xff\xff\xff\xff"
+
+-- | Atomically adds little-endian encoded n to the value stored at the given key.
+addAtomic :: ByteString -> Int -> FDB.Transaction ()
+addAtomic k n = FDB.atomicOp k (Mut.add encoded)
+  where encoded = toStrict $ runPut $ putInt64le $ fromIntegral n

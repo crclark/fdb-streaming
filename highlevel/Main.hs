@@ -77,6 +77,7 @@ import Options.Generic
 import Data.Int (Int64)
 import Data.Either (fromRight)
 import qualified Data.Text as Text
+import FDBStreaming.JobConfig (JobConfig(tasksToCleanUp))
 
 newtype Timestamp = Timestamp { unTimestamp :: Int64 }
   deriving (Show, Eq, Ord, Generic, Persist)
@@ -358,6 +359,7 @@ mainLoop db ss Args{ generatorNumThreads
              , defaultNumPartitions = coerce numPartitions
              , logLevel = LogDebug
              , defaultChunkSizeBytes = runIdentity $ fmap fromIntegral bytesPerChunk
+             , tasksToCleanUp = []
              }
   let pconf = Push.PushStreamConfig
                 ( if coerce watermark

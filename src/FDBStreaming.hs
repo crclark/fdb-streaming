@@ -261,7 +261,7 @@ import Data.Witherable.Class (catMaybes, witherM)
 import Data.Word (Word16, Word64, Word8)
 import qualified FDBStreaming.AggrTable as AT
 import qualified FDBStreaming.Index as Ix
-import FDBStreaming.JobConfig (JobConfig (JobConfig, defaultChunkSizeBytes, defaultNumPartitions, jobConfigDB, jobConfigSS, leaseDuration, logLevel, msgsPerBatch, numPeriodicJobThreads, numStreamThreads, streamMetricsStore), JobSubspace)
+import FDBStreaming.JobConfig (JobConfig (JobConfig, defaultChunkSizeBytes, defaultNumPartitions, jobConfigDB, jobConfigSS, leaseDuration, logLevel, msgsPerBatch, numPeriodicJobThreads, numStreamThreads, streamMetricsStore, tasksToCleanUp), JobSubspace)
 import FDBStreaming.Joins
   ( OneToOneJoinSS,
     delete1to1JoinData,
@@ -348,6 +348,7 @@ import FDBStreaming.TaskLease (TaskName (TaskName), secondsSinceEpoch)
 import FDBStreaming.TaskRegistry as TaskRegistry
   ( TaskRegistry,
     addTask,
+    removeTask,
     empty,
     runRandomTask,
   )
@@ -1190,8 +1191,6 @@ instance MonadStream LeaseBasedStreamWorker where
   run sn step@SinkProcessor {} =
     runSinkProcessorLeaseBased sn step
 
--- TODO: what if we have recently removed steps from our topology? Old leases
--- will be registered forever. Need to remove old ones.
 registerContinuousLeases ::
   JobConfig ->
   LeaseBasedStreamWorker a ->
@@ -1443,12 +1442,15 @@ aggregateStep
 -- | Runs a stream processing job forever. Blocks indefinitely.
 runJob :: JobConfig -> (forall m. MonadStream m => m a) -> IO ()
 runJob
-  cfg@JobConfig {jobConfigDB, numStreamThreads, numPeriodicJobThreads, logLevel}
+  cfg@JobConfig {jobConfigDB, numStreamThreads, numPeriodicJobThreads, logLevel
+                , tasksToCleanUp}
   topology = withGlobalLogging (LogConfig Nothing True) $ do
     setLogLevel logLevel
     logInfo "Starting main loop"
     -- Run threads for continuously-running stream steps
     (_pureResult, continuousTaskReg) <- registerContinuousLeases cfg topology
+    FDB.runTransaction jobConfigDB
+      $ for_ tasksToCleanUp $ \t -> removeTask continuousTaskReg (TaskName t)
     continuousThreads <-
       replicateM numStreamThreads
         $ async
@@ -1459,6 +1461,8 @@ runJob
           True -> return ()
     -- Run threads for periodic jobs (watermarking, cleanup, etc)
     periodicTaskReg <- TaskRegistry.empty (periodicTaskRegSS cfg)
+    FDB.runTransaction jobConfigDB
+      $ for_ tasksToCleanUp $ \t -> removeTask periodicTaskReg (TaskName t)
     registerDefaultWatermarker cfg periodicTaskReg topology
     periodicThreads <-
       replicateM numPeriodicJobThreads

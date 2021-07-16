@@ -31,6 +31,7 @@ module FDBStreaming.TaskLease (
   AcquiredLease(..),
   isLeaseValid,
   ensureTask,
+  removeTask,
   EnsureTaskResult(..),
   tryAcquire,
   acquireRandom,
@@ -38,7 +39,8 @@ module FDBStreaming.TaskLease (
   release,
   ReleaseResult(..),
   getTaskID,
-  isLocked
+  isLocked,
+  listAllTasks
 ) where
 
 import           Control.Monad.IO.Class         ( liftIO )
@@ -57,7 +59,7 @@ import qualified FoundationDB as FDB
 import           FoundationDB.Layer.Subspace (Subspace)
 import qualified FoundationDB.Layer.Subspace as FDB
 import qualified FoundationDB.Layer.Tuple as FDB
-import FDBStreaming.Util (parseWord64le, addOneAtomic)
+import FDBStreaming.Util (parseWord64le, addOneAtomic, subtractOneAtomic)
 
 -- | Uniquely identifies an acquired lease on a 'TaskName'.
 newtype AcquiredLease = AcquiredLease Int
@@ -180,6 +182,11 @@ incrCount l = do
   let k = countKey l
   addOneAtomic k
 
+decrCount :: TaskSpace -> Transaction ()
+decrCount l = do
+  let k = countKey l
+  subtractOneAtomic k
+
 getAcquiredLease :: TaskSpace -> TaskID -> Transaction AcquiredLease
 getAcquiredLease l taskID = do
   let k = lockVersionKey l taskID
@@ -238,6 +245,38 @@ ensureTask l taskName =
     addToTaskList taskID = do
       let alk = allTasksKey l taskID taskName
       FDB.set alk ""
+
+-- | Delete a task from the TaskSpace. This can be used to clean up old tasks
+-- if a pipeline is changed and a stream step is removed. This is idempotent
+-- and safe to call if the task does not in fact exist.
+removeTask :: TaskSpace -> TaskName -> Transaction ()
+removeTask l taskName =
+  getTaskID l taskName >>= \case
+    Nothing -> return ()
+    Just taskID -> do
+      clearOldExpiresAtKey l taskID taskName
+      makeUnavailable taskID
+      removeFromTaskList taskID
+      removeFromLockedTasks taskID
+      removeFromLockVersions taskID
+      decrCount l
+
+  where
+    makeUnavailable taskID = do
+      let avk = availableKey l taskID taskName
+      FDB.clear avk
+
+    removeFromTaskList taskID = do
+      let alk = allTasksKey l taskID taskName
+      FDB.clear alk
+
+    removeFromLockedTasks taskID = do
+      let lk = lockedKey l taskID taskName
+      FDB.clear lk
+
+    removeFromLockVersions taskID = do
+      let lvk = lockVersionKey l taskID
+      FDB.clear lvk
 
 -- | Clear the old timeout key for a previously locked task, if it exists.
 clearOldExpiresAtKey :: TaskSpace -> TaskID -> TaskName -> Transaction ()
@@ -384,3 +423,11 @@ acquireRandom ts taskSeconds = do
       let how = if rand < length expireds then RandomExpired else Available
       return $ Just (taskName, tv, how)
     else return Nothing
+
+-- | Returns all tasks, locked and unlocked, that exist in the TaskSpace.
+listAllTasks :: TaskSpace -> Transaction (Seq TaskName)
+listAllTasks ts = do
+  expireds <- FDB.withSnapshot $ expiredLocks ts
+  availables <- FDB.withSnapshot $ availableLocks ts
+  let tasks = expireds <> availables
+  return tasks
