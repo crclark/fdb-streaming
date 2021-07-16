@@ -7,6 +7,7 @@ module FDBStreaming.TaskRegistry
     empty,
     numTasks,
     addTask,
+    removeTask,
     runRandomTask,
   )
 where
@@ -19,6 +20,7 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Map (Map)
 import qualified Data.Map as M
 import FDBStreaming.TaskLease (EnsureTaskResult (AlreadyExists, NewlyCreated), ReleaseResult, TaskID, TaskName, TaskSpace, acquireRandom, ensureTask, isLeaseValid, isLocked, release, taskSpace)
+import qualified FDBStreaming.TaskLease as TL
 import FDBStreaming.Util (logAndRethrowErrors)
 import FoundationDB (Transaction)
 import qualified FoundationDB as FDB
@@ -30,15 +32,15 @@ import qualified FoundationDB.Layer.Tuple as FDB
 -- registry for a task assignment. The registry is responsible for acquiring
 -- a distributed lease for the task, ensuring exclusive access to the task
 -- across all workers.
-data -- This comes with a caveat: the worker must manually check that the lease
-  -- is still valid as it runs! While this restriction is inconvenient, it is
-  -- unavoidable -- process execution could be delayed arbitrarily after lease
-  -- acquisition, and leases eventually time out and unlock themselves again.
-  -- This also gives us some flexibility -- for some tasks, we might already have
-  -- achieved safety through transaction design, and we just want to use leases
-  -- to reduce conflicts. In such cases, it's not important to check that the lock
-  -- still holds.
-  TaskRegistry
+-- This comes with a caveat: the worker must manually check that the lease
+-- is still valid as it runs! While this restriction is inconvenient, it is
+-- unavoidable -- process execution could be delayed arbitrarily after lease
+-- acquisition, and leases eventually time out and unlock themselves again.
+-- This also gives us some flexibility -- for some tasks, we might already have
+-- achieved safety through transaction design, and we just want to use leases
+-- to reduce conflicts. In such cases, it's not important to check that the lock
+-- still holds.
+data TaskRegistry
   = TaskRegistry
       { taskRegistrySpace :: TaskSpace,
         getTaskRegistry ::
@@ -101,6 +103,15 @@ addTask reg@(TaskRegistry ts tr) taskName dur f = do
     extractID (AlreadyExists t) = t
     extractID (NewlyCreated t) = t
 
+-- | Remove a task from the TaskRegistry.
+removeTask ::
+  TaskRegistry ->
+  TaskName ->
+  Transaction ()
+removeTask (TaskRegistry ts tr) taskName = do
+  TL.removeTask ts taskName
+  liftIO $ atomicModifyIORef' tr ((,()) . M.delete taskName)
+
 -- | Run a random task in the task registry. If no tasks are available, returns
 -- false.
 runRandomTask :: FDB.Database -> TaskRegistry -> IO Bool
@@ -112,8 +123,23 @@ runRandomTask db (TaskRegistry ts tr) = do
   FDB.runTransaction db (acquireRandom ts toDur) >>= \case
     Nothing -> return False
     Just (taskName, lease, howAcquired) -> case M.lookup taskName tr' of
-      Nothing ->
-        return False --TODO: warn? this implies tasks outside registry
+      Nothing -> do
+        logWarn $
+          " found unexpected task "
+          <> showText taskName
+          <> " acquired by "
+          <> showText howAcquired
+          <> ". If you have redeployed your job after"
+          <> " deleting a pipeline step, please add"
+          <> " " <> showText taskName
+          <> " to 'tasksToCleanUp' in your JobConfig and redeploy. Afterwards,"
+          <> " you can set 'tasksToCleanUp' to an empty list again."
+          <> " If you have not recently renamed or deleted a step, please ensure"
+          <> " that you are using a different jobConfigSS"
+          <> " from all other jobs running on this FoundationDB cluster."
+          <> " This task will be ignored and this thread will try to find other"
+          <> " tasks to execute."
+        return True
       Just (taskID, _dur, f) -> do
         tid <- myThreadId
         logDebug $

@@ -6,6 +6,7 @@ module FDBStreaming.JobConfig
   )
 where
 
+import           Data.ByteString                ( ByteString )
 import qualified Control.Logger.Simple as Log
 import Data.Word (Word16, Word8)
 import qualified FoundationDB as FDB
@@ -64,5 +65,14 @@ data JobConfig
         -- generally improves throughput and reduces disk usage in FDB.
         defaultChunkSizeBytes :: Word,
         -- | Logging level for fdb-streaming log messages
-        logLevel :: Log.LogLevel
+        logLevel :: Log.LogLevel,
+        -- | Internal tasks to remove from the task registry when the job
+        -- starts. This is used to clean up old state after modifying an
+        -- existing job and removing or renaming a step in the pipeline. After
+        -- your modified job has started, you will see warnings about unexpected
+        -- tasks. Add these task names to this list and redeploy. They will
+        -- be cleaned up when the job starts. You can then set this to an
+        -- empty list again. The job migration helper, once it exists, will also
+        -- help you in setting this value if needed.
+        tasksToCleanUp :: [ByteString]
       }

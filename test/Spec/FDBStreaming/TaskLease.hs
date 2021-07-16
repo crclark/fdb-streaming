@@ -28,6 +28,7 @@ import Data.IORef (atomicModifyIORef, newIORef, readIORef)
 import Data.Kind (Type)
 import qualified Data.Map as Map
 import Data.Maybe (isJust, isNothing)
+import qualified Data.Sequence as Seq
 import Data.TreeDiff.Class (ToExpr)
 import FDBStreaming.TaskLease
   ( AcquiredLease,
@@ -41,6 +42,7 @@ import FDBStreaming.TaskLease
     TaskSpace,
     acquireRandom,
     ensureTask,
+    removeTask,
     release,
     tryAcquire,
   )
@@ -52,11 +54,12 @@ import Safe (headMay)
 import Spec.FDBStreaming.Util (extendRand)
 import Test.QuickCheck ((===), Property)
 import Test.QuickCheck.Gen
-import Test.QuickCheck.Monadic (monadicIO)
+import Test.QuickCheck.Monadic (monadicIO, run)
 import Test.StateMachine as QSM
 import qualified Test.StateMachine.Types.Rank2 as Rank2
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit ((@?=), assertBool, testCase)
+import FDBStreaming.TaskLease (listAllTasks)
 
 update :: Eq a => a -> b -> [(a, b)] -> [(a, b)]
 update ref i m = (ref, i) : filter ((/= ref) . fst) m
@@ -310,7 +313,8 @@ leaseProps testSS db =
     "Lease properties"
     [ mutualExclusion testTaskSpace db,
       uniformRandomness testTaskSpace db,
-      mutualExclusionRandom testTaskSpace db
+      mutualExclusionRandom testTaskSpace db,
+      taskDeletion testTaskSpace db
     ]
   where
     testTaskSpace = TaskSpace testSS
@@ -322,6 +326,31 @@ isNewlyCreated _ = False
 isAlreadyExists :: EnsureTaskResult -> Bool
 isAlreadyExists (AlreadyExists _) = True
 isAlreadyExists _ = False
+
+taskDeletion :: TaskSpace -> Database -> TestTree
+taskDeletion (TaskSpace testSS) db =
+  testCase "removing tasks" $ do
+    ss <- TaskSpace <$> extendRand testSS
+    let t1 = "testTask1"
+    let t2 = "testTask2"
+    runTransaction db $ removeTask ss t1
+    create1 <- runTransaction db $ ensureTask ss t1
+    assertBool "t1 not newly created" $ isNewlyCreated create1
+    create2 <- runTransaction db $ ensureTask ss t2
+    assertBool "t2 not newly created" $ isNewlyCreated create2
+    runTransaction db $ removeTask ss t1
+    create12 <- runTransaction db $ ensureTask ss t1
+    assertBool "t1 not newly created after delete and create" $ isNewlyCreated create12
+    create22 <- runTransaction db $ ensureTask ss t2
+    assertBool "t2 didn't already exist after removing t1" $ isAlreadyExists create22
+    runTransaction db $ removeTask ss t1
+    allTasks <- runTransaction db $ listAllTasks ss
+    assertBool "t1 still listed in all tasks" (allTasks == Seq.fromList [t2])
+    acquireResult <- runTransaction db $ tryAcquire ss t2 5
+    assertBool "couldn't acquire t2" (isJust acquireResult)
+    runTransaction db $ removeTask ss t2
+    allTasks2 <- runTransaction db $ listAllTasks ss
+    assertBool "t2 still listed in all tasks" (allTasks2 == Seq.empty)
 
 mutualExclusion :: TaskSpace -> Database -> TestTree
 mutualExclusion (TaskSpace testSS) db =
