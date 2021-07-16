@@ -6,6 +6,9 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE UndecidableInstances #-}
 {-# OPTIONS_GHC -fno-warn-missing-export-lists #-}
 
 -- Internal module; export everything!
@@ -30,6 +33,8 @@ import FDBStreaming.Watermark
   )
 import FoundationDB (Transaction)
 import FoundationDB.Layer.Subspace (Subspace)
+import Data.Kind (Type)
+import GHC.TypeLits (TypeError, ErrorMessage(..))
 
 -- | The name of a step in the pipeline. A step can be thought of as a function
 -- that consumes a stream and writes to a stream, a table, or a side effect.
@@ -246,7 +251,8 @@ data StreamStep outMsg runResult where
   -- | A StreamStep that writes an immediately consistent secondary index on
   -- the output of a 'StreamProcessor'.
   IndexedStreamProcessor ::
-    (Indexable c, Message b, AT.TableKey k) =>
+    (Message b, AT.TableKey k,
+     StructureBeingIndexed c ~ Stream 'FDB b) =>
     { indexedStreamProcessorInner :: StreamStep b c,
       indexedStreamProcessorIndexName :: IndexName,
       indexedStreamProcessorIndexBy :: b -> [k]
@@ -290,21 +296,27 @@ data StreamStep outMsg runResult where
       sinkProcessorStreamStepConfig :: StreamStepConfig
     } -> StreamStep () Sink
 
-class Indexable runResult where
-  -- | When writing messages downstream, also index them by the given key
-  -- function. This is immediately consistent with the write.
-  indexBy ::
-    (Message outMsg, AT.TableKey k) =>
+-- | When writing messages downstream, also index them by the given key
+-- function. This is immediately consistent with the write.
+-- This can only be called on stream steps that produce topics.
+indexBy ::
+    (Message outMsg, AT.TableKey k,
+     StructureBeingIndexed runResult ~ Stream 'FDB outMsg) =>
     IndexName ->
     (outMsg -> [k]) ->
     StreamStep outMsg runResult ->
     StreamStep outMsg (Index k, runResult)
+indexBy ixnm f stp = IndexedStreamProcessor stp ixnm f
 
-instance Indexable (Stream 'FDB outMsg) where
-  indexBy ixnm f stp = IndexedStreamProcessor stp ixnm f
+type NotIndexableMsg (arg :: Type) =
+  'Text "Type is not indexable: " ':<>: 'ShowType arg
+  ':$$: 'Text "Only Stream 'FDB a can be indexed. Tables and Sinks cannot be."
 
-instance Indexable a => Indexable (Index k, a) where
-  indexBy ixnm f stp = IndexedStreamProcessor stp ixnm f
+type family StructureBeingIndexed a where
+  StructureBeingIndexed (Index k, c) = StructureBeingIndexed c
+  StructureBeingIndexed (Stream 'FDB a) = Stream 'FDB a
+  StructureBeingIndexed a = TypeError (NotIndexableMsg a)
+
 
 stepWatermarkBy :: StreamStep outMsg runResult -> WatermarkBy outMsg
 stepWatermarkBy IndexedStreamProcessor {..} = stepWatermarkBy indexedStreamProcessorInner

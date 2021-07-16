@@ -12,6 +12,8 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE UndecidableInstances #-}
 
 -- | FDBStreaming is a poorly-named, work-in-progress, proof-of-concept library
 -- for large-scale processing of unbounded data sets and sources. It is inspired
@@ -67,7 +69,8 @@
 --   of seconds.
 -- * When storing unbounded stream data in FoundationDB, FDBStreaming performance
 --   is bound by FoundationDB. Expect tens to low hundreds of thousands of messages per
---   second for the 'Topic' data structure, and perhaps millions for the 'AggrTable' structure. See <https://apple.github.io/foundationdb/performance.html FoundationDB's docs>
+--   second for the 'Topic' data structure, and perhaps millions for the 'AggrTable' structure.
+--   See <https://apple.github.io/foundationdb/performance.html FoundationDB's docs>
 --   for more information about how performance scales. However, if you are only
 --   storing monoidal aggregations in FoundationDB and reading data from another
 --   data source (Kafka, S3, etc.), or are otherwise aggressively filtering or
@@ -339,7 +342,7 @@ import FDBStreaming.StreamStep.Internal
     streamProcessorWatermarkBy,
     watermarkBy,
     withBatchSize,
-    withOutputPartitions, ProcessBatchStats (ProcessBatchStats, processBatchStatsNumProcessed), stepBatchProcessors, Sink (Sink)
+    withOutputPartitions, ProcessBatchStats (ProcessBatchStats, processBatchStatsNumProcessed), stepBatchProcessors, Sink (Sink), StructureBeingIndexed
   )
 import FDBStreaming.TaskLease (TaskName (TaskName), secondsSinceEpoch)
 import FDBStreaming.TaskRegistry as TaskRegistry
@@ -1104,29 +1107,26 @@ outputStreamAndTopic stepName step = do
           $ streamFromTopic topic stepName
   return (fmap fromMessage stream, topic)
 
--- TODO: find a way to improve the type on this so that we don't need to
--- return Maybe.
-
 -- | Returns Nothing if the step doesn't produce a topic (e.g., it's a
 -- TableProcessor).
 outputTopic ::
-  (HasJobConfig m, Monad m) =>
+  (HasJobConfig m, Monad m, StructureBeingIndexed runResult ~ Stream 'FDB b) =>
   StepName ->
   StreamStep b runResult ->
-  m (Maybe Topic)
+  m Topic
 outputTopic stepName IndexedStreamProcessor {indexedStreamProcessorInner} =
   outputTopic stepName indexedStreamProcessorInner
 outputTopic stepName step@StreamProcessor {} = do
   jc <- getJobConfig
   return
-    $ Just
     $ makeTopic
       (jobConfigSS jc)
       stepName
       (getStepNumPartitions jc (getStepConfig step))
       (defaultChunkSizeBytes jc)
-outputTopic _ TableProcessor {} = return Nothing
-outputTopic _ SinkProcessor {} = return Nothing
+-- I thought that GHC would know this is impossible, but I get a non-exhaustive
+-- pattern warning.
+outputTopic _ _ = error "impossible case in outputTopic"
 
 instance MonadStream LeaseBasedStreamWorker where
   run sn step@IndexedStreamProcessor {} =
@@ -1522,11 +1522,11 @@ instance HasJobConfig ListTopics where
 instance MonadStream ListTopics where
   run sn step@IndexedStreamProcessor {} = do
     t <- outputTopic sn step
-    State.modify (fromJust t :)
+    State.modify (t :)
     runIndexedStreamProcessorPure sn step
   run sn step@StreamProcessor {} = do
     t <- outputTopic sn step
-    State.modify (fromJust t :)
+    State.modify (t :)
     makeStream sn sn step
   run sn step@TableProcessor {} = do
     cfg <- getJobConfig
@@ -1573,12 +1573,8 @@ runIndexedStreamProcessorLeaseBased
                           indexedStreamProcessorIndexName
                           indexedStreamProcessorIndexBy
                         : indexers)
-          mtopic <- outputTopic sn step'
-          case mtopic of
-            -- impossible because if there is no output, then there is no
-            -- output to be indexed. Also impossible by construction. :)
-            Nothing -> error "impossible case in runIndexedStreamProcessorLeaseBased"
-            Just topic -> return (Ix.namedIndex topic indexedStreamProcessorIndexName, result)
+          topic <- outputTopic sn step'
+          return (Ix.namedIndex topic indexedStreamProcessorIndexName, result)
       go step'@StreamProcessor {} indexers =
         runStreamProcessorLeaseBased sn step' indexers
       go TableProcessor{} _ = error "impossible case 2"
@@ -1603,12 +1599,8 @@ runIndexedStreamProcessorPure
                                      , indexedStreamProcessorIndexName
                                      } = do
           result <- go indexedStreamProcessorInner
-          mtopic <- outputTopic sn step'
-          case mtopic of
-            -- impossible because if there is no output, then there is no
-            -- output to be indexed. Also impossible by construction. :)
-            Nothing -> error "impossible case in runIndexedStreamProcessorPure"
-            Just topic -> return (Ix.namedIndex topic indexedStreamProcessorIndexName, result)
+          topic <- outputTopic sn step'
+          return (Ix.namedIndex topic indexedStreamProcessorIndexName, result)
       go step'@StreamProcessor {} =
         run sn step'
       go TableProcessor{} = error "impossible case 2"
