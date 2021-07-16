@@ -373,7 +373,7 @@ mainLoop db ss Args{ generatorNumThreads
                , BW.idempotencyCleanupPeriod = 100
                }
   (input, bws) <- Push.runPushStream conf "incoming_orders" pconf bwconf (fromIntegral @Int $ coerce generatorNumThreads)
-  let table = getAggrTable conf "order_table" (coerce numPartitions)
+  let table = runPure conf (topology input) -- getAggrTable conf "order_table" (coerce numPartitions)
   stats <- newTVarIO $ LatencyStats 0 1
   -- TODO: use async for all of the threads below.
   forM_ bws $ \bw ->

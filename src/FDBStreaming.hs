@@ -207,8 +207,10 @@ module FDBStreaming
     groupBy,
     GroupedBy (..),
     aggregate,
-    getAggrTable, --TODO: footgun, don't export?
     benignIO,
+
+    -- * Sinks
+    Sink(..),
 
     -- * More complex usage
     run,
@@ -224,6 +226,7 @@ module FDBStreaming
     topicWatermarkSS,
     WatermarkBy,
     streamFromTopic,
+    getAggrTable,
   )
 where
 
@@ -336,7 +339,7 @@ import FDBStreaming.StreamStep.Internal
     streamProcessorWatermarkBy,
     watermarkBy,
     withBatchSize,
-    withOutputPartitions, ProcessBatchStats (ProcessBatchStats, processBatchStatsNumProcessed), stepBatchProcessors
+    withOutputPartitions, ProcessBatchStats (ProcessBatchStats, processBatchStatsNumProcessed), stepBatchProcessors, Sink (Sink)
   )
 import FDBStreaming.TaskLease (TaskName (TaskName), secondsSinceEpoch)
 import FDBStreaming.TaskRegistry as TaskRegistry
@@ -608,9 +611,10 @@ instance MonadStream DefaultWatermarker where
     case (isStepDefaultWatermarked step,
           sinkWatermarkSubspace cfg sn,
            defaultWatermarkUpstreamTopics sn step) of
-      (True, wmSS, Just xs) ->
+      (True, wmSS, Just xs) -> do
         watermarkNext (defaultWatermark xs wmSS)
-      _ -> return ()
+        return (Sink wmSS)
+      (_, wmSS, _) -> return (Sink wmSS)
 
 -- | Runs the standard watermark logic for a stream. For each input stream,
 -- finds the minimum checkpoint across all its partitions. For each of these
@@ -687,27 +691,16 @@ existingWatermarked :: (Message a, MonadStream m) => Topic -> m (Stream 'FDB a)
 existingWatermarked tc =
   fmap setStreamWatermarkByTopic (existing tc)
 
--- TODO: better operation for externally-visible side effects. Perhaps we can
--- introduce an atMostOnceSideEffect type for these sorts of things, that
--- checkpoints and THEN performs side effects. The problem is if the thread
--- dies after the checkpoint but before the side effect, or if the side effect
--- fails. We could maintain a set of in-flight side effects, and remove them
--- from the set once finished (like a kind of write-ahead log). In that case, we
--- could try to recover by traversing the items in the set that are older than
--- t.
-
 -- | Produce a side effect at least once for each message in the stream.
-atLeastOnce :: (MonadStream m) => StepName -> Stream t a -> (a -> IO ()) -> m ()
+atLeastOnce :: (MonadStream m) => StepName -> Stream t a -> (a -> IO ()) -> m Sink
 atLeastOnce sn input f =
   run sn $
     SinkProcessor
-      -- TODO: it would be good to watermark this so users can see how far
-      -- behind real time this step is lagging.
-      { sinkProcessorWatermarkBy = NoWatermark,
+      { sinkProcessorWatermarkBy = DefaultWatermark,
         sinkProcessorBatchProcessors =
           [ IOBatchProcessor
               input
-              (\_ss _pid xs -> do
+              (\_cfg _ss _pid xs -> do
                 units <- mapM (liftIO . f . snd) xs
                 return (ProcessBatchStats (Just $ length xs), units))
               (fromIntegral $ streamMinReaderPartitions input)
@@ -751,7 +744,7 @@ pipe' input f =
       streamProcessorBatchProcessors =
         [ IOBatchProcessor
             input
-            (\_ss _pid xs -> do
+            (\_cfg _ss _pid xs -> do
               results <- catMaybes <$> mapM (liftIO . f . snd) xs
               return (ProcessBatchStats (Just $ length xs), results))
             (fromIntegral $ streamMinReaderPartitions input)
@@ -764,27 +757,28 @@ pipe' input f =
 -- effect if the stream is not persisted to FoundationDB. This is an eventually
 -- consistent indexing operation; it runs as a separate stage of the pipeline,
 -- and is thus more suitable for more resource-intensive indexing operations.
+--
+-- Returns an 'Ix.Index' and a 'Sink' object representing this step. The sink
+-- can be used to query the watermark of this step, which you can use to
+-- determine how far behind real time the index is.
 eventualIndexBy ::
   (AT.TableKey k, MonadStream m) =>
   StepName ->
   (a -> [k]) ->
   Stream 'FDB a ->
-  m (Ix.Index k)
+  m (Ix.Index k, Sink)
 eventualIndexBy sn f stream = do
   let topic = streamTopic stream
   let ix = Ix.namedIndex topic sn
-  let ixer _ss _pid batch = do
+  let ixer _cfg _ss _pid batch = do
         for_ batch $ \case
           (Just coord, x) -> for_ (f x) \k -> do
             Ix.indexCommitted ix k coord
           (Nothing, _) -> return ()
         return (ProcessBatchStats (Just (length batch)), mempty)
-  run sn $
+  sink <- run sn $
     SinkProcessor
-      -- TODO: we definitely want to watermark this so that users can see how
-      -- far behind real time their secondary index is. How do we best expose
-      -- it to the user so they can check on it?
-      { sinkProcessorWatermarkBy = NoWatermark,
+      { sinkProcessorWatermarkBy = DefaultWatermark,
         sinkProcessorBatchProcessors =
           [IOBatchProcessor
             stream
@@ -793,7 +787,7 @@ eventualIndexBy sn f stream = do
             "eix"],
         sinkProcessorStreamStepConfig = defaultStreamStepConfig
       }
-  return ix
+  return (ix, sink)
 
 -- | Streaming one-to-one join. If the relationship is not actually one-to-one
 --   (i.e. the input join functions are not injective), some messages in the
@@ -829,8 +823,8 @@ oneToOneJoin' ::
   (a -> b -> d) ->
   StreamStep d (Stream 'FDB d)
 oneToOneJoin' inl inr pl pr j =
-  let lstep = \workSS _pid -> oneToOneJoinStep (oneToOneJoinSS workSS) 0 pl j
-      rstep = \workSS _pid -> oneToOneJoinStep (oneToOneJoinSS workSS) 1 pr (flip j)
+  let lstep = \_cfg workSS _pid -> oneToOneJoinStep (oneToOneJoinSS workSS) 0 pl j
+      rstep = \_cfg workSS _pid -> oneToOneJoinStep (oneToOneJoinSS workSS) 1 pr (flip j)
    in StreamProcessor
         ( if isStreamWatermarked inl && isStreamWatermarked inr
             then DefaultWatermark
@@ -885,7 +879,7 @@ oneToManyJoin' inl inr pl pr j =
       lstep =
         IBatchProcessor
           { iBatchInStream = inl,
-            iProcessBatch = \workSS pid lmsgs -> do
+            iProcessBatch = \_cfg workSS pid lmsgs -> do
                              OTM.lMessageJob (OTM.oneToManyJoinSS workSS)
                                              pid
                                              pl
@@ -897,7 +891,7 @@ oneToManyJoin' inl inr pl pr j =
       rstep =
         IOBatchProcessor
           { ioBatchInStream = inr,
-            ioProcessBatch = \workSS _pid rmsgs -> do
+            ioProcessBatch = \_cfg workSS _pid rmsgs -> do
                              results <- OTM.rMessageJob
                                           (OTM.oneToManyJoinSS workSS)
                                           pr
@@ -910,14 +904,12 @@ oneToManyJoin' inl inr pl pr j =
           }
       flushBacklog =
         OBatchProcessor
-          { -- TODO: pass job config into processBatch, too? Need batch size
-            -- info to replace the 256 magic number below.
-            oProcessBatch = \workSS pid -> do
+          { oProcessBatch = \cfg workSS pid -> do
                              results <- OTM.flushBacklogJob
                                           (OTM.oneToManyJoinSS workSS)
                                           pid
                                           joinFn
-                                          256
+                                          (fromIntegral $ msgsPerBatch cfg)
                              -- Usually we want to return stats about the length
                              -- of the input to the batch processor, but in this
                              -- case, output is all we have (see flushBacklogJob)
@@ -1499,8 +1491,9 @@ instance MonadStream PureStream where
             sn
             (getStepNumPartitions cfg (getStepConfig s))
     return table
-  run _ SinkProcessor {} =
-    return ()
+  run sn SinkProcessor {} = do
+    cfg <- getJobConfig
+    return (Sink (sinkWatermarkSubspace cfg sn))
 
 -- | Extracts the output of a MonadStream topology without side effects.
 -- This can be used to return handles to any streams and tables you want
@@ -1543,8 +1536,9 @@ instance MonadStream ListTopics where
             sn
             (getStepNumPartitions cfg (getStepConfig step))
     return table
-  run _ SinkProcessor {} =
-    return ()
+  run sn SinkProcessor {} = do
+    cfg <- getJobConfig
+    return (Sink (sinkWatermarkSubspace cfg sn))
 
 -- | List all topics written to by the given stream topology.
 listTopics :: JobConfig -> (forall m. MonadStream m => m a) -> [Topic]
@@ -1677,7 +1671,7 @@ runStreamProcessorLeaseBased
                                   msgsPerBatch
                                   state
                         recordInputBatchMetrics metrics inMsgs
-                        (stats, outputMsgs) <- ioProcessBatch workspaceSS pid inMsgs
+                        (stats, outputMsgs) <- ioProcessBatch cfg workspaceSS pid inMsgs
                         coordsUncommitted <- writeToRandomPartition outTopic outputMsgs
                         let outMsgsWithCoords = Seq.zip outputMsgs coordsUncommitted
                         runIndexers indexers outTopic outMsgsWithCoords
@@ -1708,7 +1702,7 @@ runStreamProcessorLeaseBased
                                   msgsPerBatch
                                   state
                         recordInputBatchMetrics metrics inMsgs
-                        iProcessBatch workspaceSS pid inMsgs
+                        iProcessBatch cfg workspaceSS pid inMsgs
                     where
                       checkpointSS =
                         streamConsumerCheckpointSS
@@ -1719,7 +1713,7 @@ runStreamProcessorLeaseBased
                 doForSeconds leaseDuration
                         $ throttleByErrors metrics sn_i
                         $ runStreamTxn jobConfigDB do
-                          (stats, outputMsgs) <- oProcessBatch workspaceSS pid
+                          (stats, outputMsgs) <- oProcessBatch cfg workspaceSS pid
                           coordsUncommitted <- writeToRandomPartition outTopic outputMsgs
                           runCustomWatermark (topicWatermarkSS outTopic) streamProcessorWatermarkBy outputMsgs
                           runIndexers indexers outTopic (Seq.zip outputMsgs coordsUncommitted)
@@ -1729,7 +1723,7 @@ runStreamProcessorLeaseBased
                         $ void
                         $ throttleByErrors metrics sn_i
                         $ runStreamTxn jobConfigDB
-                        $ processBatch workspaceSS pid
+                        $ processBatch cfg workspaceSS pid
 
       forEachPartition' (numBatchPartitions batchProcessor) $ \pid -> do
         let taskName = mkTaskName sn_i pid
@@ -1745,8 +1739,8 @@ runStreamProcessorLeaseBased
   _ _ _ = error "runStreamProcessorLeaseBased called on non-StreamProcessor"
 
 runSinkProcessorLeaseBased :: StepName
-                           -> StreamStep () ()
-                           -> LeaseBasedStreamWorker ()
+                           -> StreamStep () Sink
+                           -> LeaseBasedStreamWorker Sink
 runSinkProcessorLeaseBased
   sn
   SinkProcessor { sinkProcessorWatermarkBy
@@ -1800,7 +1794,7 @@ runSinkProcessorLeaseBased
                                   msgsPerBatch
                                   state
                         recordInputBatchMetrics metrics inMsgs
-                        (stats, outputMsgs) <- ioProcessBatch workspaceSS pid inMsgs
+                        (stats, outputMsgs) <- ioProcessBatch cfg workspaceSS pid inMsgs
                         -- custom watermark support might not actually be needed
                         -- for sink steps -- the custom watermark is always going
                         -- to be given () as input, so it's not really useful.
@@ -1828,3 +1822,4 @@ runSinkProcessorLeaseBased
         liftIO
           $ runStreamTxn jobConfigDB
           $ addTask taskReg taskName leaseDuration (job pid)
+    return (Sink (sinkWatermarkSubspace cfg sn))
