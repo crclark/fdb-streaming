@@ -33,6 +33,7 @@ module FDBStreaming.TaskLease (
   ensureTask,
   removeTask,
   EnsureTaskResult(..),
+  TryAcquireResult(..),
   tryAcquire,
   acquireRandom,
   HowAcquired(..),
@@ -312,33 +313,40 @@ acquire l taskName seconds =
 -- | Returns the time at which the lock expires, in seconds since the epoch.
 -- The time may be in the past, in which case the lock has expired.
 -- Returns Nothing if the lock has never been acquired.
-getTimesOutAt :: TaskSpace -> TaskName -> Transaction (Maybe Int)
-getTimesOutAt l taskName =
-  getTaskID l taskName >>= \case
-    Nothing -> error "impossible happened: tried to acquire nonexistent lock"
-    Just taskID ->
-      FDB.get (lockedKey l taskID taskName) >>= FDB.await >>= \case
-        Nothing -> return Nothing
-        Just expiresAtBytes -> return $ Just $ parseLockedValue expiresAtBytes
+getTimesOutAt :: TaskSpace -> TaskName -> TaskID -> Transaction (Maybe Int)
+getTimesOutAt l taskName taskID =
+  FDB.get (lockedKey l taskID taskName) >>= FDB.await >>= \case
+    Nothing -> return Nothing
+    Just expiresAtBytes -> return $ Just $ parseLockedValue expiresAtBytes
 
 -- | Returns true if the lease has been acquired and the current acquired lease
 -- has not expired.
-isLocked :: TaskSpace -> TaskName -> Transaction Bool
-isLocked l taskName =
-  getTimesOutAt l taskName >>= \case
+isLocked :: TaskSpace -> TaskName -> TaskID -> Transaction Bool
+isLocked l taskName taskID =
+  getTimesOutAt l taskName taskID >>= \case
     Nothing -> return False
     Just expiresAt -> do
       currTime <- liftIO secondsSinceEpoch
       return (currTime <= expiresAt)
 
+-- | Encodes all possible results of trying to acquire a lease on a task.
+data TryAcquireResult =
+  TryAcquireSuccess AcquiredLease
+  | TryAcquireIsLocked
+  | TryAcquireDoesNotExist
+  deriving (Show, Eq, Ord)
+
 -- | Attempt to acquire the given task. If it is already locked by another
 -- worker, returns 'Nothing'. Otherwise, returns the acquired lease.
-tryAcquire :: TaskSpace -> TaskName -> Int -> Transaction (Maybe AcquiredLease)
+tryAcquire :: TaskSpace -> TaskName -> Int -> Transaction TryAcquireResult
 tryAcquire l taskName seconds = do
-  currentlyLocked <- isLocked l taskName
-  if currentlyLocked
-    then return Nothing
-    else Just <$> acquire l taskName seconds
+  getTaskID l taskName >>= \case
+    Nothing -> return TryAcquireDoesNotExist
+    Just taskID -> do
+      currentlyLocked <- isLocked l taskName taskID
+      if currentlyLocked
+        then return TryAcquireIsLocked
+        else TryAcquireSuccess <$> acquire l taskName seconds
 
 -- | Encodes all possible results of releasing a lease.
 data ReleaseResult =
@@ -403,7 +411,8 @@ availableLocks ts@(TaskSpace ss) = do
 data HowAcquired = RandomExpired | Available
   deriving (Show, Eq, Ord)
 
--- | Acquire a random available or expired lease.
+-- | Acquire a random available or expired lease. Returns nothing if no tasks
+-- are available or expired.
 acquireRandom :: TaskSpace
                       -> (TaskName -> Int)
                       -- ^ How long to lock the task, depending on its name.

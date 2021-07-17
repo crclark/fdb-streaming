@@ -132,12 +132,8 @@ test-suite fdb-streaming-test
     , tasty-quickcheck
     , foundationdb-haskell
     , containers
-    , quickcheck-state-machine >= 0.6.0
     , QuickCheck
     , quickcheck-instances
-    -- tree-diff should be re-exported by state machine somewhere, but
-    -- can't figure out which module does so.
-    , tree-diff
     , safe
     , bytestring
     , uuid

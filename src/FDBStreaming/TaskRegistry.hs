@@ -153,7 +153,7 @@ runRandomTask db (TaskRegistry ts tr) = do
         logAndRethrowErrors (show taskName) $
           f
             ( (&&) <$> isLeaseValid ts taskID lease
-                <*> isLocked ts taskName
+                <*> isLocked ts taskName taskID
             )
             (release ts taskName lease)
         logDebug $ "Finished running task " <> showText taskName
