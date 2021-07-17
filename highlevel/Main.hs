@@ -13,13 +13,13 @@
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE OverloadedLabels #-}
+
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 {-# OPTIONS_GHC -fno-warn-missing-export-lists #-}
 
 module Main where
 
+import Data.Functor ((<&>))
 import GHC.Records
 import           FDBStreaming
 import qualified FDBStreaming.AggrTable as AT
@@ -165,7 +165,7 @@ randOrderDetails Order { .. } = do
   -- Switch from random to randomGen.
   -- It called withSystemRandom, whose docs warn
   -- "This is a somewhat expensive function, and is intended to be called only occasionally"
-  details <- return "hi"
+  let details = "hi"
   return OrderDetails { .. }
 
 goodDetails :: ByteString -> Bool
@@ -197,7 +197,7 @@ awaitOrder db table stats latencyDist awaitGauge order@Order{orderID} = withProb
   Gauge.inc awaitGauge
   _ <- AT.getBlocking db table orderID
   endTime <- millisSinceEpoch <$> getCurrentTime
-  let diffMillis = endTime - (unTimestamp $ placedAt order)
+  let diffMillis = endTime - unTimestamp (placedAt order)
   let statsDiff = LatencyStats diffMillis 1
   atomically $ modifyTVar' stats (<> statsDiff)
   Distribution.add latencyDist (fromIntegral diffMillis)
@@ -263,7 +263,7 @@ orderGeneratorLoop db bw table rps batchSize stats latencyDist awaitGauge should
 latencyReportLoop :: TVar LatencyStats -> IO ()
 latencyReportLoop stats = do
   LatencyStats{timeElapsed, numFinished} <- readTVarIO stats
-  let avgMilliseconds = (timeElapsed `div` fromIntegral numFinished)
+  let avgMilliseconds = timeElapsed `div` fromIntegral numFinished
   putStrLn $ "Processed "
              ++ show numFinished
              ++ " orders with average latency of "
@@ -293,8 +293,7 @@ topology input = do
                             (\(oid, isGood) OrderDetails{details}
                               -> (oid, All $ isGood && goodDetails details))
   let grouped = groupBy (pure . fst) finalJoin
-  orderStatusTable <- aggregate "order_table" grouped snd
-  return orderStatusTable
+  aggregate "order_table" grouped snd
 
 printStats :: Database -> Subspace -> Word8 -> IO ()
 printStats db ss numPartitions = catches (do
@@ -306,10 +305,10 @@ printStats db ss numPartitions = catches (do
     threadDelay 1000000
     after <- runTransaction db $ withSnapshot $ getTopicCount tc
     afterT <- getTime Monotonic
-    let diffSecs = (fromIntegral $ toNanoSecs $ diffTimeSpec afterT beforeT)
+    let diffSecs = fromIntegral (toNanoSecs $ diffTimeSpec afterT beforeT)
                    / 10**9
     return ( topicName tc
-           , ((fromIntegral after - fromIntegral before) / diffSecs)
+           , (fromIntegral after - fromIntegral before) / diffSecs
            , after
            )
   forM_ (sortOn (\(x,_,_) -> x) ts)
@@ -363,14 +362,14 @@ mainLoop db ss Args{ generatorNumThreads
              }
   let pconf = Push.PushStreamConfig
                 ( if coerce watermark
-                    then Just $ \_ -> liftIO getCurrentTime >>= return . Watermark
+                    then Just $ \_ -> liftIO getCurrentTime <&> Watermark
                     else Nothing)
                 (Just $ fromIntegral @Word8 $ coerce numPartitions)
   let bwconf = BW.BatchWriterConfig
                { BW.desiredMaxLatencyMillis = 2000
                , BW.maxBatchBytes = 10000
                , BW.maxQueueSize = 3000
-               , BW.maxBatchSize = (fromIntegral @Int $ coerce generatorBatchSize)
+               , BW.maxBatchSize = fromIntegral @Int $ coerce generatorBatchSize
                , BW.minIdempotencyMemoryDurationSeconds = 600
                , BW.idempotencyCleanupPeriod = 100
                }
