@@ -6,7 +6,6 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
 {-# OPTIONS_GHC -fno-warn-incomplete-uni-patterns #-}
 {-# OPTIONS_GHC -fno-warn-missing-import-lists #-}
@@ -214,7 +213,7 @@ propNonAtomicSemigroup ss db tableName vs = monadicIO $ do
   run $ runTransaction db $ mappendBatch table 0 kvs
   run $ runTransaction db $ mappendBatch table 1 kvs
   let expectedResult = foldMap singletonMonoid (vs <> vs)
-  result <- fromMaybe mempty <$> (run $ runTransaction db $ AT.getRow table ())
+  result <- fromMaybe mempty <$> run (runTransaction db $ AT.getRow table ())
   when (expectedResult /= result) $ do
     run $ putStrLn $ "expected: " ++ show expectedResult
     run $ putStrLn $ "got: " ++ show result

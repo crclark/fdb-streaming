@@ -64,7 +64,7 @@ isTryAcquireSuccess (TryAcquireSuccess _) = True
 isTryAcquireSuccess _ = False
 
 isTryAcquireIsLocked :: TryAcquireResult -> Bool
-isTryAcquireIsLocked (TryAcquireIsLocked) = True
+isTryAcquireIsLocked TryAcquireIsLocked = True
 isTryAcquireIsLocked _ = False
 
 taskDeletion :: TaskSpace -> Database -> TestTree
