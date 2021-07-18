@@ -32,11 +32,10 @@ import Data.Binary.Get (Get, getWord64le, runGet, runGetOrFail)
 import Data.Binary.Put (runPut, putInt64le)
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (fromStrict, toStrict)
-import Data.Fixed (Fixed (MkFixed), E12)
-import Data.Time.Clock (NominalDiffTime, UTCTime, getCurrentTime, secondsToNominalDiffTime)
+import Data.Fixed (Fixed (MkFixed))
+import Data.Time.Clock (UTCTime, getCurrentTime, secondsToNominalDiffTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
 import Data.Int (Int64)
-import Unsafe.Coerce (unsafeCoerce)
 import qualified Streamly as S
 import qualified Streamly.Prelude as S
 import System.Random (Random, randomRIO)
