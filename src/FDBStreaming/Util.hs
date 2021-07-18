@@ -33,7 +33,7 @@ import Data.Binary.Put (runPut, putInt64le)
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (fromStrict, toStrict)
 import Data.Fixed (Fixed (MkFixed), E12)
-import Data.Time.Clock (NominalDiffTime, UTCTime, getCurrentTime)
+import Data.Time.Clock (NominalDiffTime, UTCTime, getCurrentTime, secondsToNominalDiffTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
 import Data.Int (Int64)
 import Unsafe.Coerce (unsafeCoerce)
@@ -54,17 +54,10 @@ millisSinceEpoch =
 millisSinceEpochToUTC :: Int64 -> UTCTime
 millisSinceEpochToUTC =
   posixSecondsToUTCTime
-  . fixedToNominalDiffTime
+  . secondsToNominalDiffTime
   . MkFixed -- convert to Pico type in Data.Fixed
   . (* 1000000000) -- convert milliseconds to picoseconds
   . fromIntegral
-
--- TODO: once we can upgrade to the latest time library, which includes
--- nominalDiffTimeToSeconds and secondsToNominalDiffTime, we won't need this.
--- We currently can't upgrade because stackage doesn't have it in an LTS
--- version yet.
-fixedToNominalDiffTime :: Fixed E12 -> NominalDiffTime
-fixedToNominalDiffTime = unsafeCoerce
 
 runGetMay :: Get a -> ByteString -> Maybe a
 runGetMay g bs = case runGetOrFail g (fromStrict bs) of
