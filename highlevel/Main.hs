@@ -23,7 +23,10 @@ import Data.Functor ((<&>))
 import GHC.Records
 import           FDBStreaming
 import qualified FDBStreaming.AggrTable as AT
-import           FDBStreaming.Topic
+import FDBStreaming.Topic
+    ( Topic(numPartitions, topicName),
+      getTopicCount,
+      listExistingTopics )
 import           FDBStreaming.Watermark (Watermark(Watermark, watermarkUTCTime), WatermarkSS, getCurrentWatermark)
 import qualified FDBStreaming.Util.BatchWriter as BW
 import qualified FDBStreaming.Push as Push
