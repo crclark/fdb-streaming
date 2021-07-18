@@ -6,9 +6,10 @@ module Spec.FDBStreaming.Util
   )
 where
 
+import Data.Int (Int64)
 import Data.UUID (toWords)
 import qualified Data.UUID.V4 as UUID
-import FDBStreaming.Util (chunksOfSize)
+import FDBStreaming.Util (chunksOfSize, millisSinceEpochToUTC, millisSinceEpoch)
 import qualified FoundationDB.Layer.Subspace as FDB
 import qualified FoundationDB.Layer.Tuple as FDB
 import Test.QuickCheck ((===), Arbitrary, Property, property)
@@ -46,8 +47,13 @@ chunksOfSizeProps =
       QC.testProperty "chunk size respected" chunksOfSizeRespectsSize
     ]
 
+millisSinceEpochRoundTrip :: Property
+millisSinceEpochRoundTrip = property $ \(millis :: Int64) ->
+  millis === (millisSinceEpoch $ millisSinceEpochToUTC millis)
+
 utilProps :: TestTree
 utilProps =
   testGroup
     "Utility functions"
-    [chunksOfSizeProps]
+    [chunksOfSizeProps,
+     QC.testProperty "millisSinceEpoch roundtrips" millisSinceEpochRoundTrip]

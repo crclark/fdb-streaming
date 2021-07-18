@@ -105,7 +105,9 @@ type WatermarkKey = ByteString
 -- Unix Epoch.
 newtype Watermark = Watermark {watermarkUTCTime :: UTCTime}
   deriving stock (Eq, Data, Ord, Read, Show)
-  deriving newtype (FormatTime, NFData, ParseTime)
+  -- TODO: https://github.com/haskell/time/issues/119
+  -- newtype derive a ParseTime instance.
+  deriving newtype (FormatTime, NFData)
 
 minWatermark :: Watermark
 minWatermark = Watermark $ millisSinceEpochToUTC 0

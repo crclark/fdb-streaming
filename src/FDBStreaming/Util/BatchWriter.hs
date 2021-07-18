@@ -44,7 +44,7 @@ import Control.Concurrent.STM (atomically)
 import Control.Concurrent.STM.TBQueue (TBQueue, newTBQueueIO, writeTBQueue, flushTBQueue, tryReadTBQueue, isFullTBQueue)
 import Control.Concurrent.STM.TMVar (TMVar, putTMVar, newEmptyTMVarIO, takeTMVar)
 import Data.ByteString (ByteString)
-import Data.Maybe (fromMaybe, maybe)
+import Data.Maybe (fromMaybe)
 import System.Clock (Clock(Monotonic), getTime, toNanoSecs, diffTimeSpec)
 import FDBStreaming.Util (currMillisSinceEpoch, logErrors, withOneIn)
 

@@ -5,41 +5,6 @@
 
 packages:
 - completed:
-    hackage: ekg-0.4.0.15@sha256:f52d7c00654d72d2ab988255f30adba95a52484ac310bab9c136c64732e69f4b,2030
-    pantry-tree:
-      size: 1495
-      sha256: 391c0a6aec6219bfcbbfec371281a27eae77f587f145c4f06f7fdddddaaf5327
-  original:
-    hackage: ekg-0.4.0.15@sha256:f52d7c00654d72d2ab988255f30adba95a52484ac310bab9c136c64732e69f4b
-- completed:
-    hackage: ekg-json-0.1.0.6@sha256:4ff2e9cac213a5868ae8b4a7c72a16a9a76fac14d944ae819b3d838a9725569b,1050
-    pantry-tree:
-      size: 265
-      sha256: 77dde8082700d78a353b7e476e4457aaa41acf62b1b60dbdbb450dfd553cf9b5
-  original:
-    hackage: ekg-json-0.1.0.6@sha256:4ff2e9cac213a5868ae8b4a7c72a16a9a76fac14d944ae819b3d838a9725569b
-- completed:
-    hackage: quickcheck-state-machine-0.6.0@sha256:3e4f8df0f6b5d415e3c8840dc75034a63e37f56f5f8cfa1035ded16345235ac4,3825
-    pantry-tree:
-      size: 1926
-      sha256: ae502fd7f4c6680294149bed482d1896904c1259d5ae614093da01e0731ec92e
-  original:
-    hackage: quickcheck-state-machine-0.6.0@sha256:3e4f8df0f6b5d415e3c8840dc75034a63e37f56f5f8cfa1035ded16345235ac4
-- completed:
-    hackage: pretty-show-1.9.5@sha256:92aa3f43d8459a9b543e102fbb0b7a6aae0074e18ca6a9970d9922a867114f53,1963
-    pantry-tree:
-      size: 735
-      sha256: 99f373f488e3ec7391d856be1675c6e06eb994dd31c38edc7e19b8e4054fdb38
-  original:
-    hackage: pretty-show-1.9.5@sha256:92aa3f43d8459a9b543e102fbb0b7a6aae0074e18ca6a9970d9922a867114f53
-- completed:
-    hackage: witherable-0.3.5@sha256:6590a15735b50ac14dcc138d4265ff1585d5f3e9d3047d5ebc5abf4cd5f50084,1476
-    pantry-tree:
-      size: 271
-      sha256: b99f21dbac28da031eb7c787fbffbe5e77e0aee42b64b5dda082470e907d5ab5
-  original:
-    hackage: witherable-0.3.5@sha256:6590a15735b50ac14dcc138d4265ff1585d5f3e9d3047d5ebc5abf4cd5f50084,1476
-- completed:
     hackage: witherable-class-0@sha256:91f05518f9f4af5b02424f13ee7dcdab5d6618e01346aa2f388a72ff93e2e501,775
     pantry-tree:
       size: 277
@@ -69,15 +34,15 @@ packages:
     git: https://github.com/crclark/foundationdb-haskell.git
     commit: 63cd3fd930499f080b067f5edebf632c93d0c64f
 - completed:
-    hackage: simple-logger-0.0.4@sha256:d66b9804a4ec63a2e4b5b284cfec892c5d881050a53947314710eb4b1a1ba91f,1008
+    hackage: simple-logger-0.1.1@sha256:a21912c52a702b4e3f2376f61e5bde61cb4504debe5269dd9f9dc762097ffdbd,1098
     pantry-tree:
-      size: 375
-      sha256: c7a671c4edd76f12dbe42c4be7d5abc8d517eb8dedb4b8b056e06f55e7ad7caf
+      size: 376
+      sha256: 2c5f5491d5269854fdaeeb8c139abd318507ab9b0ba95730781b880adb6864c9
   original:
-    hackage: simple-logger-0.0.4@sha256:d66b9804a4ec63a2e4b5b284cfec892c5d881050a53947314710eb4b1a1ba91f,1008
+    hackage: simple-logger-0.1.1@sha256:a21912c52a702b4e3f2376f61e5bde61cb4504debe5269dd9f9dc762097ffdbd,1098
 snapshots:
 - completed:
-    size: 524996
-    url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/lts/14/27.yaml
-    sha256: 7ea31a280c56bf36ff591a7397cc384d0dff622e7f9e4225b47d8980f019a0f0
-  original: lts-14.27
+    size: 585392
+    url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/lts/18/2.yaml
+    sha256: 7abb45c0cc5eb349448b66d8753655542d45d387ad26970419282eab3d860724
+  original: lts-18.2
