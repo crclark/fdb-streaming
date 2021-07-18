@@ -92,7 +92,7 @@ type WatermarkKey = ByteString
 -- | For a given topic, a watermark is a function that assigns to a versionstamp
 -- (which can be thought of as a processing-time timestamp) an event timestamp
 -- representing a point in time up to which we have complete data. Watermarks
--- originate from the root of the DAG -- whatever process is feeding us data
+-- originate from the roots of the DAG -- whatever process is feeding us data
 -- needs to give us information about the times of the events, or we can't
 -- produce a watermark. For example, a flat text file may not have any natural
 -- timestamp associated with individual lines in the file. In contrast, Kafka
@@ -100,9 +100,12 @@ type WatermarkKey = ByteString
 -- watermark is a heuristic, and events may arrive late.
 --
 -- For technical reasons, we must in some cases return a default minimum
--- watermark when no watermark is otherwise available. In such cases, use
+-- watermark when no watermark is otherwise available. In such cases, we use
 -- 'minWatermark', which is arbitrarily defined to be the start of the
 -- Unix Epoch.
+--
+-- Watermarks use O(n) storage for each step that is watermarked. On a busy
+-- system, this could be as much as 10MiB per day per step.
 newtype Watermark = Watermark {watermarkUTCTime :: UTCTime}
   deriving stock (Eq, Data, Ord, Read, Show)
   -- TODO: https://github.com/haskell/time/issues/119
@@ -152,11 +155,6 @@ getWatermark ss version = do
   let sel = FDB.LastLessOrEq k
   fk <- FDB.getKey sel
   return (fmap (parseWatermarkKeyResult ss) fk)
-
--- TODO: the current watermarking algorithm could take about 10 MB per day per
--- processing step, if we watermark each batch we process. Could we reduce the
--- overhead further? Don't watermark every batch? And if batches are extremely
--- small, it could be even more overhead.
 
 -- | Specifies how the output stream of a stream processor should be
 -- watermarked.
