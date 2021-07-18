@@ -345,7 +345,7 @@ writeTopicIO ::
   Topic ->
   [ByteString] ->
   IO [CoordinateUncommitted]
-writeTopicIO db topic@Topic {..} bss = do
+writeTopicIO db topic bss = do
   p <- randPartition topic
   FDB.runTransaction db $ writeTopic topic p bss
 
@@ -542,7 +542,7 @@ readNAndCheckpoint ::
   ReaderName ->
   Word16 ->
   Transaction (Seq (Coordinate, ByteString))
-readNAndCheckpoint topic@Topic {..} p rn n =
+readNAndCheckpoint topic p rn n =
   peekNPastCheckpoint topic p rn n >>= \case
     x@(_ :|> (coord, _)) -> do
       checkpoint topic p rn (coordinateToCheckpoint coord)
@@ -573,7 +573,7 @@ readNAndCheckpointIO ::
   ReaderName ->
   Word16 ->
   IO (Seq (Coordinate, ByteString))
-readNAndCheckpointIO db topic@Topic {..} rn n = do
+readNAndCheckpointIO db topic rn n = do
   p <- randPartition topic
   FDB.runTransaction db (readNAndCheckpoint topic p rn n)
 

@@ -44,7 +44,6 @@ import Test.QuickCheck ((===), Arbitrary, Property, property)
 import Test.QuickCheck.Instances.ByteString ()
 import Test.QuickCheck.Instances.Text ()
 import Test.QuickCheck.Instances.UUID ()
-import Test.QuickCheck.Monadic (monadicIO, run)
 import Test.QuickCheck.Monadic as Monadic
 import Test.Tasty
 import qualified Test.Tasty.QuickCheck as QC

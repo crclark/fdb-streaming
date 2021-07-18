@@ -49,7 +49,7 @@ chunksOfSizeProps =
 
 millisSinceEpochRoundTrip :: Property
 millisSinceEpochRoundTrip = property $ \(millis :: Int64) ->
-  millis === (millisSinceEpoch $ millisSinceEpochToUTC millis)
+  millis === millisSinceEpoch (millisSinceEpochToUTC millis)
 
 utilProps :: TestTree
 utilProps =
