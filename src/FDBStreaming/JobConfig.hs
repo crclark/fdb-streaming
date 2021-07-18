@@ -34,7 +34,8 @@ data JobConfig
         streamMetricsStore :: Maybe Metrics.Store,
         -- | Number of messages to process per transaction per worker thread.
         -- The larger the messages being processed, the smaller this number
-        -- should be. This can be overridden on a per-step basis. TODO: reference
+        -- should be. This can be overridden on a per-step basis with
+        -- 'FDBStreaming.StreamStep.Internal.StreamStepConfig'.
         msgsPerBatch :: Word16,
         -- | Length of time an individual worker should work on a single stage of the
         -- pipeline before stopping and trying to work on something else. Higher
@@ -57,8 +58,7 @@ data JobConfig
         -- number of concurrent readers equals the number of partitions, so more
         -- partitions means more throughput at the expense of more worker threads.
         -- In tables, the number of concurrent writers is bounded by the number of
-        -- partitions, but having fewer writers won't significantly affect
-        -- pipeline timeliness (TODO: explain why not).
+        -- partitions.
         defaultNumPartitions :: PartitionCount,
         -- | Default target number of bytes to store per k/v in topics. Small
         -- messages will be combined into one k/v to reach this target. This

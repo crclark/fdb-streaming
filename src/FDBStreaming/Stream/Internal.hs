@@ -178,7 +178,10 @@ defaultWmSS :: StreamName -> JobSubspace -> WatermarkSS
 defaultWmSS sn ss = FDB.extend ss [C.topics, FDB.Bytes sn, C.customMeta, FDB.Bytes "wm"]
 
 -- | Helper function for defining custom data sources for other external
--- databases.
+-- databases. This works well for any external database where FDBStreaming can
+-- /pull/ data. If you need to /push/ data to FDBStreaming (for example, you
+-- are generating events from a web service and you don't want to set up Kafka),
+-- see "FDBStreaming.Push".
 customStream ::
   -- | Function that will be called to read a batch of records from the data
   -- source. Receives the configuration for the current job, the name and

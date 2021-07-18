@@ -137,11 +137,6 @@ data Coordinate = Coordinate PartitionId (Versionstamp 'Complete) Int
 data Checkpoint = Checkpoint (Versionstamp 'Complete) Int
   deriving (Show, Eq, Ord, Bounded)
 
--- TODO: it seems that Coordinates are more general than checkpoints. Can we
--- remove checkpoints as a separate type? Or make checkpoints a newtype for
--- coordinates? They do serve two different purposes, but they both ultimately
--- point at a particular message.
-
 -- | Convert a coordinate to a checkpoint. The difference between the two is
 -- that a coordinate contains a PartitionId and a checkpoint does not, because
 -- checkpoints are stored per partition.
@@ -153,11 +148,6 @@ checkpointToCoordinate pid (Checkpoint vs i) = Coordinate pid vs i
 
 -- TODO: consider switching to the directory layer so the subspace strings
 -- are shorter
--- TODO: the current schema uses versionstamps in a way that prevents data from
--- being transferred to a new database, because versionstamps are only
--- monotonically increasing for a given DB. We need an "incarnation" prefix
--- before the versionstamp. See the record layer paper for more info. This might
--- no longer be needed in recent versions of FDB.
 
 -- | Represents an append-only collection of messages, stored in FoundationDB.
 -- This collection can be efficiently written to using only FoundationDB atomic
@@ -292,7 +282,7 @@ readerCheckpointKey topic i rn =
 
 -- | Write a batch of messages to this topic.
 -- Danger!! It's possible to write multiple messages with the same key
--- if this is called more than once in a single transaction.
+-- if this is called more than once for one topic in a single transaction.
 --
 -- Returns the coordinate corresponding to
 -- where each item in the input batch was written.
@@ -306,12 +296,11 @@ readerCheckpointKey topic i rn =
 writeTopic ::
   Topic ->
   PartitionId ->
-  --TODO watch for regression from switching to list here
   [ByteString] ->
   Transaction [CoordinateUncommitted]
-writeTopic topic@Topic {..} p bss = do
-  incrPartitionCountBy topic p (fromIntegral $ length bss)
-  let chunks = chunksOfSize desiredChunkSizeBytes BS.length bss
+writeTopic topic@Topic {..} p msgs = do
+  incrPartitionCountBy topic p (fromIntegral $ length msgs)
+  let chunks = chunksOfSize desiredChunkSizeBytes BS.length msgs
   let mkTuple i =
         [ FDB.Int $ fromIntegral p,
           FDB.IncompleteVS (IncompleteVersionstamp i)
@@ -322,13 +311,13 @@ writeTopic topic@Topic {..} p bss = do
           | (i, chunk) <- zip [0 ..] chunks,
             let t = mkTuple i
         ]
-  forM_ keyedIndexedChunks $ \(_, k, bs) -> do
+  forM_ keyedIndexedChunks $ \(_, k, chunkMsgs) -> do
     -- TODO: this has the unhappy side effect of increasing the size of
     -- messages encoded by the persist library significantly. persist pads with
     -- \x00, which FDB's tuple layer uses as a marker for the end of bytes, so
     -- all the \x00 bytes get escaped with \ff by the tuple layer encoding.
     -- In other words, every \x00 needs two bytes to encode.
-    let v = FDB.encodeTupleElems (map (FDB.Bytes . snd) bs)
+    let v = FDB.encodeTupleElems (map (FDB.Bytes . snd) chunkMsgs)
     FDB.atomicOp k (Mut.setVersionstampedKey v)
   return [m i | (m, _, cs) <- keyedIndexedChunks, (i, _) <- cs]
 
