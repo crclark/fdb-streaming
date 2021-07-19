@@ -15,14 +15,10 @@ import Data.ByteString.Lazy (fromStrict, toStrict)
 import Data.Functor.Identity (Identity (Identity, runIdentity))
 import Data.Int (Int16, Int32, Int64, Int8)
 import Data.Monoid (All, Any)
+import qualified Data.Persist as Persist
 import Data.Semigroup (Dual (Dual, getDual), First (First, getFirst), Last (Last, getLast), Max (Max, getMax), Min (Min, getMin), Option (Option, getOption), Product (Product, getProduct), Sum (Sum, getSum))
 import Data.Void (Void, absurd)
 import Data.Word (Word16, Word32, Word64, Word8)
-import FoundationDB.Layer.Tuple
-  ( Elem (Bytes),
-    decodeTupleElems,
-    encodeTupleElems,
-  )
 import GHC.Natural (Natural)
 
 -- TODO: error handling for bad parses? There is some benefit to throwing, in
@@ -89,97 +85,97 @@ instance Message () where
 
 instance (Message a, Message b) => Message (a, b) where
 
-  toMessage (x, y) = encodeTupleElems [Bytes (toMessage x), Bytes (toMessage y)]
+  toMessage (x, y) = Persist.encode [toMessage x, toMessage y]
 
   fromMessage bs =
-    case decodeTupleElems bs of
+    case Persist.decode bs of
       Left err -> error $ "bad tuple decode " ++ show err
-      Right [Bytes x, Bytes y] -> (fromMessage x, fromMessage y)
+      Right [x,y] -> (fromMessage x, fromMessage y)
       Right xs -> error $ "unexpected decode " ++ show xs
 
 instance (Message a, Message b, Message c) => Message (a, b, c) where
 
   toMessage (x, y, z) =
-    encodeTupleElems
-      [ Bytes (toMessage x),
-        Bytes (toMessage y),
-        Bytes (toMessage z)
+    Persist.encode
+      [ toMessage x,
+        toMessage y,
+        toMessage z
       ]
 
   fromMessage bs =
-    case decodeTupleElems bs of
+    case Persist.decode bs of
       Left err -> error $ "bad tuple decode " ++ show err
-      Right [Bytes x, Bytes y, Bytes z] -> (fromMessage x, fromMessage y, fromMessage z)
+      Right [x, y, z] -> (fromMessage x, fromMessage y, fromMessage z)
       Right xs -> error $ "unexpected decode " ++ show xs
 
 instance (Message a, Message b, Message c, Message d) => Message (a, b, c, d) where
 
   toMessage (a, b, c, d) =
-    encodeTupleElems
-      [ Bytes (toMessage a),
-        Bytes (toMessage b),
-        Bytes (toMessage c),
-        Bytes (toMessage d)
+    Persist.encode
+      [ toMessage a,
+        toMessage b,
+        toMessage c,
+        toMessage d
       ]
 
   fromMessage bs =
-    case decodeTupleElems bs of
+    case Persist.decode bs of
       Left err -> error $ "bad tuple decode " ++ show err
-      Right [Bytes a, Bytes b, Bytes c, Bytes d] -> (fromMessage a, fromMessage b, fromMessage c, fromMessage d)
+      Right [a, b, c, d] -> (fromMessage a, fromMessage b, fromMessage c, fromMessage d)
       Right xs -> error $ "unexpected decode " ++ show xs
 
 instance (Message a, Message b, Message c, Message d, Message e) => Message (a, b, c, d, e) where
 
   toMessage (a, b, c, d, e) =
-    encodeTupleElems
-      [ Bytes (toMessage a),
-        Bytes (toMessage b),
-        Bytes (toMessage c),
-        Bytes (toMessage d),
-        Bytes (toMessage e)
+    Persist.encode
+      [ toMessage a,
+        toMessage b,
+        toMessage c,
+        toMessage d,
+        toMessage e
       ]
 
   fromMessage bs =
-    case decodeTupleElems bs of
+    case Persist.decode bs of
       Left err -> error $ "bad tuple decode " ++ show err
-      Right [Bytes a, Bytes b, Bytes c, Bytes d, Bytes e] -> (fromMessage a, fromMessage b, fromMessage c, fromMessage d, fromMessage e)
+      Right [a, b, c, d, e] -> (fromMessage a, fromMessage b, fromMessage c, fromMessage d, fromMessage e)
       Right xs -> error $ "unexpected decode " ++ show xs
 
 instance (Message a, Message b, Message c, Message d, Message e, Message f) => Message (a, b, c, d, e, f) where
 
   toMessage (a, b, c, d, e, f) =
-    encodeTupleElems
-      [ Bytes (toMessage a),
-        Bytes (toMessage b),
-        Bytes (toMessage c),
-        Bytes (toMessage d),
-        Bytes (toMessage e),
-        Bytes (toMessage f)
+    Persist.encode
+      [ toMessage a,
+        toMessage b,
+        toMessage c,
+        toMessage d,
+        toMessage e,
+        toMessage f
       ]
 
   fromMessage bs =
-    case decodeTupleElems bs of
+    case Persist.decode bs of
       Left err -> error $ "bad tuple decode " ++ show err
-      Right [Bytes a, Bytes b, Bytes c, Bytes d, Bytes e, Bytes f] -> (fromMessage a, fromMessage b, fromMessage c, fromMessage d, fromMessage e, fromMessage f)
+      Right [a, b, c, d, e, f] -> (fromMessage a, fromMessage b, fromMessage c, fromMessage d, fromMessage e, fromMessage f)
       Right xs -> error $ "unexpected decode " ++ show xs
 
 instance (Message a, Message b, Message c, Message d, Message e, Message f, Message g) => Message (a, b, c, d, e, f, g) where
 
   toMessage (a, b, c, d, e, f, g) =
-    encodeTupleElems
-      [ Bytes (toMessage a),
-        Bytes (toMessage b),
-        Bytes (toMessage c),
-        Bytes (toMessage d),
-        Bytes (toMessage e),
-        Bytes (toMessage f),
-        Bytes (toMessage g)
+    Persist.encode
+      [ toMessage a,
+        toMessage b,
+        toMessage c,
+        toMessage d,
+        toMessage e,
+        toMessage f,
+        toMessage g
       ]
 
   fromMessage bs =
-    case decodeTupleElems bs of
+    case Persist.decode bs of
       Left err -> error $ "bad tuple decode " ++ show err
-      Right [Bytes a, Bytes b, Bytes c, Bytes d, Bytes e, Bytes f, Bytes g] -> (fromMessage a, fromMessage b, fromMessage c, fromMessage d, fromMessage e, fromMessage f, fromMessage g)
+      Right [a, b, c, d, e, f, g] -> (fromMessage a, fromMessage b, fromMessage c, fromMessage d, fromMessage e, fromMessage f, fromMessage g)
       Right xs -> error $ "unexpected decode " ++ show xs
 
 instance Message Bool where
