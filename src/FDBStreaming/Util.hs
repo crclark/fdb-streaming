@@ -162,8 +162,8 @@ addOneAtomic k = FDB.atomicOp k (Mut.add oneLE)
 
 -- | Subtracts little-endian encoded 1 to the value stored at the given key.
 subtractOneAtomic :: ByteString -> FDB.Transaction ()
-subtractOneAtomic k = FDB.atomicOp k (Mut.add oneLE)
-  where oneLE = "\xff\xff\xff\xff\xff\xff\xff\xff"
+subtractOneAtomic k = FDB.atomicOp k (Mut.add negativeOneLE)
+  where negativeOneLE = "\xff\xff\xff\xff\xff\xff\xff\xff"
 
 -- | Atomically adds little-endian encoded n to the value stored at the given key.
 addAtomic :: ByteString -> Int -> FDB.Transaction ()
