@@ -51,11 +51,11 @@ import Data.Binary.Put
     runPut,
   )
 import Data.ByteString (ByteString)
-import qualified Data.ByteString as BS
 import Data.Foldable (forM_)
 import Data.Function ((&))
 import Data.Map (Map)
 import qualified Data.Map as Map
+import qualified Data.Persist as Persist
 import qualified Data.Sequence as Seq
 import Data.Sequence (Seq ((:|>)))
 import Data.Traversable (for)
@@ -300,7 +300,7 @@ writeTopic ::
   Transaction [CoordinateUncommitted]
 writeTopic topic@Topic {..} p msgs = do
   incrPartitionCountBy topic p (fromIntegral $ length msgs)
-  let chunks = chunksOfSize desiredChunkSizeBytes BS.length msgs
+  let chunks = chunksOfSize desiredChunkSizeBytes msgs
   let mkTuple i =
         [ FDB.Int $ fromIntegral p,
           FDB.IncompleteVS (IncompleteVersionstamp i)
@@ -312,12 +312,7 @@ writeTopic topic@Topic {..} p msgs = do
             let t = mkTuple i
         ]
   forM_ keyedIndexedChunks $ \(_, k, chunkMsgs) -> do
-    -- TODO: this has the unhappy side effect of increasing the size of
-    -- messages encoded by the persist library significantly. persist pads with
-    -- \x00, which FDB's tuple layer uses as a marker for the end of bytes, so
-    -- all the \x00 bytes get escaped with \ff by the tuple layer encoding.
-    -- In other words, every \x00 needs two bytes to encode.
-    let v = FDB.encodeTupleElems (map (FDB.Bytes . snd) chunkMsgs)
+    let v = Persist.encode (map snd chunkMsgs)
     FDB.atomicOp k (Mut.setVersionstampedKey v)
   return [m i | (m, _, cs) <- keyedIndexedChunks, (i, _) <- cs]
 
@@ -339,16 +334,9 @@ writeTopicIO db topic bss = do
   FDB.runTransaction db $ writeTopic topic p bss
 
 parseTopicV :: ByteString -> [ByteString]
-parseTopicV vals = case FDB.decodeTupleElems vals of
-  Right bs | allBytes bs -> unBytes bs
+parseTopicV vals = case Persist.decode vals of
+  Right bs -> bs
   _ -> error "parseTopicV: unexpected topic chunk format"
-  where
-    allBytes [] = True
-    allBytes (FDB.Bytes _ : xs) = allBytes xs
-    allBytes _ = False
-    unBytes [] = []
-    unBytes (FDB.Bytes x : xs) = x : unBytes xs
-    unBytes _ = error "unreachable case in parseTopicKV"
 
 parseTopicKV ::
   Topic ->

@@ -16,7 +16,9 @@ module FDBStreaming.Util (
   parseWord64le,
   addOneAtomic,
   subtractOneAtomic,
-  addAtomic
+  addAtomic,
+  splitOn,
+  spanInclusive
 ) where
 
 import Control.Logger.Simple (logError, showText)
@@ -30,9 +32,11 @@ import Control.Exception
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Binary.Get (Get, getWord64le, runGet, runGetOrFail)
 import Data.Binary.Put (runPut, putInt64le)
+import qualified Data.ByteString as BS
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (fromStrict, toStrict)
 import Data.Fixed (Fixed (MkFixed))
+import qualified Data.Persist as Persist
 import Data.Time.Clock (UTCTime, getCurrentTime, secondsToNominalDiffTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
 import Data.Int (Int64)
@@ -88,19 +92,51 @@ withOneIn n action = do
   x <- liftIO $ randomRIO (1,n)
   when (x == 1) action
 
--- | @chunksOfSize n sz@ splits a list into chunks, such that for each chunk
--- @c@, @sum $ map sz c@ is less than or equal to @n@, except for elements
--- larger than the chunk size, which will be placed in singleton chunks.
-chunksOfSize :: Word -> (a -> Int) -> [a] -> [[a]]
-chunksOfSize _ _ [] = []
-chunksOfSize n sz xs@(h:_) =
-  let (l, rest) = go (sz h) 1 xs
-      in take l xs : chunksOfSize n sz rest
+encodedIntLength :: Word
+encodedIntLength = fromIntegral $ BS.length $ Persist.encode (maxBound :: Int)
 
-  where go _ !l [] = (l, [])
-        go !i !l (z:zs)
-          | i + sz z > fromIntegral n = (l, zs)
-          | otherwise = go (i + sz z) (l + 1) zs
+-- | Like 'span', except that the left list includes the first element for which
+-- f returned False.
+spanInclusive :: (a -> Bool) -> [a] -> ([a], [a])
+spanInclusive _ [] = ([], [])
+spanInclusive _ [x] = ([x], [])
+spanInclusive f (x:y:xs)
+  | f x && f y = let (ys, zs) = spanInclusive f (y:xs) in (x : ys, zs)
+  | f x && not (f y) = ([x, y], xs)
+  | otherwise = ([x], y:xs)
+
+-- | Split a list into chunks by a delimiter function. The delimiter is included
+-- at the end of each chunk.
+splitOn :: (a -> Bool) -> [a] -> [[a]]
+splitOn _ [] = []
+splitOn f xs =
+  let (chunk, rest) = spanInclusive f xs
+    in chunk : splitOn f rest
+
+-- | @chunksOfSize n sz@ splits a list of bytestrings into chunks, such that
+-- for each chunk
+-- @c@, the length of the serialization of @c@ by the @persist@ library is less
+-- than or equal to @n@, except for bytestrings
+-- larger than the chunk size, which will be placed in singleton chunks.
+chunksOfSize :: Word -> [ByteString] -> [[ByteString]]
+chunksOfSize _ [] = []
+chunksOfSize 0 xs = map return xs
+chunksOfSize desiredChunkSizeBytes bss =
+  map (map fst)
+  $ splitOn ((>= desiredChunkSizeBytes) . snd)
+  $ zip bss
+  $ tail
+  $ scanl acc prefixLength bss
+
+  where
+    -- each bytestring is serialized as length, bytestring.
+    sz bs = encodedIntLength + fromIntegral (BS.length bs)
+
+    -- A list is serialized as a word64 length followed by each encoded item.
+    prefixLength = 8
+
+    acc l bs = (l + sz bs) `mod` desiredChunkSizeBytes
+
 
 streamlyRangeResult :: (S.IsStream t)
                     => FDB.RangeResult

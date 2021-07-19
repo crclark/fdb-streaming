@@ -57,6 +57,7 @@ library
       binary,
       foundationdb-haskell,
       mtl,
+      persist,
       random,
       async,
       ekg-core,
