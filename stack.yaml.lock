@@ -40,6 +40,20 @@ packages:
       sha256: 2c5f5491d5269854fdaeeb8c139abd318507ab9b0ba95730781b880adb6864c9
   original:
     hackage: simple-logger-0.1.1@sha256:a21912c52a702b4e3f2376f61e5bde61cb4504debe5269dd9f9dc762097ffdbd,1098
+- completed:
+    hackage: quickcheck-state-machine-0.7.0@sha256:4fc4467380e35b88aab72c278856aacebbf95688059d8ad70eb82fe048df476b,4958
+    pantry-tree:
+      size: 3022
+      sha256: 045794fff983e385560b321ff5576f6ec5c2821748c3042053f72daaca7beba8
+  original:
+    hackage: quickcheck-state-machine-0.7.0@sha256:4fc4467380e35b88aab72c278856aacebbf95688059d8ad70eb82fe048df476b,4958
+- completed:
+    hackage: markov-chain-usage-model-0.0.0@sha256:1afa95faeb9213c4d960a669190078b41b89169462b8edd910472980671ba8c0,2112
+    pantry-tree:
+      size: 432
+      sha256: 6871bd9281acf589296d0998a3d62892b036040ab10e74e8a0f356f68c194f4f
+  original:
+    hackage: markov-chain-usage-model-0.0.0@sha256:1afa95faeb9213c4d960a669190078b41b89169462b8edd910472980671ba8c0,2112
 snapshots:
 - completed:
     size: 585392

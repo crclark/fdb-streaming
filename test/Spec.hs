@@ -26,8 +26,7 @@ cleanup db = do
 
 allTests :: Database -> TestTree
 allTests db =
-  testGroup
-    "Tests"
+  testGroup "all"
     [ leaseProps testSS db,
       tableProps testSS db,
       watermarks testSS db,

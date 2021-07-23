@@ -135,10 +135,14 @@ test-suite fdb-streaming-test
     , containers
     , QuickCheck
     , quickcheck-instances
+    , quickcheck-state-machine >= 0.6.0
     , safe
     , bytestring
     , uuid
     , text
+    -- tree-diff should be re-exported by state machine somewhere, but
+    -- can't figure out which module does so.
+    , tree-diff
     , math-functions
     , monoid-statistics
     , persist
