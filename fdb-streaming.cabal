@@ -28,6 +28,7 @@ library
       FDBStreaming.StreamStep.Internal,
       FDBStreaming.TableKey,
       FDBStreaming.TaskLease,
+      FDBStreaming.TaskLease.Internal,
       FDBStreaming.TaskRegistry,
       FDBStreaming.Testing,
       FDBStreaming.Topic,
