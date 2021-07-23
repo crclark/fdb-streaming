@@ -27,8 +27,6 @@ import Control.Monad.IO.Class (liftIO)
 import Data.IORef (atomicModifyIORef, newIORef, readIORef)
 import qualified Data.Map as Map
 import Data.Kind (Type)
-import Data.Maybe (isJust, isNothing)
-import Data.TreeDiff.Class (ToExpr)
 import qualified Data.Sequence as Seq
 import FDBStreaming.TaskLease
     ( AcquiredLease(AcquiredLease),
@@ -57,7 +55,7 @@ import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit ((@?=), assertBool, testCase)
 import Test.QuickCheck ((===), Property)
 import Test.QuickCheck.Gen
-import Test.QuickCheck.Monadic (monadicIO, run)
+import Test.QuickCheck.Monadic (monadicIO)
 import Test.StateMachine as QSM
 import qualified Test.StateMachine.Types.Rank2 as Rank2
 import qualified Test.Tasty.QuickCheck as QC
@@ -195,29 +193,36 @@ transition (Model refs) (AcquireRandom _) (AcquiredRandom taskName acquiredLease
   Model (update taskName (IsLocked acquiredLease) refs)
 transition m (AcquireRandom _) _ = m
 
+-- NOTE: postcondition, despite the name, is passed the state of the model
+-- *before* the command is executed and the response is returned. We need to
+-- call transition on it ourselves to get the state after command execution.
 postcondition :: Model Concrete -> Command Concrete -> Response Concrete -> Logic
-postcondition (Model refs) cmd resp = case (cmd, resp) of
-  (TryAcquireFor _ ref, Acquired _) ->
-    let (Just oldLockStatus) = lookup ref refs
-     in isLockedState oldLockStatus .== False .// "was unlocked before acquisition"
-  (TryAcquireFor _ ref, AlreadyLocked) ->
-    let (Just oldLockStatus) = lookup ref refs
-     in isLockedState oldLockStatus .== True .// "AlreadyLocked consistent"
-  (TryAcquireFor _ _, _) -> Bot .// "Unexpected output for TryAcquireFor"
+postcondition m@(Model oldRefs) cmd resp = case (cmd, resp) of
+  (TryAcquireFor _ ref, acquireResult) ->
+    case (lookup ref newRefs, acquireResult) of
+      (Nothing, Acquired _) -> Bot .// "acquired nonexistent task"
+      (Nothing, TaskDNE) -> Top .// "can't acquire nonexistent task"
+      (Nothing, AlreadyLocked) -> Bot .// "inconsistent state: task DNE but we got AlreadyLocked"
+      (Just (IsLocked x), Acquired y) -> x .== y
+      (Just (IsLocked _), TaskDNE) -> Bot .// "model thinks task is locked but we got a TaskDNE response"
+      (Just (IsLocked _), AlreadyLocked) -> Top
+      (leaseState, _) -> Bot .// ("unexpected acquire response. leaseState: "
+                                  ++ show leaseState
+                                  ++ " response: " ++ show acquireResult)
   (Deliver _ ref, Success) ->
-    let (Just oldLockStatus) = lookup ref refs
+    let (Just oldLockStatus) = lookup ref oldRefs
      in isLockedState oldLockStatus .== True .// "locked before delivery"
   (Deliver _ ref, Expired) ->
-    let (Just oldLockStatus) = lookup ref refs
+    let (Just oldLockStatus) = lookup ref oldRefs
      in isLockedState oldLockStatus .== True .// "models expired locks as IsLocked"
   (Deliver lease ref, LeaseDNE) ->
-    case lookup ref refs of
+    case lookup ref oldRefs of
       Just (IsLocked lease') -> lease' ./= lease
       Just (LastLeaseWas _) -> Top
       Just NeverLocked -> Top
       Nothing -> Top
   (AcquireRandom _, AcquiredRandom taskName _acquiredLease) ->
-    case lookup taskName refs of
+    case lookup taskName oldRefs of
       -- TODO: this is wrong. The model doesn't get updated by the passage of
       -- time, so this can be legal if enough time has passed. As it is, the
       -- QSM tests aren't testing lock expiry unless we get really lucky with
@@ -225,10 +230,12 @@ postcondition (Model refs) cmd resp = case (cmd, resp) of
       Just oldLockStatus -> isAvailable oldLockStatus .== True .// "can only acquire available tasks"
       Nothing -> error $ "acquired lock that DNE in Model: " ++ show taskName
   (AcquireRandom _, AlreadyLocked) ->
-    let allStates = map snd refs
+    let allStates = map snd oldRefs
         allLocked = all isLockedState allStates
      in allLocked .== True .// "AcquireRandom fails only if all are locked"
   (_, _) -> Top
+
+  where (Model newRefs) = transition m cmd resp
 
 generator :: Model Symbolic -> Maybe (Gen (Command Symbolic))
 generator (Model refs) =

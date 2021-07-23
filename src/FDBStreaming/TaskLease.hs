@@ -62,7 +62,9 @@ import qualified FoundationDB.Layer.Subspace as FDB
 import qualified FoundationDB.Layer.Tuple as FDB
 import FDBStreaming.Util (parseWord64le, addOneAtomic, subtractOneAtomic)
 
--- | Uniquely identifies an acquired lease on a 'TaskName'.
+-- | Uniquely identifies an acquired lease on a 'TaskName'. Each time a task is
+-- acquired, its lease number is incremented by one. The lowest valid lease
+-- number is 1.
 newtype AcquiredLease = AcquiredLease Int
   deriving (Show, Eq, Ord, Num, Generic)
 
@@ -188,12 +190,14 @@ decrCount l = do
   let k = countKey l
   subtractOneAtomic k
 
-getAcquiredLease :: TaskSpace -> TaskID -> Transaction AcquiredLease
+-- | Gets the current lease on the given TaskID. Returns Nothing if the task
+-- has never been locked.
+getAcquiredLease :: TaskSpace -> TaskID -> Transaction (Maybe AcquiredLease)
 getAcquiredLease l taskID = do
   let k = lockVersionKey l taskID
   FDB.get k >>= FDB.await >>= \case
-    Nothing -> return (AcquiredLease 0)
-    Just bs -> return $ AcquiredLease $ parseWord64le bs
+    Nothing -> return Nothing
+    Just bs -> return $ Just $ AcquiredLease $ parseWord64le bs
 
 incrAcquiredLease :: TaskSpace -> TaskID -> Transaction ()
 incrAcquiredLease l taskID = do
@@ -203,9 +207,9 @@ incrAcquiredLease l taskID = do
 -- | Returns True iff the given lease is still the most recent lease for the
 -- given task. Does not check whether the lease has expired.
 isLeaseValid :: TaskSpace -> TaskID -> AcquiredLease -> Transaction Bool
-isLeaseValid l taskID lease = do
-  lease' <- getAcquiredLease l taskID
-  return (lease == lease')
+isLeaseValid l taskID lease = getAcquiredLease l taskID >>= \case
+  Nothing -> return False
+  Just lease' -> return (lease == lease')
 
 getTaskID :: TaskSpace -> TaskName -> Transaction (Maybe TaskID)
 getTaskID (TaskSpace ss) (TaskName nm) = do
@@ -308,7 +312,10 @@ acquire l taskName seconds =
       let tok = expiresAtKey l expiresAt taskName
       FDB.set tok ""
       incrAcquiredLease l taskID
-      getAcquiredLease l taskID
+      mLease <- getAcquiredLease l taskID
+      case mLease of
+        Nothing -> error "impossible happened: no lease found after incrementing it"
+        Just lease -> return lease
 
 -- | Returns the time at which the lock expires, in seconds since the epoch.
 -- The time may be in the past, in which case the lock has expired.
@@ -371,8 +378,9 @@ release l taskName@(TaskName nm) lockVersion =
   getTaskID l taskName >>= \case
     Nothing -> return InvalidLease
     Just taskID -> getAcquiredLease l taskID >>= \case
-      currVersion | currVersion > lockVersion -> return AlreadyExpired
-      currVersion | currVersion < lockVersion -> return InvalidLease
+      Nothing -> return InvalidLease
+      Just currVersion | currVersion > lockVersion -> return AlreadyExpired
+      Just currVersion | currVersion < lockVersion -> return InvalidLease
       _ -> do
           let lkk = lockedKey l taskID taskName
           expiresAtBytes <- FDB.get lkk >>= FDB.await
