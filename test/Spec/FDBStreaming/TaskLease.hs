@@ -29,6 +29,7 @@ import Control.Monad.IO.Class (liftIO)
 import Data.IORef (atomicModifyIORef, newIORef, readIORef)
 import qualified Data.Map as Map
 import Data.Kind (Type)
+import Data.Maybe (isNothing)
 import qualified Data.Sequence as Seq
 import FDBStreaming.TaskLease
     ( AcquiredLease,
@@ -174,6 +175,9 @@ update k ls m =
 getState :: TaskName -> M.Map TaskName (TaskID, LeaseState) -> Maybe LeaseState
 getState k m = fmap snd $ M.lookup k m
 
+getTaskID :: TaskName -> M.Map TaskName (TaskID, LeaseState) -> Maybe TaskID
+getTaskID k m = fmap fst $ M.lookup k m
+
 allStates :: Model r -> [LeaseState]
 allStates (Model m) = map snd $ M.elems m
 
@@ -247,6 +251,8 @@ postcondition m@(Model oldRefs) cmd resp = case (cmd, resp) of
     case M.lookup ref oldRefs of
       Nothing -> Top
       Just _ -> Bot .// "Got TaskDNE from Deliver, but task exists in model"
+  x@(Deliver _ _, _) ->
+    Bot .// ("Impossible Deliver transition: " ++ show x)
   (AcquireRandom _, AcquiredRandom taskName _acquiredLease) ->
     case getState taskName oldRefs of
       -- TODO: this is wrong. The model doesn't get updated by the passage of
@@ -258,7 +264,18 @@ postcondition m@(Model oldRefs) cmd resp = case (cmd, resp) of
   (AcquireRandom _, AlreadyLocked) ->
     let allLocked = all isLockedState (allStates m)
      in allLocked .== True .// "AcquireRandom fails only if all are locked"
-  (_, _) -> Top
+  x@(AcquireRandom _, _) ->
+    Bot .// ("Impossible AcquireRandom transition: " ++ show x)
+  (PassTime _, Success) -> Top
+  x@(PassTime _, _) -> Bot .// ("Impossible PassTime transition: " ++ show x)
+  (EnsureTask taskName, TaskEnsured r) -> case r of
+    AlreadyExists taskID
+      | getTaskID taskName oldRefs == Just taskID -> Top
+      | otherwise -> Bot .//  ("EnsureTask returns AlreadyExists with wrong taskID: " ++ show taskID)
+    NewlyCreated taskID
+      | isNothing (getTaskID taskName oldRefs) -> Top
+      | otherwise -> Bot .// ("EnsureTask returned NewlyCreated for existing task: " ++ show taskName ++ " " ++ show taskID)
+  x@(EnsureTask _, _) -> Bot .// ("Impossible EnsureTask transition: " ++ show x)
 
   where (Model newRefs) = transition m cmd resp
 
@@ -266,10 +283,7 @@ generator :: Model Symbolic -> Maybe (Gen (Command Symbolic))
 generator (Model refs) =
   Just $
     if null refs
-      then-- TODO: for reasons that remain mysterious, qsm is somehow generating
-      -- command sequences that don't start with EnsureTask. To see this happen,
-      -- remove the preconditions above that prevent it.
-
+      then
         frequency
           [ (1, pure $ EnsureTask "task1"),
             (1, pure $ EnsureTask "task2")
